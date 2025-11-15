@@ -214,7 +214,7 @@ class Trainer:
         tasks = 'Tasks: '.join(tasks)
         
         self.logger.log_message(
-            f'Training: Max Epoch - {self.epochs} -- {tasks}'
+            f'Training: Max Epoch - {self.epochs} -- {tasks} -- Device: {self.device}'
         )
         self.logger.log_new_line()
 
@@ -234,8 +234,6 @@ class Trainer:
                     ckpt_dir = f'{self.output_dir}/ckpt_{self.cur_epoch}'
                     if not os.path.exists(ckpt_dir):
                         os.makedirs(ckpt_dir)
-
-                    #TODO, ckpt save
 
             if self.monitor_val and self.cur_epoch >= self.first_val_epoch:
                 self.eval_one_epoch()
