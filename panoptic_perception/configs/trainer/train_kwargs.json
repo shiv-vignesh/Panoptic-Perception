@@ -1,0 +1,58 @@
+{
+    "model_kwargs":{
+        "cfg_path":"panoptic_perception/configs/models/yolop.cfg",
+        "device":"cuda"
+    },
+
+    "dataset_kwargs":{
+        "images_dir": "panoptic_perception/BDD100k/100k/100k",
+        "detection_annotations_dir": "panoptic_perception/BDD100k/bdd100k_labels/100k",
+        "segmentation_annotations_dir": "panoptic_perception/BDD100k/bdd100k_seg_maps/labels",
+        "drivable_annotations_dir": "panoptic_perception/BDD100k/bdd100k_drivable_maps/labels",
+        "train_batch_size":8,
+        "train_shuffle":true,
+        "train_num_workers":1,
+        "train_preprocessor_kwargs":{
+            "image_resize": [640, 640],
+            "original_image_size": [720, 1280]
+        },
+        "val_batch_size":12,
+        "val_shuffle":false,
+        "val_num_workers":1,
+        "val_preprocessor_kwargs":{
+            "image_resize": [640, 640],
+            "original_image_size": [720, 1280]    
+        }
+    },
+    "optimizer_kwargs":{
+        "_description": "AdamW optimizer configuration",
+        "_type": "AdamW",
+        "initial_lr": 1e-4,
+        "weight_decay": 0.01
+    },
+    "lr_scheduler_kwargs":{
+        "_type":"cosine",
+        "linear_lr_kwargs":{
+            "start_factor":1.0,
+            "end_factor":0.01
+        },
+        "cosine_annealing_lr_kwargs":{
+            "eta_min":1e-6
+        }
+    },
+    "trainer_kwargs":{
+        "output_dir": "yolop-panoptic",
+        "is_training":true,
+        "first_val_epoch": 0,
+        "metric_eval_mode": "strict",
+        "metric_average_mode": "macro",
+        "epochs": 50,
+        "monitor_train": true,
+        "monitor_val": true,
+        "gradient_clipping": 1.0,
+        "checkpoint_idx":2,
+        "gradient_accumulation_steps":1
+
+
+    }
+}
