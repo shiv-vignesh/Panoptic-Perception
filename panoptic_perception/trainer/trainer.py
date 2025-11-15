@@ -294,14 +294,14 @@ class Trainer:
                 
         avg_epoch_loss = total_loss / self.total_train_batch
 
+        self.logger.log_message(
+            f'Epoch {self.cur_epoch} - Average Loss {avg_epoch_loss:.4f} -- current_lr: {current_lr}'
+        )
+
         # Step the learning rate scheduler at the end of epoch
         if hasattr(self, 'lr_scheduler'):
             self.lr_scheduler.step()
             current_lr = self.optimizer.param_groups[0]['lr']
-
-        self.logger.log_message(
-            f'Epoch {self.cur_epoch} - Average Loss {avg_epoch_loss:.4f} -- current_lr: {current_lr}'
-        )
 
         # Log epoch-level metrics to WandB
         self.wandb_logger.log_metrics({
@@ -437,8 +437,8 @@ class Trainer:
                 if outputs.drivable_segmentation_predictions is not None:
                     drivable_preds = torch.argmax(outputs.drivable_segmentation_predictions, dim=1)
                     all_drivable_preds.append(drivable_preds.cpu())
-                    if data_items.get("drivable_masks") is not None:
-                        all_drivable_targets.append(data_items["drivable_masks"].cpu())
+                    if data_items.get("drivable_area_seg") is not None:
+                        all_drivable_targets.append(data_items["drivable_area_seg"].cpu())
 
                 if outputs.lane_segmentation_predictions is not None:
                     lane_preds = torch.argmax(outputs.lane_segmentation_predictions, dim=1)
