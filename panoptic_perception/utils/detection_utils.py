@@ -1,5 +1,6 @@
 from typing import List
 import torch
+import torchvision
 
 class DetectionHelper:
     
@@ -135,7 +136,7 @@ class DetectionHelper:
     @staticmethod
     def nms_boxes(boxes: torch.Tensor, scores: torch.Tensor, iou_threshold: float) -> List[int]:
         """
-        Perform NMS on boxes with given scores.
+        Perform NMS on boxes with given scores using optimized torchvision implementation.
 
         Args:
             boxes: (N, 4) tensor [x1, y1, x2, y2]
@@ -145,25 +146,9 @@ class DetectionHelper:
         Returns:
             List of indices to keep
         """
-        keep = []
-        order = scores.argsort(descending=True)
-
-        while order.numel() > 0:
-            if order.numel() == 1:
-                keep.append(order.item())
-                break
-
-            i = order[0].item()
-            keep.append(i)
-
-            # Compute IoU of the kept box with the rest
-            ious = DetectionHelper.box_iou(boxes[i:i+1], boxes[order[1:]])
-
-            # Keep boxes with IoU less than threshold
-            mask = ious[0] <= iou_threshold
-            order = order[1:][mask]
-
-        return keep
+        # Use torchvision's optimized NMS (GPU-accelerated, C++ backend)
+        keep_indices = torchvision.ops.nms(boxes, scores, iou_threshold)
+        return keep_indices.tolist()
 
     @staticmethod
     def box_iou(box1: torch.Tensor, box2: torch.Tensor) -> torch.Tensor:
