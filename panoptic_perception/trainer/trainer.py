@@ -280,7 +280,6 @@ class Trainer:
 
                 message = f'Epoch {self.cur_epoch} - iter {batch_idx}/{self.total_train_batch} - total loss {average_loss:.4f} -- current_lr: {current_lr}'
                 self.logger.log_message(message=message)
-                self.logger.log_new_line()
 
                 # Log to WandB
                 self.wandb_logger.log_metrics({
@@ -378,7 +377,7 @@ class Trainer:
                 outputs = self.model(
                     data_items["images"],
                     targets={
-                        "drivable_area_seg": data_items.get("drivable_masks"),
+                        "drivable_area_seg": data_items.get("drivable_area_seg"),
                         "lane_seg": data_items.get("segmentation_masks"),
                         "detections": data_items["detections"]
                     }
@@ -387,12 +386,15 @@ class Trainer:
                 # Accumulate losses
                 if outputs.detection_loss is not None:
                     total_det_loss += outputs.detection_loss.item()
+                    total_val_loss += outputs.detection_loss.item()
 
                 if outputs.drivable_segmentation_loss is not None:
                     total_drivable_loss += outputs.drivable_segmentation_loss.item()
+                    total_val_loss += outputs.drivable_segmentation_loss.item()
 
                 if outputs.lane_segmentation_loss is not None:
                     total_lane_loss += outputs.lane_segmentation_loss.item()
+                    total_val_loss += outputs.lane_segmentation_loss.item()
 
                 # Process detection predictions - concatenate layer outputs and apply NMS
                 if outputs.detection_predictions is not None:
