@@ -43,6 +43,8 @@ class Trainer:
         
         self.checkpoint_idx = trainer_kwargs['checkpoint_idx']     
         self.gradient_accumulation_steps = trainer_kwargs['gradient_accumulation_steps']
+        self.reload_optimizer_with_initial_lr = trainer_kwargs["reload_optimizer_with_initial_lr"]
+        self.lr_scheduler_start_epoch = trainer_kwargs["lr_scheduler_start_epoch"] 
 
         if not os.path.exists(self.output_dir):
             os.makedirs(self.output_dir)
@@ -62,7 +64,7 @@ class Trainer:
         }
         self.wandb_logger = WandBLogger(
             project_name=trainer_kwargs.get("wandb_project", "yolop-panoptic"),
-            run_name=trainer_kwargs.get("wandb_run_name", f"run_{datetime.now().strftime('%Y%m%d_%H%M%S')}"),
+            run_name=trainer_kwargs.get("wandb_run_name", f"run_{datetime.now()}"),
             config=wandb_config,
             entity=trainer_kwargs.get("wandb_entity", None),
             tags=trainer_kwargs.get("wandb_tags", ["yolop", "panoptic"]),
@@ -161,12 +163,16 @@ class Trainer:
                 momentum=optimizer_kwargs.get("momentum", 0.7)
             )
             
+            self.inital_lr = optimizer_kwargs.get("initial_lr", 3e-5)
+            
         elif optimizer_kwargs["_type"] == "AdamW":
             self.optimizer = torch.optim.AdamW(
                 self.model.parameters(),
                 lr=optimizer_kwargs.get("initial_lr", 3e-4),
                 weight_decay=optimizer_kwargs.get("weight_decay", 0.01)
-            )                        
+            )
+            
+            self.inital_lr = optimizer_kwargs.get("initial_lr", 3e-5)
     
     def _init_lr_scheduler(self, lr_scheduler_kwargs:dict):
 
@@ -197,7 +203,28 @@ class Trainer:
             self.logger.log_message(f'LR Scheduler ETA Min: {lr_scheduler_kwargs["eta_min"]}')            
             self.logger.log_new_line()
     
-    def train(self):
+    def resume_from_ckpt(self, ckpt_path:str):
+                
+        if ckpt_path and os.path.exists(ckpt_path):
+            ckpt = torch.load(ckpt_path, map_location=self.device)
+
+            self.model.load_state_dict(ckpt["model_state"])
+
+            if "optimizer_state" in ckpt and ckpt["optimizer_state"] is not None:
+                self.optimizer.load_state_dict(ckpt["optimizer_state"])
+                
+                if self.reload_optimizer_with_initial_lr:
+                    for param_group in self.optimizer.param_groups:
+                        param_group['lr'] = self.inital_lr                    
+
+            if "scheduler_state" in ckpt and ckpt["scheduler_state"] is not None:
+                if hasattr(self, "lr_scheduler"):
+                    self.lr_scheduler.load_state_dict(ckpt["scheduler_state"])
+
+            self.start_epoch = ckpt.get("epoch", 1)
+            self.logger.log_message(f"Resuming from epoch {self.start_epoch}")
+    
+    def train(self, checkpoint_path:str=None):
         self.logger.log_line()
         
         tasks = []
@@ -222,8 +249,11 @@ class Trainer:
         self.cur_epoch = 0
         # self.best_score = 0.0
         self.best_score = defaultdict(float)
+        
+        self.start_epoch = 1
+        self.resume_from_ckpt(checkpoint_path)
 
-        for epoch in range(1, self.epochs + 1):
+        for epoch in range(self.start_epoch, self.epochs + 1):
             self.cur_epoch = epoch
             self.logger.log_line()
 
@@ -234,6 +264,16 @@ class Trainer:
                     ckpt_dir = f'{self.output_dir}/ckpt_{self.cur_epoch}'
                     if not os.path.exists(ckpt_dir):
                         os.makedirs(ckpt_dir)
+                    
+                    torch.save(
+                        {
+                            "epoch": self.cur_epoch,
+                            "model_state": self.model.state_dict(),
+                            "optimizer_state": self.optimizer.state_dict(),
+                            "scheduler_state": self.lr_scheduler.state_dict() if hasattr(self, "lr_scheduler") else None
+                        },
+                        f"{ckpt_dir}/ckpt-{self.cur_epoch}.pt"
+                    )
 
             if self.monitor_val and self.cur_epoch >= self.first_val_epoch:
                 self.eval_one_epoch()
@@ -300,8 +340,9 @@ class Trainer:
 
         # Step the learning rate scheduler at the end of epoch
         if hasattr(self, 'lr_scheduler'):
-            self.lr_scheduler.step()
-            current_lr = self.optimizer.param_groups[0]['lr']
+            if self.lr_scheduler_start_epoch != -1 and self.cur_epoch > self.lr_scheduler_start_epoch:
+                self.lr_scheduler.step()
+                current_lr = self.optimizer.param_groups[0]['lr']
 
         # Log epoch-level metrics to WandB
         self.wandb_logger.log_metrics({
@@ -413,10 +454,14 @@ class Trainer:
                     # Apply NMS
                     nms_results = DetectionHelper.non_max_suppression(
                         concatenated_preds,
-                        conf_threshold=0.25,
+                        conf_threshold=0.00,
                         iou_threshold=0.45,
                         max_detections=100
                     )
+                    
+                    print(nms_results)
+                    exit(1)
+                    
                     all_detections.extend(nms_results)
 
                     # Process ground truth detections
@@ -445,6 +490,7 @@ class Trainer:
                     all_lane_preds.append(lane_preds.cpu())
                     if data_items.get("segmentation_masks") is not None:
                         all_lane_targets.append(data_items["segmentation_masks"].cpu())
+
 
         # Compute metrics
         num_batches = len(self.val_dataloader)

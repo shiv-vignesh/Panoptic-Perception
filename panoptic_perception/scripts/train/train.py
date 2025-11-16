@@ -14,9 +14,9 @@ def create_model(model_kwargs:dict):
     assert os.path.exists(cfg_path), f'{cfg_path} does not exists'
     model = YOLOP(cfg_path)
     
-    device = torch.device("cuda") if torch.cuda.is_available() and device == "cuda" else torch.device("cpu")    
-    model.to(device)
-
+    device = torch.device("cuda") if torch.cuda.is_available() and device == "cuda" else torch.device("cpu")
+    model.to(device)  
+    
     return model, device
 
 def create_trainer(trainer_kwargs_path:str):
@@ -37,12 +37,12 @@ def create_trainer(trainer_kwargs_path:str):
         trainer_kwargs=trainer_kwargs["trainer_kwargs"]
     )
     
-    return trainer
+    return trainer, trainer_kwargs["trainer_kwargs"]["checkpoint_path"]
 
 if __name__ == "__main__":
     
-    trainer = create_trainer(
+    trainer, checkpoint_path = create_trainer(
         "panoptic_perception/configs/trainer/train_kwargs.json"
     )
     
-    trainer.train()
+    trainer.train(checkpoint_path)

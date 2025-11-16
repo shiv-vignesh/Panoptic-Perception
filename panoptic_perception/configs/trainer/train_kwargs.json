@@ -1,22 +1,22 @@
 {
     "model_kwargs":{
-        "cfg_path":"panoptic_perception/configs/models/yolop.cfg",
+        "cfg_path":"panoptic_perception/configs/models/yolo-detection.cfg",
         "device":"cuda"
     },
 
     "dataset_kwargs":{
-        "images_dir": "panoptic_perception/BDD100k/100k/100k",
+        "images_dir": "panoptic_perception/BDD100k/100k",
         "detection_annotations_dir": "panoptic_perception/BDD100k/bdd100k_labels/100k",
         "segmentation_annotations_dir": "panoptic_perception/BDD100k/bdd100k_seg_maps/labels",
         "drivable_annotations_dir": "panoptic_perception/BDD100k/bdd100k_drivable_maps/labels",
-        "train_batch_size":8,
+        "train_batch_size":16,
         "train_shuffle":true,
         "train_num_workers":1,
         "train_preprocessor_kwargs":{
             "image_resize": [640, 640],
             "original_image_size": [720, 1280]
         },
-        "val_batch_size":12,
+        "val_batch_size":1,
         "val_shuffle":false,
         "val_num_workers":1,
         "val_preprocessor_kwargs":{
@@ -27,8 +27,9 @@
     "optimizer_kwargs":{
         "_description": "AdamW optimizer configuration",
         "_type": "AdamW",
-        "initial_lr": 1e-4,
-        "weight_decay": 0.01
+        "initial_lr": 1e-3,
+        "weight_decay": 0.01,
+        "momentum":0.9
     },
     "lr_scheduler_kwargs":{
         "_type":"cosine",
@@ -41,18 +42,19 @@
         }
     },
     "trainer_kwargs":{
-        "output_dir": "yolop-panoptic",
+        "output_dir": "yolop-detection-reduced-classes-2-debug",
         "is_training":true,
         "first_val_epoch": 0,
         "metric_eval_mode": "strict",
         "metric_average_mode": "macro",
         "epochs": 50,
-        "monitor_train": true,
+        "monitor_train": false,
         "monitor_val": true,
         "gradient_clipping": 1.0,
         "checkpoint_idx":2,
-        "gradient_accumulation_steps":1
-
-
+        "gradient_accumulation_steps":4,
+        "lr_scheduler_start_epoch":15,
+        "checkpoint_path":"yolop-detection-reduced-classes-2/ckpt_23/ckpt-23.pt",
+        "reload_optimizer_with_initial_lr":false
     }
 }

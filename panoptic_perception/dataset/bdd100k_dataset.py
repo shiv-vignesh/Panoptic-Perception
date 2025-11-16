@@ -6,7 +6,7 @@ import json
 import cv2
 import albumentations as A
 
-from panoptic_perception.dataset.enums import BDD100KClasses
+from panoptic_perception.dataset.enums import BDD100KClasses, BDD100KClassesReduced
 
 class BDDPreprocessor:
     def __init__(self, preprocess_kwargs:dict):
@@ -55,7 +55,8 @@ class BDDPreprocessor:
                     box = item["box2d"]
                     label = item["category"]
                     label = '_'.join(label.split())
-                    label_id = BDD100KClasses.from_label(label)
+                    # label_id = BDD100KClasses.from_label(label)
+                    label_id = BDD100KClassesReduced.from_label(label)
                     
                     if box["x2"] > box["x1"] and box["y2"] > box["y1"]: 
                         bboxes.append([box["x1"], box["y1"], box["x2"], box["y2"]])
