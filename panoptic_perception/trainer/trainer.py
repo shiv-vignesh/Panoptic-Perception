@@ -459,9 +459,6 @@ class Trainer:
                         max_detections=100
                     )
                     
-                    print(nms_results)
-                    exit(1)
-                    
                     all_detections.extend(nms_results)
 
                     # Process ground truth detections

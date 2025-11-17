@@ -62,7 +62,6 @@ class DetectionHelper:
             
         return iou
     
-    @staticmethod
     def non_max_suppression(
         predictions: torch.Tensor,
         conf_threshold: float = 0.25,
@@ -90,22 +89,25 @@ class DetectionHelper:
         for img_idx in range(batch_size):
             pred = predictions[img_idx]  # (num_boxes, 5+num_classes)
 
-            # Filter by objectness threshold
-            obj_conf = pred[:, 4]
-            pred = pred[obj_conf > conf_threshold]
-
             if pred.shape[0] == 0:
                 continue
 
-            # Convert from (x, y, w, h) to (x1, y1, x2, y2)
-            boxes = DetectionHelper.xywh2xyxy(pred[:, :4])
+            # Multiply class scores by objectness to get final confidence
+            pred[:, 5:] *= pred[:, 4:5]
 
-            # Get objectness and class predictions from filtered pred
-            obj_conf_filtered = pred[:, 4]
+            # Get max confidence across all classes
             class_conf, class_pred = pred[:, 5:].max(1, keepdim=True)
 
-            # Combine: [x1, y1, x2, y2, obj_conf, class_conf, class_pred]
-            detections = torch.cat([boxes, obj_conf_filtered.unsqueeze(1), class_conf, class_pred.float()], 1)
+            # Filter by confidence threshold
+            conf_mask = class_conf[:, 0] > conf_threshold
+            pred = pred[conf_mask]
+            class_conf = class_conf[conf_mask]
+            class_pred = class_pred[conf_mask]
+
+            # Convert from (x, y, w, h) to (x1, y1, x2, y2)
+            boxes = DetectionHelper.xywh2xyxy(pred[:, :4])
+            
+            detections = torch.cat([boxes, class_conf, class_pred.float()], 1)
 
             # Perform NMS per class
             unique_classes = detections[:, -1].unique()
@@ -115,14 +117,14 @@ class DetectionHelper:
                 cls_mask = detections[:, -1] == cls
                 cls_detections = detections[cls_mask]
 
-                # Sort by confidence
-                conf_sort_idx = torch.argsort(cls_detections[:, 4] * cls_detections[:, 5], descending=True)
+                # Sort by confidence (column 4 - already final confidence)
+                conf_sort_idx = torch.argsort(cls_detections[:, 4], descending=True)
                 cls_detections = cls_detections[conf_sort_idx]
 
-                # NMS
+                # NMS using final confidence (column 4 - no multiply!)
                 keep_idx = DetectionHelper.nms_boxes(
                     cls_detections[:, :4],
-                    cls_detections[:, 4] * cls_detections[:, 5],
+                    cls_detections[:, 4],  # Just column 4, NOT [:, 4] * [:, 5]
                     iou_threshold
                 )
 
@@ -267,7 +269,8 @@ class DetectionLossCalculator:
             anchors = anchors / strides[i]
             
             # [1, 1, grid_w, grid_h, grid_w, grid_h, 1]
-            gain[2:6] = torch.tensor(outputs[i].shape)[[3, 4, 3, 4]] #indexing by height and width of feature map
+            # gain[2:6] = torch.tensor(outputs[i].shape)[[3, 4, 3, 4]] # FIXME, indexing by height and width of feature map
+            gain[2:6] = torch.tensor(outputs[i].shape)[[3, 2, 3, 2]] # indexing by height and width of feature map
 
             # multiplying targets by gain scales normalized x,y,w,h to grid-cell coordinates.
             t = targets * gain # shape (num_anchors, num_targets, 7)
@@ -365,16 +368,30 @@ class DetectionLossCalculator:
             # print(f"\n[compute_detection_loss] Layer {i}: num_targets = {num_targets}")
 
             if num_targets:
+                                
                 ps = output[b, a, gj, gi] # shape (num_targets, 5 + num_classes)
 
-                # Regression
+                # # Predictions in grid space
+                # grid_xy = torch.stack((gi, gj), dim=1).float()
+                # pxy = ps[:, 0:2].sigmoid() + grid_xy  # Absolute grid coordinates
+                # pwh = torch.exp(ps[:, 2:4]) * anchors[i]
+                # pbox = torch.cat((pxy, pwh), 1)
+
+                # # Targets in grid space (convert offset to absolute)
+                # tbox_absolute = tbox[i].clone()
+                # tbox_absolute[:, :2] += grid_xy  # offset → absolute grid coordinate
+
+                # # Compute IoU in grid space (no need to convert to pixels!)
+                # iou = DetectionHelper.bbox_iou(pbox, tbox_absolute, x1y1x2y2=False, CIoU=True)                
+
+                #VERSUS
+
                 pxy = ps[:, 0:2].sigmoid()
                 pwh = torch.exp(ps[:, 2:4]) * anchors[i]
                 pbox = torch.cat((pxy, pwh), 1)            
 
                 iou = DetectionHelper.bbox_iou(pbox, tbox[i], x1y1x2y2=False, CIoU=True)
                 ious.append(iou.mean().item())
-
                 lbox += (1.0 - iou).mean()
 
                 # Objectness
@@ -406,4 +423,3 @@ class DetectionLossCalculator:
             "lcls": lcls,
             "iou": sum(ious) / len(ious) if len(ious) > 0 else 0.0
         }
-                    

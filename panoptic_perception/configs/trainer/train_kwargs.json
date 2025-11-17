@@ -16,7 +16,7 @@
             "image_resize": [640, 640],
             "original_image_size": [720, 1280]
         },
-        "val_batch_size":1,
+        "val_batch_size":24,
         "val_shuffle":false,
         "val_num_workers":1,
         "val_preprocessor_kwargs":{
@@ -42,7 +42,7 @@
         }
     },
     "trainer_kwargs":{
-        "output_dir": "yolop-detection-reduced-classes-2-debug",
+        "output_dir": "yolop-detection-reduced-classes-3",
         "is_training":true,
         "first_val_epoch": 0,
         "metric_eval_mode": "strict",
@@ -53,8 +53,10 @@
         "gradient_clipping": 1.0,
         "checkpoint_idx":2,
         "gradient_accumulation_steps":4,
-        "lr_scheduler_start_epoch":15,
-        "checkpoint_path":"yolop-detection-reduced-classes-2/ckpt_23/ckpt-23.pt",
-        "reload_optimizer_with_initial_lr":false
+        "lr_scheduler_start_epoch":10,
+        "checkpoint_path":"",
+        "reload_optimizer_with_initial_lr":false,
+
+        "wandb_project":"yolop-detection-reduced-classes"
     }
 }
