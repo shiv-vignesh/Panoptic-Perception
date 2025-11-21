@@ -5,7 +5,7 @@
     },
 
     "dataset_kwargs":{
-        "images_dir": "panoptic_perception/BDD100k/100k",
+        "images_dir": "panoptic_perception/BDD100k/100k/100k",
         "detection_annotations_dir": "panoptic_perception/BDD100k/bdd100k_labels/100k",
         "segmentation_annotations_dir": "panoptic_perception/BDD100k/bdd100k_seg_maps/labels",
         "drivable_annotations_dir": "panoptic_perception/BDD100k/bdd100k_drivable_maps/labels",
@@ -16,7 +16,7 @@
             "image_resize": [640, 640],
             "original_image_size": [720, 1280]
         },
-        "val_batch_size":24,
+        "val_batch_size":4,
         "val_shuffle":false,
         "val_num_workers":1,
         "val_preprocessor_kwargs":{
@@ -42,7 +42,7 @@
         }
     },
     "trainer_kwargs":{
-        "output_dir": "yolop-detection-reduced-classes-3",
+        "output_dir": "yolop-detection-reduced-classes-3-debug",
         "is_training":true,
         "first_val_epoch": 0,
         "metric_eval_mode": "strict",
