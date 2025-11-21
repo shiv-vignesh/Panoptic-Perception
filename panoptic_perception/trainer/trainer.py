@@ -440,7 +440,7 @@ class Trainer:
                 # Process detection predictions - concatenate layer outputs and apply NMS
                 if outputs.detection_predictions is not None:
                     detection_preds = outputs.detection_predictions
-                    batch_size = data_items["images"].shape[0]
+                    batch_size, _, image_h, image_w = data_items["images"].shape
 
                     # Concatenate predictions from all detection layers
                     all_predictions = []
@@ -454,7 +454,7 @@ class Trainer:
                     # Apply NMS
                     nms_results = DetectionHelper.non_max_suppression(
                         concatenated_preds,
-                        conf_threshold=0.00,
+                        conf_threshold=0.25,
                         iou_threshold=0.45,
                         max_detections=100
                     )
@@ -468,12 +468,39 @@ class Trainer:
 
                         if img_targets.shape[0] > 0:
                             boxes_xywh = img_targets[:, 2:6]
+                            boxes_xywh[:, [0,2]] *= image_w
+                            boxes_xywh[:, [1,3]] *= image_h
                             boxes_xyxy = DetectionHelper.xywh2xyxy(boxes_xywh)
                             classes = img_targets[:, 1:2]
                             gts = torch.cat([boxes_xyxy, classes], dim=1)
                             all_detection_targets.append(gts)
                         else:
                             all_detection_targets.append(None)
+
+                # # Check ranges
+                # image_size = (image_h, image_w)
+                # for idx, layer_pred in enumerate(all_predictions):
+                #     xy = layer_pred[..., 0:2]
+                #     wh = layer_pred[..., 2:4]
+                    
+                #     print(f'Prediction: {idx} -- XY Min: {xy.min()} XY Max: {xy.max()}')
+                #     print(f'Prediction: {idx} -- WH Min: {wh.min()} WH Max: {wh.max()}')
+
+                #     assert xy.max() <= image_size[1]+1e-3, f"X/Y coords exceed image width/height: {xy.max()}"
+                #     assert wh.max() <= max(image_size), f"W/H coords exceed image size: {wh.max()}"
+                #     assert xy.min() >= 0, f"X/Y coords < 0: {xy.min()}"
+                #     assert wh.min() >= 0, f"W/H coords < 0: {wh.min()}"
+
+                # # Check targets
+                
+                # print(f'Targets Min: {img_targets[:,2:6].min()} -- Targets Max: {img_targets[:,2:6].max()}')
+                
+                # assert img_targets[:,2:6].max() <= max(image_size), f"Target box exceeds image size: {img_targets[:,2:6].max()}"
+                # assert img_targets[:,2:6].min() >= 0, f"Target box has negative values: {img_targets[:,2:6].min()}"
+
+                # print("Activation outputs and targets are in image pixel scale.")
+                
+                # exit(1)
 
                 # Process segmentation predictions
                 if outputs.drivable_segmentation_predictions is not None:

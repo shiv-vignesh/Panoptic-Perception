@@ -186,8 +186,7 @@ class YOLOP(nn.Module):
                     model_outputs.detection_logits = detection_outputs
                     
                     if not self.training:
-                        model_outputs.detection_predictions = module.activation(detection_outputs, 
-                                                                                image_size=(height, width))
+                        model_outputs.detection_predictions = module.activation(detection_outputs)
 
                     # for detection in detection_outputs:
                     #     print(f'Layer: {i} - Module Name: {self.module_names[i]} - prediction shape: {detection.shape}')
@@ -222,18 +221,26 @@ class YOLOP(nn.Module):
             if model_outputs.detection_logits is not None:
                 output_name = "detections"
                 assert output_name in targets, f"Target for {output_name} not provided."
-                
-                det_loss, det_loss_items = DetectionLossCalculator.compute_detection_loss(
+
+                # det_loss, det_loss_items = DetectionLossCalculator.compute_detection_loss(
+                #     model_outputs.detection_logits,
+                #     targets["detections"],
+                #     num_anchors=len(self.module_list[self.detection_head_idx].anchors[0]),
+                #     anchors_tensor=self.module_list[self.detection_head_idx].anchors,
+                #     strides=[width/x.shape[2] for x in model_outputs.detection_logits]
+                # )
+
+                det_loss, det_loss_items = DetectionLossCalculator.compute_detection_loss_2(
                     model_outputs.detection_logits,
                     targets["detections"],
-                    num_anchors=len(self.module_list[self.detection_head_idx].anchors[0]),
-                    anchors_tensor=self.module_list[self.detection_head_idx].anchors,
-                    strides=[width/x.shape[2] for x in model_outputs.detection_logits]
+                    self.module_list[self.detection_head_idx].num_layers,
+                    self.module_list[self.detection_head_idx].anchors,
+                    self.module_list[self.detection_head_idx].stride
                 )
-                model_outputs.detection_loss = det_loss
 
+                model_outputs.detection_loss = det_loss
                 # print(f'Detection Loss: {det_loss}')
-                
+
             if model_outputs.drivable_segmentation_logits is not None:
                 output_name = "drivable_area_seg"
                 assert output_name in targets, f"Target for {output_name} not provided."

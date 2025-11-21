@@ -101,52 +101,69 @@ class Upsample(nn.Module):
     
 class Detect(nn.Module):
     def __init__(self, anchors:List[Tuple[int]], num_classes:int, in_channels:List[int]):
-        
-        super(Detect, self).__init__()
+        super().__init__()
 
         self.num_classes = num_classes
-        self.num_outputs = num_classes + 5
+        self.num_outputs = num_classes + 5      # xywh + obj + classes
         self.num_layers = len(anchors)
 
-        self.convs = nn.ModuleList()        
+        # anchors: list of N scale lists
         self.anchors = torch.tensor(anchors).float().view(self.num_layers, -1, 2)
+        self.register_buffer("anchors_grid", self.anchors)
 
+        self.convs = nn.ModuleList()
         for i, in_ch in enumerate(in_channels):
-            out_ch = self.num_outputs * len(self.anchors[i])
-            self.convs.append(nn.Conv2d(in_ch, out_ch, kernel_size=1, stride=1))        
-        
-        #register buffer ensure persistance across model saves & does not update during backprop
-
-        # self.register_buffer("stride", torch.zeros(self.num_layers)) 
-        self.register_buffer("anchor_grid", self.anchors.clone().view(self.num_layers, 1, -1, 1, 1, 2))
+            na = self.anchors[i].shape[0]
+            out_ch = na * self.num_outputs
+            self.convs.append(nn.Conv2d(in_ch, out_ch, 1, 1))
 
         self.stride = None
-    
-    def forward(self, x:List[torch.Tensor], image_size:Tuple[int, int]):
-        
+
+
+    def forward(self, x:List[torch.Tensor], image_size:Tuple[int,int]):
+
         for i in range(self.num_layers):
-            
             bs, _, ny, nx = x[i].shape
-            x[i] = self.convs[i](x[i]) #(bs, dim, ny, nx) to (bs, num_outputs * num_anchors, ny, nx)
-            x[i] = x[i].view(bs, -1, self.num_outputs, ny, nx).permute(0, 1, 3, 4, 2).contiguous() #(bs, num_anchors, ny, nx, num_outputs)
-            
-            self.stride = image_size[0] / ny  #assume square input
-            
+            x[i] = self.convs[i](x[i])
+            x[i] = x[i].view(bs, -1, self.num_outputs, ny, nx).permute(0,1,3,4,2).contiguous()
+
+        if self.stride is None:
+            self.stride = torch.tensor(
+                [image_size[0] // x[i].shape[2] for i in range(self.num_layers)],
+                device=x[0].device
+            )
+
         return x
-    
-    def activation(self, x:List[torch.Tensor], image_size:Tuple[int, int]):
+
+
+    def activation(self, x: List[torch.Tensor]):
+        """Decode predictions to image-space YOLOv3 boxes (pixels)."""
         outputs = []
         for i in range(self.num_layers):
             bs, na, ny, nx, _ = x[i].shape
-            stride = image_size[0] // ny
+            stride = self.stride[i]
 
-            grid_y, grid_x = torch.meshgrid(torch.arange(ny), torch.arange(nx), indexing='ij')
-            grid = torch.stack((grid_x, grid_y), 2).view((1, 1, ny, nx, 2)).float().to(x[i].device)
+            # Grid
+            yv, xv = torch.meshgrid(
+                torch.arange(ny, device=x[i].device),
+                torch.arange(nx, device=x[i].device),
+                indexing='ij'
+            )
+            grid = torch.stack((xv, yv), 2).view(1, 1, ny, nx, 2).float()
 
+            # Clone tensor
             y = x[i].clone()
-            y[..., 0:2] = (y[..., 0:2].sigmoid() + grid) * stride  # Classic YOLO: (σ(x) + grid) * stride
-            y[..., 2:4] = torch.exp(y[..., 2:4]) * self.anchor_grid[i]  # Classic YOLO: e^x * anchor
-            y[..., 4:] = y[..., 4:].sigmoid()  # Objectness and class probabilities
+
+            # Decode xy: sigmoid + grid -> pixels
+            y[..., 0:2] = (y[..., 0:2].sigmoid() + grid) * stride
+
+            # Decode wh: exp + anchor -> pixels
+            anchor = self.anchors[i].view(1, na, 1, 1, 2)  # anchors in pixels per stride
+            y[..., 2:4] = torch.exp(y[..., 2:4]) * anchor  # <-- scale to image pixels
+
+            # Objectness + class scores
+            y[..., 4:] = y[..., 4:].sigmoid()
 
             outputs.append(y)
+
         return outputs
