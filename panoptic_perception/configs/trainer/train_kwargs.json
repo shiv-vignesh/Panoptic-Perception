@@ -5,7 +5,7 @@
     },
 
     "dataset_kwargs":{
-        "images_dir": "panoptic_perception/BDD100k/100k",
+        "images_dir": "panoptic_perception/BDD100k/100k/100k",
         "detection_annotations_dir": "panoptic_perception/BDD100k/bdd100k_labels/100k",
         "segmentation_annotations_dir": "panoptic_perception/BDD100k/bdd100k_seg_maps/labels",
         "drivable_annotations_dir": "panoptic_perception/BDD100k/bdd100k_drivable_maps/labels",
@@ -46,7 +46,11 @@
         }
     },
     "trainer_kwargs":{
+<<<<<<< HEAD
         "output_dir": "yolop-detection-reduced-classes-3-augmentation",
+=======
+        "output_dir": "yolop-detection-reduced-classes-3-debug",
+>>>>>>> eec8f57 (fix detect.activation, fix anchor scaling per stride, scale targets to img_size)
         "is_training":true,
         "first_val_epoch": 0,
         "metric_eval_mode": "strict",
