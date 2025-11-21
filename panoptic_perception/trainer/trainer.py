@@ -365,9 +365,9 @@ class Trainer:
                 "lane_seg": data_items.get("segmentation_masks"),
                 "detections": data_items["detections"]
             }            
-        )
+        )        
         
-        loss = torch.tensor(0.0, device=self.device)
+        loss = torch.zeros(1, device=self.device)
         
         if outputs.detection_loss is not None:
             loss += outputs.detection_loss
