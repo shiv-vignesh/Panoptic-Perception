@@ -27,7 +27,7 @@ class BDD100KClasses(Enum):
 class BDD100KClassesReduced(Enum):
     PERSON = 0
     RIDER = 1
-    TRAIN = CAR = TRUCK = BUS =  2
+    VEHICLES = TRAIN = CAR = TRUCK = BUS =  2
     MOTOR = MOTORCYCLE = BIKE = BICYCLE = 3
     TRAFFIC_LIGHT = 4
     TRAFFIC_SIGN = 5

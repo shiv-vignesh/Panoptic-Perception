@@ -11,6 +11,7 @@ from torch.utils.data.dataloader import DataLoader
 import numpy as np
 
 from panoptic_perception.dataset.bdd100k_dataset import BDD100KDataset, BDDPreprocessor
+from panoptic_perception.dataset.enums import BDD100KClassesReduced
 
 from panoptic_perception.models.models import YOLOP
 from panoptic_perception.models.utils import PanopticModelOutputs
@@ -112,7 +113,7 @@ class Trainer:
         def create_dataloader(images_dir:str, detection_annotations_dir:dict, 
                             segmentation_annotations_dir:dict, drivable_annotations_dir:dict,
                             preprocessor_kwargs:dict, dataset_type:str, batch_size:int, 
-                            shuffle:bool=False, num_workers:int=1):
+                            perform_augmentation:bool=False, shuffle:bool=False, num_workers:int=1):
             
             dataset = BDD100KDataset({
                 "images_dir":images_dir, 
@@ -120,7 +121,8 @@ class Trainer:
                 "segmentation_annotations_dir":segmentation_annotations_dir,
                 "drivable_annotations_dir":drivable_annotations_dir,
                 "preprocessor_kwargs":preprocessor_kwargs
-            }, dataset_type=dataset_type)
+            }, dataset_type=dataset_type, 
+            perform_augmentation=perform_augmentation)
             
             return DataLoader(
                 dataset, 
@@ -139,7 +141,8 @@ class Trainer:
             dataset_type="train",
             batch_size=dataset_kwargs["train_batch_size"],
             shuffle=dataset_kwargs.get("train_shuffle", True),
-            num_workers=dataset_kwargs.get("train_num_workers", 1)
+            num_workers=dataset_kwargs.get("train_num_workers", 1),
+            perform_augmentation=dataset_kwargs.get("train_preprocessor_kwargs", False).get("perform_augmentation", False)
         )
         
         self.val_dataloader = create_dataloader(
@@ -451,14 +454,21 @@ class Trainer:
 
                     concatenated_preds = torch.cat(all_predictions, dim=1)
 
+                    # print(concatenated_preds[:, :, 4].mean())
+                    # exit(1)
+
                     # Apply NMS
                     nms_results = DetectionHelper.non_max_suppression(
                         concatenated_preds,
                         conf_threshold=0.25,
                         iou_threshold=0.45,
-                        max_detections=100
+                        max_detections=500
                     )
-                    
+
+                    # for idx, result in enumerate(nms_results):
+                    #     print(f'batch_idx {idx} - result: {result.shape}')
+                    # exit(1)
+
                     all_detections.extend(nms_results)
 
                     # Process ground truth detections
@@ -527,19 +537,22 @@ class Trainer:
 
         # Detection metrics
         detection_metrics = {}
+        num_classes = len(BDD100KClassesReduced)
         if len(all_detections) > 0 and len(all_detection_targets) > 0:
             ap_results = DetectionMetrics.calculate_ap(
                 all_detections,
                 all_detection_targets,
-                iou_threshold=0.5,
-                num_classes=10
+                iou_threshold=0.25,
+                num_classes=num_classes
             )
             detection_metrics = ap_results
 
-            # Create AP table for logging
+            # Create AP table for logging with class names
             ap_table_data = [["Class", "AP"]]
-            for cls in range(10):
-                ap_table_data.append([f"Class {cls}", f"{ap_results.get(f'AP_class_{cls}', 0.0):.4f}"])
+            for cls in range(num_classes):
+                class_name = BDD100KClassesReduced(cls).name
+                ap_value = ap_results.get(f'AP_class_{cls}', 0.0)
+                ap_table_data.append([f"{cls}: {class_name}", f"{ap_value:.4f}"])
             ap_table_data.append(["mAP@0.5", f"{ap_results['mAP']:.4f}"])
 
             ap_table_string = AsciiTable(ap_table_data).table
@@ -548,7 +561,7 @@ class Trainer:
             self.logger.log_message(ap_table_string)
 
             # Log AP table to WandB
-            wandb_ap_data = [[f"Class {cls}", ap_results.get(f'AP_class_{cls}', 0.0)] for cls in range(10)]
+            wandb_ap_data = [[f"{cls}: {BDD100KClassesReduced(cls).name}", ap_results.get(f'AP_class_{cls}', 0.0)] for cls in range(num_classes)]
             wandb_ap_data.append(["mAP@0.5", ap_results['mAP']])
             self.wandb_logger.log_table(
                 "val/detection_ap",
@@ -629,7 +642,7 @@ class Trainer:
         # Add detection metrics
         if detection_metrics:
             wandb_metrics["val/mAP"] = detection_metrics["mAP"]
-            for cls in range(10):
+            for cls in range(num_classes):
                 wandb_metrics[f"val/AP_class_{cls}"] = detection_metrics.get(f'AP_class_{cls}', 0.0)
 
         # Add drivable metrics

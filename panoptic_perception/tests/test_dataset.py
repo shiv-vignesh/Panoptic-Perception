@@ -12,9 +12,8 @@ from torch.utils.data import DataLoader
 # Add parent directory to path
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
-from dataset.bdd100k_dataset import BDDPreprocessor, BDD100KDataset
+from dataset.bdd100k_dataset import BDDPreprocessor, BDD100KDataset, visualize_batch
 from dataset.enums import BDD100KClasses
-
 
 def test_bdd_classes():
     """Test BDD100K class enumeration."""
@@ -156,7 +155,7 @@ def test_dataset_creation():
 
     # Define paths (adjust these to your actual data paths)
     dataset_kwargs = {
-        "images_dir": "panoptic_perception/BDD100k/100k/100k",
+        "images_dir": "panoptic_perception/BDD100k/100k",
         "detection_annotations_dir": "panoptic_perception/BDD100k/bdd100k_labels/100k",
         "segmentation_annotations_dir": "panoptic_perception/BDD100k/bdd100k_seg_maps/labels",
         "drivable_annotations_dir": "panoptic_perception/BDD100k/bdd100k_drivable_maps/labels",
@@ -167,7 +166,7 @@ def test_dataset_creation():
     }        
 
     try:
-        dataset = BDD100KDataset(dataset_kwargs, dataset_type='train')
+        dataset = BDD100KDataset(dataset_kwargs, dataset_type='train', perform_augmentation=True)
         print(f"✓ Dataset created successfully")
         print(f"  Dataset type: {dataset.dataset_type}")
         print(f"  Dataset length: {len(dataset)}")
@@ -233,7 +232,7 @@ def test_dataloader_creation(dataset=None):
         dataloader = DataLoader(
             dataset,
             batch_size=16,
-            shuffle=True,
+            shuffle=False,
             num_workers=0,  # Use 0 for debugging, increase for training
             collate_fn=BDDPreprocessor.collate_fn
         )
@@ -287,6 +286,11 @@ def test_dataloader_iteration(dataloader=None):
             print(f"  Detection targets shape: {batch['detections'].shape}")
             print(f"  Total objects in batch: {batch['detections'].shape[0]}")
             print(f"  Batch indices: {batch['detections'][:, 0].unique().tolist()}")
+            
+        save_dir = "panoptic_perception/BDD100k/sample_target_visualizations"
+        for batch_idx in range(batch["images"].shape[0]):
+            print(f"  Visualizing: {batch_idx}")
+            visualize_batch(batch["images"], batch["detections"], save_dir=save_dir, batch_index=batch_idx)
 
     except Exception as e:
         print(f"✗ Failed to iterate DataLoader")

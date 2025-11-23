@@ -135,7 +135,6 @@ class Detect(nn.Module):
 
         return x
 
-
     def activation(self, x: List[torch.Tensor]):
         """Decode predictions to image-space YOLOv3 boxes (pixels)."""
         outputs = []
@@ -159,7 +158,7 @@ class Detect(nn.Module):
 
             # Decode wh: exp + anchor -> pixels
             anchor = self.anchors[i].view(1, na, 1, 1, 2)  # anchors in pixels per stride
-            y[..., 2:4] = torch.exp(y[..., 2:4]) * anchor  # <-- scale to image pixels
+            y[..., 2:4] = torch.exp(y[..., 2:4]) * anchor.to(x[i].device)  # <-- scale to image pixels
 
             # Objectness + class scores
             y[..., 4:] = y[..., 4:].sigmoid()

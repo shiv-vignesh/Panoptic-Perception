@@ -14,7 +14,8 @@
         "train_num_workers":1,
         "train_preprocessor_kwargs":{
             "image_resize": [640, 640],
-            "original_image_size": [720, 1280]
+            "original_image_size": [720, 1280],
+            "perform_augmentation":true
         },
         "val_batch_size":16,
         "val_shuffle":false,
@@ -27,7 +28,7 @@
     "optimizer_kwargs":{
         "_description": "AdamW optimizer configuration",
         "_type": "AdamW",
-        "initial_lr": 1e-4,
+        "initial_lr": 5e-4,
         "weight_decay": 0.01,
         "momentum":0.9
     },
@@ -42,7 +43,7 @@
         }
     },
     "trainer_kwargs":{
-        "output_dir": "yolop-detection-reduced-classes-3",
+        "output_dir": "yolop-detection-reduced-classes-3-augmentation",
         "is_training":true,
         "first_val_epoch": 0,
         "metric_eval_mode": "strict",
@@ -52,9 +53,9 @@
         "monitor_val": true,
         "gradient_clipping": 1.0,
         "checkpoint_idx":2,
-        "gradient_accumulation_steps":4,
+        "gradient_accumulation_steps":2,
         "lr_scheduler_start_epoch":10,
-        "checkpoint_path":"",
+        "checkpoint_path":"yolop-detection-reduced-classes-3-debug/ckpt_7/ckpt-7.pt",
         "reload_optimizer_with_initial_lr":false,
 
         "wandb_project":"yolop-detection-reduced-classes"

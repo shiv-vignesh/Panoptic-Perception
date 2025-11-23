@@ -211,8 +211,8 @@ class DetectionHelper:
 class DetectionLossCalculator:
     
     
-    bbox_weight: float = 0.05
-    obj_weight: float = 1.0
+    bbox_weight: float = 0.5
+    obj_weight: float = 2.0
     cls_weight: float = 0.5
 
     @staticmethod
