@@ -226,7 +226,92 @@ def apply_salt_pepper(img, salt_prob=0.01, pepper_prob=0.01):
         pepper_mask = np.random.random((h, w)) < pepper_prob
         noisy_img[pepper_mask] = 0
 
-    return noisy_img    
+    return noisy_img
+
+
+def copy_paste_instances(img, labels, source_img, source_labels, target_classes=[1, 3], max_instances=3):
+    """
+    Copy-paste instances of specific classes from source to target image.
+    Particularly useful for boosting long-tail classes (RIDER, MOTOR).
+
+    Args:
+        img: target image (HWC, BGR)
+        labels: target labels (Nx5: [class, cx, cy, w, h] normalized)
+        source_img: source image to copy from
+        source_labels: source labels
+        target_classes: list of class IDs to copy (default: [1=RIDER, 3=MOTOR])
+        max_instances: maximum number of instances to paste
+
+    Returns:
+        img, labels (with pasted instances)
+    """
+    if len(source_labels) == 0:
+        return img, labels
+
+    h, w = img.shape[:2]
+    img = img.copy()
+    labels_list = list(labels) if len(labels) > 0 else []
+
+    # Find instances of target classes in source
+    paste_candidates = []
+    for label in source_labels:
+        cls = int(label[0])
+        if cls in target_classes:
+            paste_candidates.append(label)
+
+    if len(paste_candidates) == 0:
+        return img, labels
+
+    # Randomly select instances to paste
+    num_to_paste = min(len(paste_candidates), max_instances)
+    instances_to_paste = random.sample(paste_candidates, num_to_paste)
+
+    sh, sw = source_img.shape[:2]
+
+    for instance in instances_to_paste:
+        cls, cx, cy, bw, bh = instance
+
+        # Get bbox in source image (pixel coords)
+        x1_src = int((cx - bw/2) * sw)
+        y1_src = int((cy - bh/2) * sh)
+        x2_src = int((cx + bw/2) * sw)
+        y2_src = int((cy + bh/2) * sh)
+
+        # Clip to source bounds
+        x1_src = max(0, x1_src)
+        y1_src = max(0, y1_src)
+        x2_src = min(sw, x2_src)
+        y2_src = min(sh, y2_src)
+
+        # Extract instance
+        instance_crop = source_img[y1_src:y2_src, x1_src:x2_src]
+        if instance_crop.size == 0:
+            continue
+
+        # Random paste location in target image
+        crop_h, crop_w = instance_crop.shape[:2]
+
+        # Ensure it fits in target
+        if crop_h >= h or crop_w >= w:
+            continue
+
+        # Random position (avoid edges)
+        paste_x = random.randint(0, w - crop_w)
+        paste_y = random.randint(0, h - crop_h)
+
+        # Paste instance (simple overlay - could add blending for better results)
+        img[paste_y:paste_y+crop_h, paste_x:paste_x+crop_w] = instance_crop
+
+        # Add label for pasted instance (normalized coords)
+        new_cx = (paste_x + crop_w / 2) / w
+        new_cy = (paste_y + crop_h / 2) / h
+        new_w = crop_w / w
+        new_h = crop_h / h
+
+        labels_list.append([cls, new_cx, new_cy, new_w, new_h])
+
+    return img, np.array(labels_list) if labels_list else np.zeros((0, 5))
+
 
 def apply_augmentations(img, seg, drivable, labels, params):
 

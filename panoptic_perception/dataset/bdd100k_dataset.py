@@ -75,18 +75,28 @@ class BDDPreprocessor:
         self.resized_height = self.image_resize[0]
 
         # YOLOP-style augmentation parameters
+        # Optimized for small objects and long-tail classes
         self.augment_params = preprocess_kwargs.get("augment_params", {
-            'degrees': 15,
-            'translate': 0.1,
-            'scale': 0.1,
-            'shear': 10,
+            # Geometric augmentations (reduced to preserve small objects)
+            'degrees': 7,          # Reduced from 15 - less rotation preserves small objects
+            'translate': 0.08,     # Reduced from 0.1 - keep objects in frame
+            'scale': 0.15,         # Increased from 0.1 - multi-scale helps small objects
+            'shear': 5,            # Reduced from 10 - less distortion
+
+            # Color augmentations (kept aggressive for robustness)
             'hsv_h': 0.015,
             'hsv_s': 0.7,
             'hsv_v': 0.4,
-            'salt_prob': 0.1,      # Probability of salt noise (disabled by default)
-            'pepper_prob': 0.1,    # Probability of pepper noise (disabled by default)
+
+            # Noise (reduced - hurts small objects)
+            'salt_prob': 0.005,    # Reduced from 0.1 - too much noise hurts small objects
+            'pepper_prob': 0.005,  # Reduced from 0.1
+
+            # Flip
             "flip_prob": 0.5,
-            "img_size": (self.resized_height, self.resized_width)  # Use target size, not original
+
+            # Output size
+            "img_size": (self.resized_height, self.resized_width)
         })
 
         # self.transformation = A.Compose(
