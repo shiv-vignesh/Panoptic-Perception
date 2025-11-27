@@ -6,7 +6,6 @@ import os
 import json
 import cv2
 import albumentations as A
-import matplotlib.pyplot as plt
 
 from panoptic_perception.dataset.enums import BDD100KClasses, BDD100KClassesReduced
 from panoptic_perception.dataset.augmentations import apply_augmentations
