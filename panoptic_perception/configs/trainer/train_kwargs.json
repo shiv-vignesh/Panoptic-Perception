@@ -46,11 +46,7 @@
         }
     },
     "trainer_kwargs":{
-<<<<<<< HEAD
         "output_dir": "yolop-detection-reduced-classes-3-augmentation",
-=======
-        "output_dir": "yolop-detection-reduced-classes-3-debug",
->>>>>>> eec8f57 (fix detect.activation, fix anchor scaling per stride, scale targets to img_size)
         "is_training":true,
         "first_val_epoch": 0,
         "metric_eval_mode": "strict",
