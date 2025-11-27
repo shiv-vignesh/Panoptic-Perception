@@ -28,9 +28,12 @@
     "optimizer_kwargs":{
         "_description": "AdamW optimizer configuration",
         "_type": "AdamW",
-        "initial_lr": 5e-4,
+        "initial_lr": 1e-3,
         "weight_decay": 0.01,
-        "momentum":0.9
+        "momentum":0.937,
+        "warmup_bias_lr":0.1,
+        "warmup_momentum":0.8,
+        "warmup_epochs":3
     },
     "lr_scheduler_kwargs":{
         "_type":"cosine",
@@ -54,7 +57,7 @@
         "gradient_clipping": 1.0,
         "checkpoint_idx":2,
         "gradient_accumulation_steps":2,
-        "lr_scheduler_start_epoch":10,
+        "lr_scheduler_start_epoch":1,        
         "checkpoint_path":"yolop-detection-reduced-classes-3-debug/ckpt_7/ckpt-7.pt",
         "reload_optimizer_with_initial_lr":false,
 

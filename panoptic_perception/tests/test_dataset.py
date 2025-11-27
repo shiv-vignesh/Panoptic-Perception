@@ -155,7 +155,7 @@ def test_dataset_creation():
 
     # Define paths (adjust these to your actual data paths)
     dataset_kwargs = {
-        "images_dir": "panoptic_perception/BDD100k/100k",
+        "images_dir": "panoptic_perception/BDD100k/100k/100k",
         "detection_annotations_dir": "panoptic_perception/BDD100k/bdd100k_labels/100k",
         "segmentation_annotations_dir": "panoptic_perception/BDD100k/bdd100k_seg_maps/labels",
         "drivable_annotations_dir": "panoptic_perception/BDD100k/bdd100k_drivable_maps/labels",

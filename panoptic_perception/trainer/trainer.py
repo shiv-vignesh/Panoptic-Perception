@@ -45,7 +45,7 @@ class Trainer:
         self.checkpoint_idx = trainer_kwargs['checkpoint_idx']     
         self.gradient_accumulation_steps = trainer_kwargs['gradient_accumulation_steps']
         self.reload_optimizer_with_initial_lr = trainer_kwargs["reload_optimizer_with_initial_lr"]
-        self.lr_scheduler_start_epoch = trainer_kwargs["lr_scheduler_start_epoch"] 
+        self.lr_scheduler_start_epoch = trainer_kwargs["lr_scheduler_start_epoch"]        
 
         if not os.path.exists(self.output_dir):
             os.makedirs(self.output_dir)
@@ -159,20 +159,28 @@ class Trainer:
     
     def _init_optimizer(self, optimizer_kwargs):
         
+        self.warmup_bias_lr = optimizer_kwargs.get("warmup_bias_lr", 0.1)
+        self.warmup_momentum = optimizer_kwargs.get("warmup_momentum", 0.8)
+        self.warmup_epochs = optimizer_kwargs.get("warmup_epochs", 3)
+        self.main_momentum = optimizer_kwargs.get("momentum", 0.937)        
+        
         if optimizer_kwargs["_type"] == "SGD":
+            self.lr0 = optimizer_kwargs.get("initial_lr", 3e-5)
             self.optimizer = torch.optim.SGD(
                 self.model.parameters(),
-                lr=optimizer_kwargs.get("initial_lr", 3e-5),
+                lr=optimizer_kwargs.get("initial_lr", 3e-3),
                 momentum=optimizer_kwargs.get("momentum", 0.7)
             )
             
             self.inital_lr = optimizer_kwargs.get("initial_lr", 3e-5)
             
         elif optimizer_kwargs["_type"] == "AdamW":
+            self.lr0 = optimizer_kwargs.get("initial_lr", 3e-4)
             self.optimizer = torch.optim.AdamW(
                 self.model.parameters(),
                 lr=optimizer_kwargs.get("initial_lr", 3e-4),
-                weight_decay=optimizer_kwargs.get("weight_decay", 0.01)
+                weight_decay=optimizer_kwargs.get("weight_decay", 0.01),
+                betas=(0.937, 0.999)
             )
             
             self.inital_lr = optimizer_kwargs.get("initial_lr", 3e-5)
@@ -318,8 +326,25 @@ class Trainer:
             ten_percent_training_time += (step_end_time - step_begin_time)
                 
             if (batch_idx + 1) % self.ten_percent_train_batch == 0:
+
+                if self.cur_epoch < self.warmup_epochs:
+                    warmup_factor = (self.cur_epoch + (batch_idx + 1)/self.total_train_batch) / self.warmup_epochs
+                    warmup_factor = min(1.0, warmup_factor)
+
+                    # LR warmup per param group (bias gets special warmup LR)
+                    for pg in self.optimizer.param_groups:
+                        if 'bias' in pg.get('name',''):
+                            pg['lr'] = self.warmup_bias_lr + warmup_factor * (self.lr0 - self.warmup_bias_lr)
+                        else:
+                            pg['lr'] = warmup_factor * self.lr0
+
+                    # Momentum warmup if optimizer supports momentum
+                    if 'momentum' in self.optimizer.param_groups[0]:
+                        self.optimizer.param_groups[0]['momentum'] = \
+                            self.warmup_momentum + warmup_factor * (self.main_momentum - self.warmup_momentum)
+
                 average_loss = ten_percent_batch_total_loss/self.ten_percent_train_batch
-                average_time = ten_percent_training_time/self.ten_percent_train_batch    
+                average_time = ten_percent_training_time/self.ten_percent_train_batch
 
                 message = f'Epoch {self.cur_epoch} - iter {batch_idx}/{self.total_train_batch} - total loss {average_loss:.4f} -- current_lr: {current_lr}'
                 self.logger.log_message(message=message)

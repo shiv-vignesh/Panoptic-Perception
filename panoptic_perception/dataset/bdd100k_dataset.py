@@ -78,9 +78,9 @@ class BDDPreprocessor:
         # Optimized for small objects and long-tail classes
         self.augment_params = preprocess_kwargs.get("augment_params", {
             # Geometric augmentations (reduced to preserve small objects)
-            'degrees': 7,          # Reduced from 15 - less rotation preserves small objects
-            'translate': 0.08,     # Reduced from 0.1 - keep objects in frame
-            'scale': 0.15,         # Increased from 0.1 - multi-scale helps small objects
+            'degrees': 10,          # Reduced from 15 - less rotation preserves small objects
+            'translate': 0.1,     # Reduced from 0.1 - keep objects in frame
+            'scale': 0.25,         # Increased from 0.1 - multi-scale helps small objects
             'shear': 5,            # Reduced from 10 - less distortion
 
             # Color augmentations (kept aggressive for robustness)
