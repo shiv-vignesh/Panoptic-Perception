@@ -2,6 +2,7 @@
 from dataclasses import dataclass, asdict
 from typing import List, Union
 
+import os
 import torch
 
 @dataclass
@@ -27,6 +28,54 @@ class PanopticModelOutputs:
 
     def values(self):
         return self.__dict__.values()
+
+class WeightsManager:
+    def __init__(self, verbose=True):
+        self.verbose = verbose
+        
+    def load(self, model:torch.nn.Module, ckpt_path:str, strict=False):
+        
+        if not os.path.exists(ckpt_path):
+            if self.verbose:
+                print(f'Model Checkpoint not found: {ckpt_path}')
+            return
+        
+        ckpt = torch.load(ckpt_path, map_location="cpu")
+
+        if "model_state" in ckpt:
+            state_dict = ckpt["model_state"]
+        else:
+            state_dict = ckpt
+
+        # Backward compatibility: copy anchors_grid to anchors if only anchors_grid exists
+        # This handles old checkpoints that saved anchors_grid but not anchors
+        keys_to_add = {}
+        for key in state_dict.keys():
+            if 'anchors_grid' in key and key.replace('anchors_grid', 'anchors') not in state_dict:
+                new_key = key.replace('anchors_grid', 'anchors')
+                keys_to_add[new_key] = state_dict[key]
+        state_dict.update(keys_to_add)
+
+        missing, unexpected = model.load_state_dict(
+            state_dict, strict=False
+        )
+        
+        if strict:
+            if len(missing) or len(unexpected):
+                raise RuntimeError(
+                    f"Strict loading failed.\n"
+                    f"Missing keys: {missing}\nUnexpected keys: {unexpected}"
+                )
+        
+        loaded_keys = [k for k in state_dict.keys() if k not in unexpected]
+
+        if self.verbose:
+            print("=== Weights Loaded ===")
+            print(f"Loaded     : {len(loaded_keys)} keys")
+            print(f"Missing    : {len(missing)} keys")
+            print(f"Unexpected : {len(unexpected)} keys")
+
+        return missing, unexpected, loaded_keys
 
 def parse_model_config(model_config:str):
 

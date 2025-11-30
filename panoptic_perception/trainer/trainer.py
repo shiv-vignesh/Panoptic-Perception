@@ -14,7 +14,7 @@ from panoptic_perception.dataset.bdd100k_dataset import BDD100KDataset, BDDPrepr
 from panoptic_perception.dataset.enums import BDD100KClassesReduced
 
 from panoptic_perception.models.models import YOLOP
-from panoptic_perception.models.utils import PanopticModelOutputs
+from panoptic_perception.models.utils import PanopticModelOutputs, WeightsManager
 
 from panoptic_perception.utils.logger import Logger
 from panoptic_perception.utils.wandb_logger import WandBLogger
@@ -46,6 +46,7 @@ class Trainer:
         self.gradient_accumulation_steps = trainer_kwargs['gradient_accumulation_steps']
         self.reload_optimizer_with_initial_lr = trainer_kwargs["reload_optimizer_with_initial_lr"]
         self.lr_scheduler_start_epoch = trainer_kwargs["lr_scheduler_start_epoch"]        
+        self.reload_optimizer = trainer_kwargs["reload_optimizer"]
 
         if not os.path.exists(self.output_dir):
             os.makedirs(self.output_dir)
@@ -219,21 +220,27 @@ class Trainer:
         if ckpt_path and os.path.exists(ckpt_path):
             ckpt = torch.load(ckpt_path, map_location=self.device)
 
-            self.model.load_state_dict(ckpt["model_state"])
+            missing, unexpected, loaded_keys = WeightsManager().load(self.model, ckpt_path)            
+            # self.model.load_state_dict(ckpt["model_state"])
+            self.logger.log_message("=== Weights Loaded ===")
+            self.logger.log_message(f"Loaded     : {len(loaded_keys)} keys")
+            self.logger.log_message(f"Missing    : {len(missing)} keys")
+            self.logger.log_message(f"Unexpected : {len(unexpected)} keys")            
 
-            if "optimizer_state" in ckpt and ckpt["optimizer_state"] is not None:
-                self.optimizer.load_state_dict(ckpt["optimizer_state"])
-                
-                if self.reload_optimizer_with_initial_lr:
-                    for param_group in self.optimizer.param_groups:
-                        param_group['lr'] = self.inital_lr                    
+            if self.reload_optimizer:
+                if "optimizer_state" in ckpt and ckpt["optimizer_state"] is not None:
+                    self.optimizer.load_state_dict(ckpt["optimizer_state"])
+                    
+                    if self.reload_optimizer_with_initial_lr:
+                        for param_group in self.optimizer.param_groups:
+                            param_group['lr'] = self.inital_lr                    
 
-            if "scheduler_state" in ckpt and ckpt["scheduler_state"] is not None:
-                if hasattr(self, "lr_scheduler"):
-                    self.lr_scheduler.load_state_dict(ckpt["scheduler_state"])
+                if "scheduler_state" in ckpt and ckpt["scheduler_state"] is not None:
+                    if hasattr(self, "lr_scheduler"):
+                        self.lr_scheduler.load_state_dict(ckpt["scheduler_state"])
 
-            self.start_epoch = ckpt.get("epoch", 1)
-            self.logger.log_message(f"Resuming from epoch {self.start_epoch}")
+                self.start_epoch = ckpt.get("epoch", 1)
+                self.logger.log_message(f"Resuming from epoch {self.start_epoch}")
     
     def train(self, checkpoint_path:str=None):
         self.logger.log_line()
@@ -412,18 +419,64 @@ class Trainer:
             torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.gradient_clipping)
             
         return loss, outputs
-    
+
+    def _compute_confusion_matrix(self, preds: torch.Tensor, targets: torch.Tensor, num_classes: int) -> torch.Tensor:
+        """Compute confusion matrix for a batch of predictions and targets."""
+        preds_flat = preds.view(-1)
+        targets_flat = targets.view(-1)
+
+        # Filter valid indices (in case of ignore labels)
+        mask = (targets_flat >= 0) & (targets_flat < num_classes)
+        preds_flat = preds_flat[mask]
+        targets_flat = targets_flat[mask]
+
+        # Compute confusion matrix using bincount
+        indices = targets_flat * num_classes + preds_flat
+        conf_matrix = torch.bincount(indices, minlength=num_classes * num_classes)
+        return conf_matrix.reshape(num_classes, num_classes)
+
+    def _compute_metrics_from_confusion_matrix(self, conf_matrix: torch.Tensor, num_classes: int) -> tuple:
+        """Compute IoU and Dice metrics from confusion matrix."""
+        iou_dict = {}
+        dice_dict = {}
+
+        iou_per_class = []
+        dice_per_class = []
+
+        for cls in range(num_classes):
+            tp = conf_matrix[cls, cls].float()
+            fp = conf_matrix[:, cls].sum().float() - tp
+            fn = conf_matrix[cls, :].sum().float() - tp
+
+            # IoU = TP / (TP + FP + FN)
+            iou = tp / (tp + fp + fn + 1e-10)
+            iou_dict[f'IoU_class_{cls}'] = iou.item()
+            iou_per_class.append(iou.item())
+
+            # Dice = 2*TP / (2*TP + FP + FN)
+            dice = (2 * tp) / (2 * tp + fp + fn + 1e-10)
+            dice_dict[f'Dice_class_{cls}'] = dice.item()
+            dice_per_class.append(dice.item())
+
+        iou_dict['mIoU'] = np.mean(iou_per_class)
+        dice_dict['mDice'] = np.mean(dice_per_class)
+
+        return iou_dict, dice_dict
+
     def eval_one_epoch(self):
         """Evaluate model on validation set."""
         self.model.eval()
+        import gc
 
-        # Collect all predictions and ground truths
+        # Collect detection predictions (smaller memory footprint)
         all_detections = []
         all_detection_targets = []
-        all_drivable_preds = []
-        all_drivable_targets = []
-        all_lane_preds = []
-        all_lane_targets = []
+
+        # Use confusion matrices for segmentation (memory efficient)
+        num_drivable_classes = 3
+        num_lane_classes = 2  # Will be updated dynamically if needed
+        drivable_confusion_matrix = None
+        lane_confusion_matrix = None
 
         total_val_loss = 0.0
         total_det_loss = 0.0
@@ -471,16 +524,13 @@ class Trainer:
                     batch_size, _, image_h, image_w = data_items["images"].shape
 
                     # Concatenate predictions from all detection layers
-                    all_predictions = []
+                    batch_predictions = []
                     for layer_pred in detection_preds:
                         b, na, h, w, nc = layer_pred.shape
                         layer_pred_flat = layer_pred.view(b, na * h * w, nc)
-                        all_predictions.append(layer_pred_flat)
+                        batch_predictions.append(layer_pred_flat)
 
-                    concatenated_preds = torch.cat(all_predictions, dim=1)
-
-                    # print(concatenated_preds[:, :, 4].mean())
-                    # exit(1)
+                    concatenated_preds = torch.cat(batch_predictions, dim=1)
 
                     # Apply NMS
                     nms_results = DetectionHelper.non_max_suppression(
@@ -489,10 +539,6 @@ class Trainer:
                         iou_threshold=0.45,
                         max_detections=500
                     )
-
-                    # for idx, result in enumerate(nms_results):
-                    #     print(f'batch_idx {idx} - result: {result.shape}')
-                    # exit(1)
 
                     all_detections.extend(nms_results)
 
@@ -512,43 +558,45 @@ class Trainer:
                         else:
                             all_detection_targets.append(None)
 
-                # # Check ranges
-                # image_size = (image_h, image_w)
-                # for idx, layer_pred in enumerate(all_predictions):
-                #     xy = layer_pred[..., 0:2]
-                #     wh = layer_pred[..., 2:4]
-                    
-                #     print(f'Prediction: {idx} -- XY Min: {xy.min()} XY Max: {xy.max()}')
-                #     print(f'Prediction: {idx} -- WH Min: {wh.min()} WH Max: {wh.max()}')
-
-                #     assert xy.max() <= image_size[1]+1e-3, f"X/Y coords exceed image width/height: {xy.max()}"
-                #     assert wh.max() <= max(image_size), f"W/H coords exceed image size: {wh.max()}"
-                #     assert xy.min() >= 0, f"X/Y coords < 0: {xy.min()}"
-                #     assert wh.min() >= 0, f"W/H coords < 0: {wh.min()}"
-
-                # # Check targets
-                
-                # print(f'Targets Min: {img_targets[:,2:6].min()} -- Targets Max: {img_targets[:,2:6].max()}')
-                
-                # assert img_targets[:,2:6].max() <= max(image_size), f"Target box exceeds image size: {img_targets[:,2:6].max()}"
-                # assert img_targets[:,2:6].min() >= 0, f"Target box has negative values: {img_targets[:,2:6].min()}"
-
-                # print("Activation outputs and targets are in image pixel scale.")
-                
-                # exit(1)
-
-                # Process segmentation predictions
+                # Process segmentation with running confusion matrix (memory efficient)
                 if outputs.drivable_segmentation_predictions is not None:
                     drivable_preds = torch.argmax(outputs.drivable_segmentation_predictions, dim=1)
-                    all_drivable_preds.append(drivable_preds.cpu())
                     if data_items.get("drivable_area_seg") is not None:
-                        all_drivable_targets.append(data_items["drivable_area_seg"].cpu())
+                        drivable_targets = data_items["drivable_area_seg"]
+                        # Initialize confusion matrix on first batch
+                        if drivable_confusion_matrix is None:
+                            drivable_confusion_matrix = torch.zeros(
+                                num_drivable_classes, num_drivable_classes, dtype=torch.int64
+                            )
+                        # Update confusion matrix
+                        drivable_confusion_matrix += self._compute_confusion_matrix(
+                            drivable_preds.cpu(), drivable_targets.cpu(), num_drivable_classes
+                        )
 
                 if outputs.lane_segmentation_predictions is not None:
                     lane_preds = torch.argmax(outputs.lane_segmentation_predictions, dim=1)
-                    all_lane_preds.append(lane_preds.cpu())
                     if data_items.get("segmentation_masks") is not None:
-                        all_lane_targets.append(data_items["segmentation_masks"].cpu())
+                        lane_targets = data_items["segmentation_masks"]
+                        # Dynamically determine number of lane classes
+                        max_class = max(lane_preds.max().item(), lane_targets.max().item()) + 1
+                        if max_class > num_lane_classes:
+                            # Expand confusion matrix if needed
+                            if lane_confusion_matrix is not None:
+                                old_matrix = lane_confusion_matrix
+                                lane_confusion_matrix = torch.zeros(
+                                    max_class, max_class, dtype=torch.int64
+                                )
+                                lane_confusion_matrix[:old_matrix.shape[0], :old_matrix.shape[1]] = old_matrix
+                            num_lane_classes = max_class
+                        # Initialize confusion matrix on first batch
+                        if lane_confusion_matrix is None:
+                            lane_confusion_matrix = torch.zeros(
+                                num_lane_classes, num_lane_classes, dtype=torch.int64
+                            )
+                        # Update confusion matrix
+                        lane_confusion_matrix += self._compute_confusion_matrix(
+                            lane_preds.cpu(), lane_targets.cpu(), num_lane_classes
+                        )
 
 
         # Compute metrics
@@ -595,17 +643,16 @@ class Trainer:
                 step=self.cur_epoch
             )
 
-        # Drivable segmentation metrics
-        drivable_metrics = {}
-        if len(all_drivable_preds) > 0 and len(all_drivable_targets) > 0:
-            drivable_preds_cat = torch.cat(all_drivable_preds, dim=0)
-            drivable_targets_cat = torch.cat(all_drivable_targets, dim=0)
+        # Free detection memory before computing segmentation metrics
+        del all_detections, all_detection_targets
+        gc.collect()
+        torch.cuda.empty_cache()
 
-            drivable_iou = SegmentationMetrics.compute_iou(
-                drivable_preds_cat, drivable_targets_cat, num_classes=3
-            )
-            drivable_dice = SegmentationMetrics.compute_dice(
-                drivable_preds_cat, drivable_targets_cat, num_classes=3
+        # Drivable segmentation metrics (computed from confusion matrix)
+        drivable_metrics = {}
+        if drivable_confusion_matrix is not None:
+            drivable_iou, drivable_dice = self._compute_metrics_from_confusion_matrix(
+                drivable_confusion_matrix, num_drivable_classes
             )
             drivable_metrics = {**drivable_iou, **drivable_dice}
 
@@ -613,7 +660,7 @@ class Trainer:
             drivable_table_data = [["Metric", "Value"]]
             drivable_table_data.append(["mIoU", f"{drivable_iou['mIoU']:.4f}"])
             drivable_table_data.append(["mDice", f"{drivable_dice['mDice']:.4f}"])
-            for cls in range(3):
+            for cls in range(num_drivable_classes):
                 drivable_table_data.append([f"IoU Class {cls}", f"{drivable_iou.get(f'IoU_class_{cls}', 0.0):.4f}"])
 
             drivable_table_string = AsciiTable(drivable_table_data).table
@@ -626,7 +673,7 @@ class Trainer:
                 ["mIoU", drivable_iou['mIoU']],
                 ["mDice", drivable_dice['mDice']]
             ]
-            for cls in range(3):
+            for cls in range(num_drivable_classes):
                 wandb_drivable_data.append([f"IoU_class_{cls}", drivable_iou.get(f'IoU_class_{cls}', 0.0)])
 
             self.wandb_logger.log_table(
@@ -636,20 +683,11 @@ class Trainer:
                 step=self.cur_epoch
             )
 
-        # Lane segmentation metrics
+        # Lane segmentation metrics (computed from confusion matrix)
         lane_metrics = {}
-        if len(all_lane_preds) > 0 and len(all_lane_targets) > 0:
-            lane_preds_cat = torch.cat(all_lane_preds, dim=0)
-            lane_targets_cat = torch.cat(all_lane_targets, dim=0)
-
-            # Determine number of lane classes dynamically
-            num_lane_classes = int(lane_preds_cat.max().item()) + 1
-
-            lane_iou = SegmentationMetrics.compute_iou(
-                lane_preds_cat, lane_targets_cat, num_classes=num_lane_classes
-            )
-            lane_dice = SegmentationMetrics.compute_dice(
-                lane_preds_cat, lane_targets_cat, num_classes=num_lane_classes
+        if lane_confusion_matrix is not None:
+            lane_iou, lane_dice = self._compute_metrics_from_confusion_matrix(
+                lane_confusion_matrix, num_lane_classes
             )
             lane_metrics = {**lane_iou, **lane_dice}
 
@@ -693,6 +731,10 @@ class Trainer:
         if drivable_metrics:
             self.logger.log_message(f'  Drivable mIoU: {drivable_metrics["mIoU"]:.4f}')
         self.logger.log_line()
+
+        # Final cleanup
+        gc.collect()
+        torch.cuda.empty_cache()
 
         self.model.train()
         

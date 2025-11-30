@@ -1,6 +1,7 @@
-from typing import List
+from typing import List, Optional
 import torch
 import torchvision
+import numpy as np
 
 class DetectionHelper:
     
@@ -207,12 +208,122 @@ class DetectionHelper:
         w = x2 - x1
         h = y2 - y1
         return torch.stack((x_c, y_c, w, h), dim=-1)
-    
+
+    @staticmethod
+    def visualize_detections(
+        image: torch.Tensor,
+        predictions: Optional[torch.Tensor],
+        targets: Optional[torch.Tensor],
+        class_names: Optional[List[str]] = None,
+        pred_color: tuple = (0, 255, 0),  # Green for predictions
+        target_color: tuple = (255, 0, 0),  # Red for targets
+        thickness: int = 2,
+        font_scale: float = 0.5,
+        save_path: Optional[str] = None
+    ) -> np.ndarray:
+        """
+        Visualize detection predictions and ground truth on an image.
+
+        Args:
+            image: Tensor of shape (C, H, W) or (H, W, C), values in [0, 1] or [0, 255]
+            predictions: Tensor of shape (N, 6) [x1, y1, x2, y2, confidence, class_id]
+                        or None if no predictions
+            targets: Tensor of shape (M, 5) [x1, y1, x2, y2, class_id]
+                    or None if no targets
+            class_names: List of class names for labeling
+            pred_color: BGR color for prediction boxes (green by default)
+            target_color: BGR color for target boxes (red by default)
+            thickness: Line thickness for boxes
+            font_scale: Font scale for labels
+            save_path: If provided, save the image to this path
+
+        Returns:
+            Annotated image as numpy array (H, W, C) in BGR format
+        """
+        import cv2
+
+        # Convert image to numpy array
+        if torch.is_tensor(image):
+            image = image.detach().cpu().numpy()
+
+        # Handle channel dimension
+        if image.shape[0] == 3:  # (C, H, W) -> (H, W, C)
+            image = np.transpose(image, (1, 2, 0))
+
+        # Convert to uint8 if needed
+        if image.max() <= 1.0:
+            image = (image * 255).astype(np.uint8)
+        else:
+            image = image.astype(np.uint8)
+
+        # Convert RGB to BGR for OpenCV
+        image = cv2.cvtColor(image, cv2.COLOR_RGB2BGR)
+
+        # Make a copy to draw on
+        vis_image = image.copy()
+
+        # Draw target boxes (red) first so predictions overlay them
+        if targets is not None and len(targets) > 0:
+            if torch.is_tensor(targets):
+                targets = targets.detach().cpu().numpy()
+
+            for box in targets:
+                x1, y1, x2, y2 = box[:4].astype(int)
+                class_id = int(box[4]) if len(box) > 4 else -1
+
+                # Draw box
+                cv2.rectangle(vis_image, (x1, y1), (x2, y2), target_color, thickness)
+
+                # Draw label
+                if class_names is not None and 0 <= class_id < len(class_names):
+                    label = f"GT: {class_names[class_id]}"
+                else:
+                    label = f"GT: {class_id}"
+
+                label_size, baseline = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, font_scale, 1)
+                y1_label = max(y1, label_size[1] + 5)
+                cv2.rectangle(vis_image, (x1, y1_label - label_size[1] - 5),
+                            (x1 + label_size[0], y1_label), target_color, -1)
+                cv2.putText(vis_image, label, (x1, y1_label - 5),
+                           cv2.FONT_HERSHEY_SIMPLEX, font_scale, (255, 255, 255), 1)
+
+        # Draw prediction boxes (green)
+        if predictions is not None and len(predictions) > 0:
+            if torch.is_tensor(predictions):
+                predictions = predictions.detach().cpu().numpy()
+
+            for box in predictions:
+                x1, y1, x2, y2 = box[:4].astype(int)
+                confidence = box[4] if len(box) > 4 else 0.0
+                class_id = int(box[5]) if len(box) > 5 else -1
+
+                # Draw box
+                cv2.rectangle(vis_image, (x1, y1), (x2, y2), pred_color, thickness)
+
+                # Draw label with confidence
+                if class_names is not None and 0 <= class_id < len(class_names):
+                    label = f"{class_names[class_id]}: {confidence:.2f}"
+                else:
+                    label = f"{class_id}: {confidence:.2f}"
+
+                label_size, baseline = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, font_scale, 1)
+                y2_label = min(y2 + label_size[1] + 10, vis_image.shape[0])
+                cv2.rectangle(vis_image, (x1, y2),
+                            (x1 + label_size[0], y2_label), pred_color, -1)
+                cv2.putText(vis_image, label, (x1, y2 + label_size[1] + 2),
+                           cv2.FONT_HERSHEY_SIMPLEX, font_scale, (255, 255, 255), 1)
+
+        # Save if path provided
+        if save_path is not None:
+            cv2.imwrite(save_path, vis_image)
+
+        return vis_image
+
 class DetectionLossCalculator:
     
     
-    bbox_weight: float = 0.5
-    obj_weight: float = 2.0
+    bbox_weight: float = 0.05
+    obj_weight: float = 1.0
     cls_weight: float = 0.5
 
     @staticmethod
@@ -381,16 +492,17 @@ class DetectionLossCalculator:
                 # tbox_absolute = tbox[i].clone()
                 # tbox_absolute[:, :2] += grid_xy  # offset → absolute grid coordinate
 
-                # # Compute IoU in grid space (no need to convert to pixels!)
-                # iou = DetectionHelper.bbox_iou(pbox, tbox_absolute, x1y1x2y2=False, CIoU=True)                
+                # YOLOP style decoding in grid space
+                pxy = ps[:, 0:2].sigmoid() * 2. - 0.5
+                pwh = (ps[:, 2:4].sigmoid() * 2.) ** 2 * anchors[i]
+                pbox = torch.cat((pxy, pwh), 1)
 
-                #VERSUS
+                # Target boxes also need adjustment for YOLOP style
+                # tbox xy is (gxy - gij) which is in [0,1), YOLOP pxy is in [-0.5, 1.5]
+                tbox_adj = tbox[i].clone()
+                # No adjustment needed for tbox since it stores actual offsets
 
-                pxy = ps[:, 0:2].sigmoid()
-                pwh = torch.exp(ps[:, 2:4]) * anchors[i]
-                pbox = torch.cat((pxy, pwh), 1)            
-
-                iou = DetectionHelper.bbox_iou(pbox, tbox[i], x1y1x2y2=False, CIoU=True)
+                iou = DetectionHelper.bbox_iou(pbox, tbox_adj, x1y1x2y2=False, CIoU=True)
                 ious.append(iou.mean().item())
                 lbox += (1.0 - iou).mean()
 
@@ -509,9 +621,9 @@ class DetectionLossCalculator:
             if nt:
                 ps = pred[b, a, gj, gi]  # (nt, 5+nc)
 
-                # boxes in grid space
-                pxy = ps[:, :2].sigmoid()
-                pwh = torch.exp(ps[:, 2:4]) * anch_per_target[i]
+                # boxes in grid space - YOLOP style decoding
+                pxy = ps[:, :2].sigmoid() * 2. - 0.5
+                pwh = (ps[:, 2:4].sigmoid() * 2.) ** 2 * anch_per_target[i]
                 pbox = torch.cat((pxy, pwh), dim=1)
 
                 # Compute IoU with targets

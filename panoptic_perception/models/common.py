@@ -108,8 +108,12 @@ class Detect(nn.Module):
         self.num_layers = len(anchors)
 
         # anchors: list of N scale lists
-        self.anchors = torch.tensor(anchors).float().view(self.num_layers, -1, 2)
-        self.register_buffer("anchors_grid", self.anchors)
+        # Use register_buffer so anchors are saved/loaded with state_dict
+        # Note: old checkpoints may have 'anchors_grid', new ones have 'anchors'
+        anchors_tensor = torch.tensor(anchors).float().view(self.num_layers, -1, 2)
+        self.register_buffer("anchors", anchors_tensor)
+        # Keep anchors_grid as alias for backward compatibility with old checkpoints
+        self.register_buffer("anchors_grid", anchors_tensor)
 
         self.convs = nn.ModuleList()
         for i, in_ch in enumerate(in_channels):
@@ -135,8 +139,15 @@ class Detect(nn.Module):
 
         return x
 
-    def activation(self, x: List[torch.Tensor]):
-        """Decode predictions to image-space YOLOv3 boxes (pixels)."""
+    def activation(self, x: List[torch.Tensor], use_yolop_style: bool = True):
+        """
+        Decode predictions to image-space boxes (pixels).
+
+        Args:
+            x: List of raw detection outputs per layer
+            use_yolop_style: If True, use YOLOP-style decoding (sigmoid*2)^2
+                            If False, use exp() style decoding
+        """
         outputs = []
         for i in range(self.num_layers):
             bs, na, ny, nx, _ = x[i].shape
@@ -149,19 +160,19 @@ class Detect(nn.Module):
                 indexing='ij'
             )
             grid = torch.stack((xv, yv), 2).view(1, 1, ny, nx, 2).float()
+            anchor = self.anchors[i].view(1, na, 1, 1, 2).to(x[i].device)
 
-            # Clone tensor
-            y = x[i].clone()
-
-            # Decode xy: sigmoid + grid -> pixels
-            y[..., 0:2] = (y[..., 0:2].sigmoid() + grid) * stride
-
-            # Decode wh: exp + anchor -> pixels
-            anchor = self.anchors[i].view(1, na, 1, 1, 2)  # anchors in pixels per stride
-            y[..., 2:4] = torch.exp(y[..., 2:4]) * anchor.to(x[i].device)  # <-- scale to image pixels
-
-            # Objectness + class scores
-            y[..., 4:] = y[..., 4:].sigmoid()
+            if use_yolop_style:
+                # YOLOP-style decoding
+                y = x[i].sigmoid()
+                y[..., 0:2] = (y[..., 0:2] * 2. - 0.5 + grid) * stride
+                y[..., 2:4] = (y[..., 2:4] * 2.) ** 2 * anchor
+            else:
+                # Original exp() style decoding
+                y = x[i].clone()
+                y[..., 0:2] = (y[..., 0:2].sigmoid() + grid) * stride
+                y[..., 2:4] = torch.exp(y[..., 2:4]) * anchor
+                y[..., 4:] = y[..., 4:].sigmoid()
 
             outputs.append(y)
 

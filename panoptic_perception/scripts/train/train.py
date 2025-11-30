@@ -14,7 +14,7 @@ def create_model(model_kwargs:dict):
     assert os.path.exists(cfg_path), f'{cfg_path} does not exists'
     model = YOLOP(cfg_path)
     
-    device = torch.device("cuda") if torch.cuda.is_available() and device == "cuda" else torch.device("cpu")
+    device = torch.device(device) if torch.cuda.is_available() and "cuda" in device else torch.device("cpu")
     model.to(device)  
     
     return model, device

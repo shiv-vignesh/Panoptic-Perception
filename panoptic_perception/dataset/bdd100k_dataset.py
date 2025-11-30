@@ -10,7 +10,7 @@ import albumentations as A
 from panoptic_perception.dataset.enums import BDD100KClasses, BDD100KClassesReduced
 from panoptic_perception.dataset.augmentations import apply_augmentations
 
-def visualize_batch(images, targets, save_dir, batch_index=0):
+def visualize_batch(images, seg, drivable, targets, save_dir, batch_index=0):
     """
     images: tensor (B,3,H,W) normalized to [0,1]
     targets: tensor (N,6) -> (batch_idx, class, x_center, y_center, w, h)
@@ -59,6 +59,32 @@ def visualize_batch(images, targets, save_dir, batch_index=0):
         os.makedirs(save_dir)
     
     cv2.imwrite(f'{save_dir}/sample_batch_{batch_index}.png', img_draw)
+    
+    if seg is not None:
+        if seg[batch_index].ndim == 3:
+            seg_vis = seg[batch_index].permute(1, 2, 0).cpu().numpy()
+        else:
+            seg_vis = seg[batch_index].cpu().numpy()
+
+        # Scale segmentation class IDs for visibility (multiply by factor)
+        # BDD100K has ~19 semantic classes, scale to spread across 0-255
+        seg_scaled = (seg_vis * 12).clip(0, 255).astype(np.uint8)
+        cv2.imwrite(f'{save_dir}/sample_batch_seg_{batch_index}.png', seg_scaled)
+
+    if drivable is not None:
+        if drivable[batch_index].ndim == 3:
+            drivable_vis = drivable[batch_index].permute(1, 2, 0).cpu().numpy()
+        else:
+            drivable_vis = drivable[batch_index].cpu().numpy()
+
+        # BDD100K drivable area classes: 0=background, 1=direct, 2=alternative
+        # Create color visualization for proper visibility
+        drivable_colored = np.zeros((*drivable_vis.shape, 3), dtype=np.uint8)
+        drivable_colored[drivable_vis == 1] = [0, 255, 0]    # Direct drivable: green
+        drivable_colored[drivable_vis == 2] = [0, 255, 255]  # Alternative: yellow
+
+        cv2.imwrite(f'{save_dir}/sample_batch_drivable_{batch_index}.png', drivable_colored)
+    
 
 class BDDPreprocessor:
     def __init__(self, preprocess_kwargs:dict):
@@ -186,6 +212,7 @@ class BDDPreprocessor:
 
         assert os.path.exists(image_path), f"Image path {image_path} does not exist."
         image = cv2.imread(image_path)
+        image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
 
         # Load segmentation mask (original size if augmenting)
         seg = None
@@ -298,13 +325,16 @@ class BDDPreprocessor:
         batch_targets = []
         batch_segmentation_masks = []
         batch_drivable_masks = []
+        batch_image_paths = []
         
         for batch_idx, batch_items in enumerate(batch):
             image = batch_items['image']
+            image_path = batch_items["image_path"]
             assert image is not None, f"Image tensor at batch index {batch_idx} is None."
             assert image.ndim == 3, "Image tensor must have 3 dimensions (C, H, W)."
             
             batch_images.append(image)
+            batch_image_paths.append(image_path)
             
             if batch_items['detection_targets'] is not None and batch_items['detection_targets'].shape[0] > 0:
                 nt = batch_items['detection_targets'].shape[0]
@@ -334,9 +364,30 @@ class BDDPreprocessor:
             "images": batch_images_tensor,
             "detections": batch_targets_tensor,
             "segmentation_masks": batch_segmentation_masks_tensor,
-            "drivable_area_seg": batch_drivable_masks_tensor
+            "drivable_area_seg": batch_drivable_masks_tensor,
+            "image_paths":batch_image_paths
         }
+    
+    def prepare_inference(self, image_path=None):
+        
+        assert os.path.exists(image_path), f"Image path {image_path} does not exist."
+        img = cv2.imread(image_path)
+        
+        orig = img.copy()
+        h0, w0 = img.shape[:2]
 
+        # Your letterbox or resizing logic
+        transformed = self.image_only_transformation(image=img)
+        img = transformed['image']
+
+        img = torch.from_numpy(img).permute(2,0,1).float() / 255.0
+
+        return {
+            "image": img.unsqueeze(0),  # add batch dim
+            "original_image": orig,
+            "orig_shape": (h0, w0),
+            "new_shape": img.shape[1:]
+        }
 
 class BDD100KDataset(Dataset):
     def __init__(self, dataset_kwargs:dict, dataset_type:str='train', perform_augmentation:bool=False):
@@ -381,16 +432,9 @@ class BDD100KDataset(Dataset):
             "image": image_tensor,
             "segmentation_mask": seg_tensor,
             "drivable_mask": drivable_tensor,
-            "detection_targets": targets
+            "detection_targets": targets,
+            "image_path":image_path
         }
         
         return sample
     
-"""
-TODO, 
-1. Normalize Tensors
-2. Replace longestSizePad with resize only. 
-3. Reduce grad_acc_steps to 1.
-4. Replace anchors to match YOLOP repo
-5. Compare YOLOP detect with current detect
-"""
