@@ -1,15 +1,15 @@
 {
     "model_kwargs":{
-        "cfg_path":"panoptic_perception/configs/models/yolo-detection.cfg",
-        "device":"cuda"
+        "cfg_path":"panoptic_perception/configs/models/yolo-detection-drivable.cfg",
+        "device":"cuda:1"
     },
 
     "dataset_kwargs":{
-        "images_dir": "panoptic_perception/BDD100k/100k/100k",
+        "images_dir": "panoptic_perception/BDD100k/100k",
         "detection_annotations_dir": "panoptic_perception/BDD100k/bdd100k_labels/100k",
         "segmentation_annotations_dir": "panoptic_perception/BDD100k/bdd100k_seg_maps/labels",
         "drivable_annotations_dir": "panoptic_perception/BDD100k/bdd100k_drivable_maps/labels",
-        "train_batch_size":16,
+        "train_batch_size":24,
         "train_shuffle":true,
         "train_num_workers":1,
         "train_preprocessor_kwargs":{
@@ -46,7 +46,7 @@
         }
     },
     "trainer_kwargs":{
-        "output_dir": "yolop-detection-reduced-classes-3-augmentation",
+        "output_dir": "yolop-detection-detection-drivable-rectified",
         "is_training":true,
         "first_val_epoch": 0,
         "metric_eval_mode": "strict",
@@ -58,9 +58,10 @@
         "checkpoint_idx":2,
         "gradient_accumulation_steps":2,
         "lr_scheduler_start_epoch":1,        
-        "checkpoint_path":"yolop-detection-reduced-classes-3-debug/ckpt_7/ckpt-7.pt",
+        "checkpoint_path":"yolop-detection-detection-rectified/ckpt_35/ckpt-35.pt",
+        "reload_optimizer":false,
         "reload_optimizer_with_initial_lr":false,
 
-        "wandb_project":"yolop-detection-reduced-classes"
+        "wandb_project":"yolop-detection-drivable-reduced-classes"
     }
 }
