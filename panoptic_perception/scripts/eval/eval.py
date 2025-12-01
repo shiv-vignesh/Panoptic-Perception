@@ -254,7 +254,7 @@ if __name__ == "__main__":
     model_kwargs = {
         "cfg_path": "panoptic_perception/configs/models/yolo-detection.cfg",
         "device": "cuda:0",
-        "model_path": "yolop-detection-detection-rectified/ckpt_31/ckpt-31.pt"
+        "model_path": "yolop-detection-detection-rectified/best-model/best-model.pt"
     }
 
     dataset_kwargs = {

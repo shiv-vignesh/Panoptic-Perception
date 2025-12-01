@@ -1,7 +1,7 @@
 {
     "model_kwargs":{
         "cfg_path":"panoptic_perception/configs/models/yolo-detection-drivable.cfg",
-        "device":"cuda:1"
+        "device":"cuda:0"
     },
 
     "dataset_kwargs":{
@@ -11,7 +11,7 @@
         "drivable_annotations_dir": "panoptic_perception/BDD100k/bdd100k_drivable_maps/labels",
         "train_batch_size":24,
         "train_shuffle":true,
-        "train_num_workers":1,
+        "train_num_workers":4,
         "train_preprocessor_kwargs":{
             "image_resize": [640, 640],
             "original_image_size": [720, 1280],
@@ -19,7 +19,7 @@
         },
         "val_batch_size":16,
         "val_shuffle":false,
-        "val_num_workers":1,
+        "val_num_workers":4,
         "val_preprocessor_kwargs":{
             "image_resize": [640, 640],
             "original_image_size": [720, 1280]    
@@ -33,7 +33,21 @@
         "momentum":0.937,
         "warmup_bias_lr":0.1,
         "warmup_momentum":0.8,
-        "warmup_epochs":3
+        "warmup_epochs":3,
+        "groups": {
+            "backbone": {
+                "group":[0, 23],
+                "trainable":false
+            },
+            "detect": {
+                "group":[24],
+                "trainable":false              
+            },
+            "segmentation": {
+                "group":[25, 33],
+                "trainable":true
+            }
+        }
     },
     "lr_scheduler_kwargs":{
         "_type":"cosine",
@@ -46,19 +60,19 @@
         }
     },
     "trainer_kwargs":{
-        "output_dir": "yolop-detection-detection-drivable-rectified",
+        "output_dir": "yolop-detection-detection-drivable-rectified-2",
         "is_training":true,
         "first_val_epoch": 0,
         "metric_eval_mode": "strict",
         "metric_average_mode": "macro",
-        "epochs": 50,
+        "epochs": 100,
         "monitor_train": true,
         "monitor_val": true,
         "gradient_clipping": 1.0,
         "checkpoint_idx":2,
         "gradient_accumulation_steps":2,
         "lr_scheduler_start_epoch":1,        
-        "checkpoint_path":"yolop-detection-detection-rectified/ckpt_35/ckpt-35.pt",
+        "checkpoint_path":"yolop-detection-detection-rectified/ckpt_49/ckpt-49.pt",
         "reload_optimizer":false,
         "reload_optimizer_with_initial_lr":false,
 

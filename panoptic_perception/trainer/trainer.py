@@ -13,7 +13,7 @@ import numpy as np
 from panoptic_perception.dataset.bdd100k_dataset import BDD100KDataset, BDDPreprocessor
 from panoptic_perception.dataset.enums import BDD100KClassesReduced
 
-from panoptic_perception.models.models import YOLOP
+from panoptic_perception.models.models import YOLOP, get_model_param_groups
 from panoptic_perception.models.utils import PanopticModelOutputs, WeightsManager
 
 from panoptic_perception.utils.logger import Logger
@@ -163,12 +163,33 @@ class Trainer:
         self.warmup_bias_lr = optimizer_kwargs.get("warmup_bias_lr", 0.1)
         self.warmup_momentum = optimizer_kwargs.get("warmup_momentum", 0.8)
         self.warmup_epochs = optimizer_kwargs.get("warmup_epochs", 3)
-        self.main_momentum = optimizer_kwargs.get("momentum", 0.937)        
+        self.main_momentum = optimizer_kwargs.get("momentum", 0.937)
         
+        self.groups = optimizer_kwargs.get("groups", {})
+
+        if not self.groups:
+            # No custom groups: train full model
+            param_groups = list(self.model.parameters())
+            self.logger.log_message('Full model training (all layers trainable)')
+            self.logger.log_new_line()
+        else:
+            # Custom groups: get param groups
+            param_groups = get_model_param_groups(self.model, self.groups)
+            self.logger.log_message('Training with specified groups:')
+            for group_name in self.groups:
+                group_info = self.groups[group_name]
+                self.logger.log_message(
+                    f'  Group name: {group_name} - '
+                    f'trainable: {group_info["trainable"]} - '
+                    f'layer start/end: {group_info["group"]}'
+                )
+            self.logger.log_new_line()
+
         if optimizer_kwargs["_type"] == "SGD":
             self.lr0 = optimizer_kwargs.get("initial_lr", 3e-5)
             self.optimizer = torch.optim.SGD(
                 self.model.parameters(),
+                # param_groups,
                 lr=optimizer_kwargs.get("initial_lr", 3e-3),
                 momentum=optimizer_kwargs.get("momentum", 0.7)
             )
@@ -179,6 +200,7 @@ class Trainer:
             self.lr0 = optimizer_kwargs.get("initial_lr", 3e-4)
             self.optimizer = torch.optim.AdamW(
                 self.model.parameters(),
+                # param_groups,
                 lr=optimizer_kwargs.get("initial_lr", 3e-4),
                 weight_decay=optimizer_kwargs.get("weight_decay", 0.01),
                 betas=(0.937, 0.999)
