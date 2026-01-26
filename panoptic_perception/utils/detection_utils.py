@@ -438,9 +438,9 @@ class DetectionLossCalculator:
             targets: binary targets (0 or 1), same shape as inputs.
             alpha: balancing factor.
             gamma: focusing parameter.
-            reduction: 'mean' or 'sum'.
+            reduction: 'mean', 'sum', or 'none'.
         Returns:
-            scalar loss.
+            scalar loss or per-element loss if reduction='none'.
         """
         # Compute binary cross-entropy loss with logits (no reduction)
         bce_loss = torch.nn.functional.binary_cross_entropy_with_logits(inputs, targets, reduction="none")
@@ -451,6 +451,8 @@ class DetectionLossCalculator:
             return loss.mean()
         elif reduction == "sum":
             return loss.sum()
+        elif reduction == "none":
+            return loss
         else:
             return loss   
 
@@ -634,17 +636,23 @@ class DetectionLossCalculator:
                 # Objectness targets = IoU
                 tobj[b, a, gj, gi] = iou.detach()
 
-                # Classification loss
+                # Classification loss (IoU-aware weighting)
                 nc = pred.shape[-1] - 5
                 if nc > 1:
                     t = torch.zeros_like(ps[:, 5:], device=device)
                     t[range(nt), tcls[i]] = 1.0
                     t = t.detach()
 
+                    # IoU-aware weighting: weight classification loss by prediction quality
+                    iou_weight = iou.detach().clamp(0.1, 1.0)  # Clamp to avoid zero weights
+
                     if cls_loss_type.lower() == 'focal':
-                        lcls += DetectionLossCalculator.focal_loss(ps[:, 5:], t, alpha=0.25, gamma=2.0)
+                        cls_loss_per_sample = DetectionLossCalculator.focal_loss(ps[:, 5:], t, alpha=0.25, gamma=2.0, reduction='none')
+                        # Weight by IoU and take mean
+                        lcls += (cls_loss_per_sample.mean(dim=1) * iou_weight).mean()
                     else:  # BCE
-                        lcls += torch.nn.functional.binary_cross_entropy_with_logits(ps[:, 5:], t, reduction='mean')
+                        cls_loss_per_sample = torch.nn.functional.binary_cross_entropy_with_logits(ps[:, 5:], t, reduction='none')
+                        lcls += (cls_loss_per_sample.mean(dim=1) * iou_weight).mean()
 
             # Objectness loss
             lobj += torch.nn.functional.binary_cross_entropy_with_logits(pred[..., 4], tobj, reduction='mean')

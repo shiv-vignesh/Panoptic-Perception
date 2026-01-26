@@ -121,13 +121,21 @@ def create_modules(module_defs: list, num_classes: int = 80,
     return nn.ModuleList(module_list), routes, module_names, _cache_layer_idx
 
 class YOLOP(nn.Module):
-    def __init__(self, cfg: str, img_size: int = 416, num_classes: int = 80):
+    def __init__(self, cfg: str, img_size: int = 416, num_classes: int = 80,
+                 loss_weights: dict = None):
         super(YOLOP, self).__init__()
 
-        module_defs = parse_model_config(cfg)            
-        
+        module_defs = parse_model_config(cfg)
+
         self.img_size = img_size
         self.num_classes = num_classes
+
+        # Multi-task loss weights (detection prioritized by default)
+        self.loss_weights = loss_weights or {
+            "detection": 1.0,
+            "drivable_segmentation": 0.2,
+            "lane_segmentation": 0.0
+        }
 
         if module_defs[0]['type'] == 'heads':
             self.module_defs = module_defs[1:]
@@ -235,10 +243,12 @@ class YOLOP(nn.Module):
                     targets["detections"],
                     self.module_list[self.detection_head_idx].num_layers,
                     self.module_list[self.detection_head_idx].anchors,
-                    self.module_list[self.detection_head_idx].stride
+                    self.module_list[self.detection_head_idx].stride,
+                    cls_loss_type='focal'  # Use focal loss for better class imbalance handling
                 )
 
-                model_outputs.detection_loss = det_loss
+                # Apply multi-task loss weight
+                model_outputs.detection_loss = det_loss * self.loss_weights.get("detection", 1.0)
                 # print(f'Detection Loss: {det_loss}')
 
             if model_outputs.drivable_segmentation_logits is not None:
@@ -247,8 +257,9 @@ class YOLOP(nn.Module):
                 drivable_seg_loss = SegmentationLossCalculator.compute_segmentation_loss(
                     model_outputs.drivable_segmentation_logits,
                     targets["drivable_area_seg"]
-                    )
-                model_outputs.drivable_segmentation_loss = drivable_seg_loss
+                )
+                # Apply multi-task loss weight
+                model_outputs.drivable_segmentation_loss = drivable_seg_loss * self.loss_weights.get("drivable_segmentation", 0.2)
                 # print(f'Drivable Area Segmentation Loss: {drivable_seg_loss}')
                 
             if model_outputs.lane_segmentation_logits is not None:
@@ -259,7 +270,8 @@ class YOLOP(nn.Module):
                     model_outputs.lane_segmentation_logits,
                     targets["lane_seg"]
                 )
-                model_outputs.lane_segmentation_loss = lane_seg_loss
+                # Apply multi-task loss weight
+                model_outputs.lane_segmentation_loss = lane_seg_loss * self.loss_weights.get("lane_segmentation", 0.0)
                 # print(f'Lane Segmentation Loss: {lane_seg_loss}')
 
         return model_outputs

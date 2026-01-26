@@ -5,10 +5,14 @@ import numpy as np
 import os
 import json
 import cv2
+import random
 import albumentations as A
 
 from panoptic_perception.dataset.enums import BDD100KClasses, BDD100KClassesReduced
-from panoptic_perception.dataset.augmentations import apply_augmentations
+from panoptic_perception.dataset.augmentations import (
+    apply_augmentations, copy_paste_instances, mixup_augmentation
+)
+from panoptic_perception.dataset.mosaic_augmentation import mosaic_augmentation
 
 def visualize_batch(images, seg, drivable, targets, save_dir, batch_index=0):
     """
@@ -392,49 +396,177 @@ class BDDPreprocessor:
 class BDD100KDataset(Dataset):
     def __init__(self, dataset_kwargs:dict, dataset_type:str='train', perform_augmentation:bool=False):
         super(BDD100KDataset, self).__init__()
-        
+
         assert os.path.exists(dataset_kwargs["images_dir"]), f"Images directory {dataset_kwargs['images_dir']} does not exist."
-        
+
         self.images_dir = dataset_kwargs["images_dir"]
         self.detection_annotations_dir = dataset_kwargs["detection_annotations_dir"]
         self.segmentation_annotations_dir = dataset_kwargs["segmentation_annotations_dir"]
         self.drivable_annotations_dir = dataset_kwargs["drivable_annotations_dir"]
-        
+
         self.dataset_type = dataset_type
         self.perform_augmentation = perform_augmentation
-        
+
         self.preprocessor = BDDPreprocessor(dataset_kwargs.get("preprocessor_kwargs", {}))
         self.image_ids = self.get_image_ids()
+
+        # Advanced augmentation probabilities (only for training)
+        aug_config = dataset_kwargs.get("preprocessor_kwargs", {}).get("advanced_aug", {})
+        self.mosaic_prob = aug_config.get("mosaic_prob", 0.5) if perform_augmentation else 0.0
+        self.mixup_prob = aug_config.get("mixup_prob", 0.15) if perform_augmentation else 0.0
+        self.copy_paste_prob = aug_config.get("copy_paste_prob", 0.3) if perform_augmentation else 0.0
         
     def get_image_ids(self):
         return [f.split('.')[0] for f in os.listdir(os.path.join(self.images_dir, self.dataset_type))]
 
     def __len__(self):
         return len(self.image_ids)
-    
-    def __getitem__(self, index):
+
+    def _load_raw(self, index):
+        """Load raw image and annotations without augmentation for mosaic/mixup."""
         image_id = self.image_ids[index]
-        
+
         image_path = os.path.join(self.images_dir, self.dataset_type, f"{image_id}.jpg")
         seg_path = os.path.join(self.segmentation_annotations_dir, self.dataset_type, f"{image_id}_train_id.png")
         drivable_path = os.path.join(self.drivable_annotations_dir, self.dataset_type, f"{image_id}_drivable_id.png")
         det_path = os.path.join(self.detection_annotations_dir, self.dataset_type, f"{image_id}.json")
-        
-        image_tensor, seg_tensor, drivable_tensor, targets = self.preprocessor(
-            image_path=image_path,
-            seg_path=seg_path,
-            drivable_path=drivable_path,
-            det_path=det_path,
-            augment=self.perform_augmentation
-        )
-        
-        sample = {
+
+        # Load image
+        image = cv2.imread(image_path)
+        image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
+        h0, w0 = image.shape[:2]
+
+        # Load masks
+        seg = None
+        if os.path.exists(seg_path):
+            seg = cv2.imread(seg_path, cv2.IMREAD_GRAYSCALE)
+
+        drivable = None
+        if os.path.exists(drivable_path):
+            drivable = cv2.imread(drivable_path, cv2.IMREAD_GRAYSCALE)
+
+        # Load detection annotations and convert to normalized xywh
+        labels_xywh = np.zeros((0, 5))
+        if os.path.exists(det_path):
+            bboxes, class_labels = self.preprocessor.load_detection(det_path)
+            if len(bboxes) > 0:
+                labels_list = []
+                for (x1, y1, x2, y2), cls in zip(bboxes, class_labels):
+                    cx = ((x1 + x2) / 2) / w0
+                    cy = ((y1 + y2) / 2) / h0
+                    bw = (x2 - x1) / w0
+                    bh = (y2 - y1) / h0
+                    labels_list.append([cls, cx, cy, bw, bh])
+                labels_xywh = np.array(labels_list)
+
+        return image, labels_xywh, seg, drivable, image_path
+
+    def __getitem__(self, index):
+        image_id = self.image_ids[index]
+        image_path = os.path.join(self.images_dir, self.dataset_type, f"{image_id}.jpg")
+
+        # Check for advanced augmentations (mosaic, mixup, copy-paste)
+        use_mosaic = self.perform_augmentation and random.random() < self.mosaic_prob
+        use_mixup = self.perform_augmentation and random.random() < self.mixup_prob
+        use_copy_paste = self.perform_augmentation and random.random() < self.copy_paste_prob
+
+        if use_mosaic:
+            # Mosaic: combine 4 images
+            indices = [index] + [random.randint(0, len(self) - 1) for _ in range(3)]
+            images_list, labels_list, segs_list, drivables_list = [], [], [], []
+
+            for idx in indices:
+                img, labels, seg, drivable, _ = self._load_raw(idx)
+                images_list.append(img)
+                labels_list.append(labels)
+                segs_list.append(seg)
+                drivables_list.append(drivable)
+
+            # Apply mosaic
+            image, labels_xywh, seg, drivable = mosaic_augmentation(
+                images_list, labels_list, segs_list, drivables_list,
+                output_size=self.preprocessor.augment_params.get('img_size', (640, 640))
+            )
+
+            # Apply remaining augmentations (HSV, flip, etc. but skip letterbox since mosaic outputs correct size)
+            from panoptic_perception.dataset.augmentations import augment_hsv, flip_horizontal
+            augment_hsv(image,
+                       self.preprocessor.augment_params.get("hsv_h", 0.015),
+                       self.preprocessor.augment_params.get("hsv_s", 0.7),
+                       self.preprocessor.augment_params.get("hsv_v", 0.4))
+            if random.random() < 0.5:
+                image, seg, drivable, labels_xywh = flip_horizontal(image, seg, drivable, labels_xywh)
+
+        elif use_mixup:
+            # MixUp: blend 2 images
+            img1, labels1, seg1, drivable1, _ = self._load_raw(index)
+            idx2 = random.randint(0, len(self) - 1)
+            img2, labels2, seg2, drivable2, _ = self._load_raw(idx2)
+
+            # Resize both to same size first
+            from panoptic_perception.dataset.augmentations import letterbox_with_masks
+            img_size = self.preprocessor.augment_params.get('img_size', (640, 640))
+            img1, seg1, drivable1, labels1 = letterbox_with_masks(img1, seg1, drivable1, labels1, new_shape=img_size)
+            img2, seg2, drivable2, labels2 = letterbox_with_masks(img2, seg2, drivable2, labels2, new_shape=img_size)
+
+            # Apply mixup
+            image, labels_xywh, seg, drivable = mixup_augmentation(
+                img1, labels1, img2, labels2, seg1, seg2, drivable1, drivable2, alpha=0.5
+            )
+
+        else:
+            # Standard augmentation path
+            image, labels_xywh, seg, drivable, _ = self._load_raw(index)
+
+            if self.perform_augmentation:
+                # Apply copy-paste for long-tail classes before other augmentations
+                if use_copy_paste:
+                    source_idx = random.randint(0, len(self) - 1)
+                    source_img, source_labels, _, _, _ = self._load_raw(source_idx)
+                    # Resize source to match
+                    h, w = image.shape[:2]
+                    source_img = cv2.resize(source_img, (w, h))
+                    image, labels_xywh = copy_paste_instances(
+                        image, labels_xywh, source_img, source_labels,
+                        target_classes=[1, 3],  # RIDER=1, MOTOR=3
+                        max_instances=2
+                    )
+
+                # Apply standard YOLOP augmentations
+                from panoptic_perception.dataset.augmentations import apply_augmentations
+                image, seg, drivable, labels_xywh = apply_augmentations(
+                    img=image, seg=seg, drivable=drivable,
+                    labels=labels_xywh, params=self.preprocessor.augment_params
+                )
+            else:
+                # No augmentation - just resize
+                seg_path = os.path.join(self.segmentation_annotations_dir, self.dataset_type, f"{image_id}_train_id.png")
+                drivable_path = os.path.join(self.drivable_annotations_dir, self.dataset_type, f"{image_id}_drivable_id.png")
+                det_path = os.path.join(self.detection_annotations_dir, self.dataset_type, f"{image_id}.json")
+
+                image_tensor, seg_tensor, drivable_tensor, targets = self.preprocessor(
+                    image_path=image_path, seg_path=seg_path,
+                    drivable_path=drivable_path, det_path=det_path, augment=False
+                )
+                return {
+                    "image": image_tensor,
+                    "segmentation_mask": seg_tensor,
+                    "drivable_mask": drivable_tensor,
+                    "detection_targets": targets,
+                    "image_path": image_path
+                }
+
+        # Convert to tensors
+        targets = torch.tensor(labels_xywh, dtype=torch.float32) if len(labels_xywh) else torch.zeros((0, 5))
+        seg_tensor = torch.from_numpy(seg).long() if seg is not None else None
+        drivable_tensor = torch.from_numpy(drivable).long() if drivable is not None else None
+        image_tensor = torch.from_numpy(image).permute(2, 0, 1).float() / 255.0
+
+        return {
             "image": image_tensor,
             "segmentation_mask": seg_tensor,
             "drivable_mask": drivable_tensor,
             "detection_targets": targets,
-            "image_path":image_path
+            "image_path": image_path
         }
-        
-        return sample
     

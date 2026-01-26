@@ -229,6 +229,51 @@ def apply_salt_pepper(img, salt_prob=0.01, pepper_prob=0.01):
     return noisy_img
 
 
+def mixup_augmentation(img1, labels1, img2, labels2, seg1=None, seg2=None,
+                       drivable1=None, drivable2=None, alpha=0.5):
+    """
+    MixUp augmentation: Blend two images and concatenate their labels.
+
+    Args:
+        img1, img2: input images (HWC, same size)
+        labels1, labels2: labels (Nx5: [class, cx, cy, w, h] normalized)
+        seg1, seg2: segmentation masks (optional)
+        drivable1, drivable2: drivable masks (optional)
+        alpha: beta distribution parameter (higher = more variation)
+
+    Returns:
+        mixed_img, mixed_labels, mixed_seg, mixed_drivable
+    """
+    # Sample mixing ratio from beta distribution
+    lam = np.random.beta(alpha, alpha)
+
+    # Blend images
+    mixed_img = (lam * img1.astype(np.float32) + (1 - lam) * img2.astype(np.float32)).astype(np.uint8)
+
+    # Concatenate labels (both sets of boxes are valid for mixed image)
+    if len(labels1) > 0 and len(labels2) > 0:
+        mixed_labels = np.concatenate([labels1, labels2], axis=0)
+    elif len(labels1) > 0:
+        mixed_labels = labels1
+    elif len(labels2) > 0:
+        mixed_labels = labels2
+    else:
+        mixed_labels = np.zeros((0, 5))
+
+    # For segmentation, use the dominant image's mask (based on lam)
+    if seg1 is not None and seg2 is not None:
+        mixed_seg = seg1 if lam > 0.5 else seg2
+    else:
+        mixed_seg = seg1 if seg1 is not None else seg2
+
+    if drivable1 is not None and drivable2 is not None:
+        mixed_drivable = drivable1 if lam > 0.5 else drivable2
+    else:
+        mixed_drivable = drivable1 if drivable1 is not None else drivable2
+
+    return mixed_img, mixed_labels, mixed_seg, mixed_drivable
+
+
 def copy_paste_instances(img, labels, source_img, source_labels, target_classes=[1, 3], max_instances=3):
     """
     Copy-paste instances of specific classes from source to target image.
