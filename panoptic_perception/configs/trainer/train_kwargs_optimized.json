@@ -1,0 +1,112 @@
+{
+    "_description": "Optimized config for joint detection + drivable training with advanced augmentations",
+
+    "model_kwargs":{
+        "cfg_path":"panoptic_perception/configs/models/yolo-detection-drivable.cfg",
+        "device":"cuda:0"
+    },
+
+    "dataset_kwargs":{
+        "images_dir": "panoptic_perception/BDD100k/100k",
+        "detection_annotations_dir": "panoptic_perception/BDD100k/bdd100k_labels/100k",
+        "segmentation_annotations_dir": "panoptic_perception/BDD100k/bdd100k_seg_maps/labels",
+        "drivable_annotations_dir": "panoptic_perception/BDD100k/bdd100k_drivable_maps/labels",
+        "train_batch_size": 16,
+        "train_shuffle": true,
+        "train_num_workers": 4,
+        "train_preprocessor_kwargs":{
+            "image_resize": [640, 640],
+            "original_image_size": [720, 1280],
+            "perform_augmentation": true,
+            "augment_params": {
+                "degrees": 10,
+                "translate": 0.1,
+                "scale": 0.25,
+                "shear": 5,
+                "hsv_h": 0.015,
+                "hsv_s": 0.7,
+                "hsv_v": 0.4,
+                "salt_prob": 0.005,
+                "pepper_prob": 0.005,
+                "flip_prob": 0.5,
+                "img_size": [640, 640]
+            },
+            "advanced_aug": {
+                "mosaic_prob": 0.5,
+                "mixup_prob": 0.15,
+                "copy_paste_prob": 0.3
+            }
+        },
+        "val_batch_size": 16,
+        "val_shuffle": false,
+        "val_num_workers": 4,
+        "val_preprocessor_kwargs":{
+            "image_resize": [640, 640],
+            "original_image_size": [720, 1280]
+        }
+    },
+
+    "optimizer_kwargs":{
+        "_description": "AdamW optimizer - all layers trainable for joint training",
+        "_type": "AdamW",
+        "initial_lr": 1e-3,
+        "weight_decay": 0.01,
+        "momentum": 0.937,
+        "warmup_bias_lr": 0.1,
+        "warmup_momentum": 0.8,
+        "warmup_epochs": 3,
+        "groups": {
+            "backbone": {
+                "group": [0, 23],
+                "trainable": true
+            },
+            "detect": {
+                "group": [24],
+                "trainable": true
+            },
+            "segmentation": {
+                "group": [25, 33],
+                "trainable": true
+            }
+        }
+    },
+
+    "lr_scheduler_kwargs":{
+        "_type": "cosine",
+        "linear_lr_kwargs":{
+            "start_factor": 1.0,
+            "end_factor": 0.01
+        },
+        "cosine_annealing_lr_kwargs":{
+            "eta_min": 1e-6
+        }
+    },
+
+    "trainer_kwargs":{
+        "output_dir": "yolop-joint-optimized",
+        "is_training": true,
+        "first_val_epoch": 0,
+        "metric_eval_mode": "strict",
+        "metric_average_mode": "macro",
+        "epochs": 100,
+        "monitor_train": true,
+        "monitor_val": true,
+        "gradient_clipping": 1.0,
+        "checkpoint_idx": 2,
+        "gradient_accumulation_steps": 2,
+        "lr_scheduler_start_epoch": 1,
+        "checkpoint_path": null,
+        "reload_optimizer": false,
+        "reload_optimizer_with_initial_lr": false,
+
+        "wandb_project": "yolop-joint-optimized",
+        "wandb_enabled": true
+    },
+
+    "loss_weights": {
+        "_description": "Multi-task loss weights - detection prioritized",
+        "detection": 1.0,
+        "drivable_segmentation": 0.2,
+        "lane_segmentation": 0.0
+    }
+}
