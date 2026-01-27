@@ -325,109 +325,15 @@ class DetectionLossCalculator:
     bbox_weight: float = 0.05
     obj_weight: float = 1.0
     cls_weight: float = 0.5
-
-    @staticmethod
-    def build_targets(outputs:List[torch.Tensor], targets:torch.Tensor, num_anchors:int,
-                    anchors_tensor:torch.Tensor, strides:List[int]):
-
-        """
-        gain is a length-7 tensor used to scale targets from normalized image coordinates to
-            grid coordinates for the current detection layer.
-            The seven entries correspond to columns of targets plus the appended anchor id later:
-                [img, cls, x, y, w, h, anchor_id]. Initially all ones; 2:6 will be set to grid sizes.
-
-        ai : initial tensor of shape (num_anchors, num_targets) where each row is the anchor index (0 to num_anchors-1)
-            ex - [[0,0,0,0,0,0,0,0],
-            [1,1,1,1,1,1,1,1],
-            [2,2,2,2,2,2,2,2]]
-
-        """
-
-        num_targets = targets.shape[0]
-        # Infer num_classes from output shape: (batch, anchors, h, w, 5+num_classes)
-        num_classes = outputs[0].shape[-1] - 5
-
-        tcls = []
-        tbox = []
-        indices = []
-        anchors_list = []
-
-        # print(f"\n{'='*60}")
-        # print(f"[build_targets] Starting with {num_targets} targets")
-        # print(f"  Input targets shape: {targets.shape}")
-        # print(f"  Anchors tensor shape: {anchors_tensor.shape}")
-        # print(f"  Anchors: {anchors_tensor}")
-        # print(f"  Strides: {strides}")
-        # print(f"  Num detection layers: {len(outputs)}")
-        # for i, output in enumerate(outputs):
-        #     print(f"    Layer {i}: output shape = {output.shape}")
-        # print(f"{'='*60}")
-
-        anchors_tensor = anchors_tensor.to(outputs[0].device)
-
-        gain = torch.ones(7, device=outputs[0].device)  # normalized to gridspace gain
-        
-        # Make a tensor that iterates 0-2 for 3 anchors and repeat that as many times as we have target boxes
-        # tensor shape: (num_anchors, num_targets)
-        ai = torch.arange(num_anchors, device=outputs[0].device).float().view(num_anchors, 1).repeat(1, num_targets)
-        
-        # Copy target boxes anchor size times and append an anchor index to each copy the anchor index is also expressed by the new first dimension
-        # targets original shape (ntargets, 6) -> new shape (num_anchors, num_targets, 7)
-        targets = torch.cat((targets.repeat(num_anchors, 1, 1), ai[:, :, None]), 2)
-
-        for i, anchors in enumerate(anchors_tensor):
-            #scale anchors to grid size
-            anchors = anchors / strides[i]
-            
-            # [1, 1, grid_w, grid_h, grid_w, grid_h, 1]
-            # gain[2:6] = torch.tensor(outputs[i].shape)[[3, 4, 3, 4]] # FIXME, indexing by height and width of feature map
-            gain[2:6] = torch.tensor(outputs[i].shape)[[3, 2, 3, 2]] # indexing by height and width of feature map
-
-            # multiplying targets by gain scales normalized x,y,w,h to grid-cell coordinates.
-            t = targets * gain # shape (num_anchors, num_targets, 7)
-
-            if num_targets:
-                r = t[:, :, 4:6] / anchors[:, None]  # wh ratio
-
-                # DEBUG: Print anchor matching info
-                # print(f"\n[build_targets] Layer {i}:")
-                # print(f"  Anchors (grid-scaled): {anchors}")
-                # print(f"  Targets WH (grid-scaled): {t[:, :, 4:6].shape} -> {t[0, :5, 4:6] if t.shape[1] > 0 else 'empty'}")
-                # print(f"  WH ratios shape: {r.shape}")
-                # print(f"  Max ratio per target: {torch.max(r, 1 / r).max(2)[0][:5]}")
-
-                # Select the ratios that have the highest divergence in any axis and check if the ratio is less than 4
-                j = torch.max(r, 1 / r).max(2)[0] < 4.0 # compare to threshold
-                # print(f"  Targets passing filter: {j.sum()} / {j.numel()}")
-                t = t[j] #filter
-                # print(f"  Final targets for this layer: {t.shape[0]}")
-            else:
-                t = torch.zeros((0, 7), device=targets.device)
-            
-            b, c = t[:, :2].long().T # batch index, class
-
-            # We isolate the target cell associations.
-            # x, y, w, h are allready in the cell coordinate system meaning an x = 1.2 would be 1.2 times cellwidth
-            gxy = t[:, 2:4] # grid x,y
-            gwh = t[:, 4:6] # grid w,h
-
-            gij = gxy.long() #grid cell indices
-            gi, gj = gij.T #grid cell x,y indices
-
-            a = t[:, 6].long() #anchor indices
-
-            # Add target tensors for this yolo layer to the output lists
-            # Add to index list and limit index range to prevent out of bounds
-            indices.append((b, a, gj.clamp_(0, gain[3].long() - 1), gi.clamp_(0, gain[2].long() - 1)))
-            # Add to target box list and convert box coordinates from global grid coordinates to local offsets in the grid cell
-            tbox.append(torch.cat((gxy - gij, gwh), 1))  # box
-            # Add correct anchor for each target to the list
-            anchors_list.append(anchors[a])
-            # Add class for each target to the list (clamp to valid range [0, num_classes-1])
-            # This prevents IndexError if dataset has invalid class indices
-            tcls.append(c.clamp(0, num_classes - 1))
-            
-        return tcls, tbox, indices, anchors_list
+    
+    balance:list = [4.0, 1.0, 0.4]
+    gamma:float=0.5
+    
+    iou_aware_cls:bool=False
+    label_smoothing:float=0.0 
+    autobalance:bool=False
+    
+    ssi = [1.0, 1.0, 1.0]
 
     @staticmethod
     def focal_loss(inputs, targets, alpha=0.25, gamma=2.0, reduction="mean"):
@@ -456,88 +362,6 @@ class DetectionLossCalculator:
         else:
             return loss   
 
-    @staticmethod
-    def compute_detection_loss(outputs:List[torch.Tensor], targets:torch.Tensor, 
-                            num_anchors:int, anchors_tensor:torch.Tensor, strides:List[int],
-                            cls_loss_type:str='BCE'):
-        """
-        outputs[i] : Tensor of shape (batch_size, num_anchors, grid_h, grid_w, (5 + num_classes))
-        targets : Tensor of shape (num_targets, 6) where each target is (batch_idx, class, x, y, w, h)
-        """
-
-        lcls = torch.tensor(0.0, device=outputs[0].device)  # Classification loss
-        lbox = torch.tensor(0.0, device=outputs[0].device)  # Bounding box regression loss
-        lobj = torch.tensor(0.0, device=outputs[0].device)  # Objectness loss
-        
-        tcls, tbox, indices, anchors = DetectionLossCalculator.build_targets(outputs, targets, num_anchors, anchors_tensor, strides)
-        
-        ious = []
-
-        for i, output in enumerate(outputs):
-            b, a, gj, gi = indices[i]
-            tobj = torch.zeros_like(output[..., 0], device=output.device)
-            num_targets = b.shape[0]
-
-            # print(f"\n[compute_detection_loss] Layer {i}: num_targets = {num_targets}")
-
-            if num_targets:
-                                
-                ps = output[b, a, gj, gi] # shape (num_targets, 5 + num_classes)
-
-                # # Predictions in grid space
-                # grid_xy = torch.stack((gi, gj), dim=1).float()
-                # pxy = ps[:, 0:2].sigmoid() + grid_xy  # Absolute grid coordinates
-                # pwh = torch.exp(ps[:, 2:4]) * anchors[i]
-                # pbox = torch.cat((pxy, pwh), 1)
-
-                # # Targets in grid space (convert offset to absolute)
-                # tbox_absolute = tbox[i].clone()
-                # tbox_absolute[:, :2] += grid_xy  # offset → absolute grid coordinate
-
-                # YOLOP style decoding in grid space
-                pxy = ps[:, 0:2].sigmoid() * 2. - 0.5
-                pwh = (ps[:, 2:4].sigmoid() * 2.) ** 2 * anchors[i]
-                pbox = torch.cat((pxy, pwh), 1)
-
-                # Target boxes also need adjustment for YOLOP style
-                # tbox xy is (gxy - gij) which is in [0,1), YOLOP pxy is in [-0.5, 1.5]
-                tbox_adj = tbox[i].clone()
-                # No adjustment needed for tbox since it stores actual offsets
-
-                iou = DetectionHelper.bbox_iou(pbox, tbox_adj, x1y1x2y2=False, CIoU=True)
-                ious.append(iou.mean().item())
-                lbox += (1.0 - iou).mean()
-
-                # Objectness
-                tobj[b, a, gj, gi] = iou.detach().clamp(0).type(tobj.dtype)
-
-                if ps.shape[1] - 5 >= 1:
-                    # Classification loss (only if multiple classes)
-                    t = torch.zeros_like(ps[:, 5:], device=ps.device)
-                    t[range(num_targets), tcls[i]] = 1.0
-
-                    if cls_loss_type == 'BCE':
-                        lcls += torch.nn.functional.binary_cross_entropy_with_logits(ps[:, 5:], t, reduction='mean')
-                    elif cls_loss_type == 'focal':
-                        lcls += DetectionLossCalculator.focal_loss(ps[:, 5:], t, reduction='mean')
-
-            lobj += torch.nn.functional.binary_cross_entropy_with_logits(
-                output[..., 4], tobj, reduction='mean'
-            )
-
-        lbox *= DetectionLossCalculator.bbox_weight
-        lobj *= DetectionLossCalculator.obj_weight
-        lcls *= DetectionLossCalculator.cls_weight
-
-        loss = lbox + lobj + lcls
-
-        return loss, {
-            "lbox": lbox, 
-            "lobj": lobj,
-            "lcls": lcls,
-            "iou": sum(ious) / len(ious) if len(ious) > 0 else 0.0
-        }
-        
     @staticmethod
     def build_targets_2(preds:List[torch.Tensor], targets:torch.Tensor, 
                         num_layers:int, anchors:torch.Tensor, stride:torch.Tensor):
@@ -639,28 +463,57 @@ class DetectionLossCalculator:
                 # Classification loss (IoU-aware weighting)
                 nc = pred.shape[-1] - 5
                 if nc > 1:
-                    t = torch.zeros_like(ps[:, 5:], device=device)
-                    t[range(nt), tcls[i]] = 1.0
+                    
+                    cp = 1.0 - 0.5 * DetectionLossCalculator.label_smoothing
+                    cn = 0.5 * DetectionLossCalculator.label_smoothing                    
+                    
+                    t = torch.full_like(ps[:, 5:], device=device)
+                    t[range(nt), tcls[i]] = cp
                     t = t.detach()
 
                     # IoU-aware weighting: weight classification loss by prediction quality
                     iou_weight = iou.detach().clamp(0.1, 1.0)  # Clamp to avoid zero weights
 
                     if cls_loss_type.lower() == 'focal':
-                        cls_loss_per_sample = DetectionLossCalculator.focal_loss(ps[:, 5:], t, alpha=0.25, gamma=2.0, reduction='none')
+                        cls_loss_per_sample = DetectionLossCalculator.focal_loss(ps[:, 5:], t, alpha=0.25, 
+                                                                                gamma=DetectionLossCalculator.gamma, 
+                                                                                reduction='none')
                         # Weight by IoU and take mean
-                        lcls += (cls_loss_per_sample.mean(dim=1) * iou_weight).mean()
+                        if DetectionLossCalculator.iou_aware_cls:
+                            lcls += (cls_loss_per_sample.mean(dim=1) * iou_weight).mean()
+                        else:
+                            lcls += cls_loss_per_sample.mean()
                     else:  # BCE
-                        cls_loss_per_sample = torch.nn.functional.binary_cross_entropy_with_logits(ps[:, 5:], t, reduction='none')
-                        lcls += (cls_loss_per_sample.mean(dim=1) * iou_weight).mean()
+                        cls_loss_per_sample = torch.nn.functional.binary_cross_entropy_with_logits(ps[:, 5:], 
+                                                                                                   t, 
+                                                                                                   reduction='none')
+                        # Weight by IoU and take mean
+                        if DetectionLossCalculator.iou_aware_cls:
+                            lcls += (cls_loss_per_sample.mean(dim=1) * iou_weight).mean()
+                        else:
+                            lcls += cls_loss_per_sample.mean()
 
             # Objectness loss
-            lobj += torch.nn.functional.binary_cross_entropy_with_logits(pred[..., 4], tobj, reduction='mean')
+            obji += torch.nn.functional.binary_cross_entropy_with_logits(pred[..., 4], 
+                                                                        tobj, 
+                                                                        reduction='mean')
+            
+            if DetectionLossCalculator.autobalance:
+                obji_val = obji.detach().item()
+                DetectionLossCalculator.ssi[i] = \
+                    DetectionLossCalculator.ssi[i] * 0.9999 + obji_val * 0.0001
+                
+                ssi_max = max(DetectionLossCalculator.ssi)
+                balance_i = (DetectionLossCalculator.ssi[i] / (ssi_max + 1e-9))
+                lobj += obji * balance_i
+                    
+            else:
+                lobj += obji * DetectionLossCalculator.balance[i]
 
         # YOLOv3 loss weights
-        lbox *= 0.05
-        lobj *= 1.0
-        lcls *= 0.5
+        lbox *= DetectionLossCalculator.bbox_weight
+        lobj *= DetectionLossCalculator.obj_weight
+        lcls *= DetectionLossCalculator.cls_weight
 
         loss = lbox + lobj + lcls
         return loss, {"lbox": lbox, "lobj": lobj, "lcls": lcls, "iou": sum(ious)/len(ious) if ious else 0.0}

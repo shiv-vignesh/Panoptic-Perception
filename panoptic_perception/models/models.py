@@ -230,14 +230,6 @@ class YOLOP(nn.Module):
                 output_name = "detections"
                 assert output_name in targets, f"Target for {output_name} not provided."
 
-                # det_loss, det_loss_items = DetectionLossCalculator.compute_detection_loss(
-                #     model_outputs.detection_logits,
-                #     targets["detections"],
-                #     num_anchors=len(self.module_list[self.detection_head_idx].anchors[0]),
-                #     anchors_tensor=self.module_list[self.detection_head_idx].anchors,
-                #     strides=[width/x.shape[2] for x in model_outputs.detection_logits]
-                # )
-
                 det_loss, det_loss_items = DetectionLossCalculator.compute_detection_loss_2(
                     model_outputs.detection_logits,
                     targets["detections"],

@@ -1,4 +1,4 @@
-import os, math, time
+import os, math, time, copy
 from tqdm import tqdm
 from datetime import datetime
 
@@ -6,11 +6,96 @@ from typing import Iterable, Union
 from collections import defaultdict
 
 import torch
+from torch import nn
 from torch.utils.data.dataloader import DataLoader
 
 import numpy as np
 
 from panoptic_perception.dataset.bdd100k_dataset import BDD100KDataset, BDDPreprocessor
+
+
+class ModelEMA:
+    """
+    Exponential Moving Average of model weights.
+    Keeps a moving average of model parameters for more stable predictions.
+
+    Usage:
+        ema = ModelEMA(model, decay=0.9999)
+        # During training:
+        ema.update(model)
+        # For evaluation:
+        ema.apply_shadow(model)  # Apply EMA weights
+        # ... evaluate ...
+        ema.restore(model)       # Restore original weights
+    """
+
+    def __init__(self, model: nn.Module, decay: float = 0.9999, warmup_steps: int = 2000):
+        """
+        Args:
+            model: The model to track
+            decay: EMA decay rate (higher = slower update, more smoothing)
+            warmup_steps: Number of steps before reaching full decay rate
+        """
+        self.decay = decay
+        self.warmup_steps = warmup_steps
+        self.step = 0
+
+        # Create shadow copy of model weights
+        self.shadow = {}
+        self.backup = {}
+
+        for name, param in model.named_parameters():
+            if param.requires_grad:
+                self.shadow[name] = param.data.clone()
+
+    def _get_decay(self) -> float:
+        """Get current decay rate with warmup."""
+        if self.step < self.warmup_steps:
+            # Linear warmup from 0 to decay
+            return min(self.decay, (1 + self.step) / (10 + self.step))
+        return self.decay
+
+    def update(self, model: nn.Module):
+        """Update EMA weights with current model weights."""
+        self.step += 1
+        decay = self._get_decay()
+
+        with torch.no_grad():
+            for name, param in model.named_parameters():
+                if param.requires_grad and name in self.shadow:
+                    # EMA update: shadow = decay * shadow + (1 - decay) * param
+                    self.shadow[name].mul_(decay).add_(param.data, alpha=1 - decay)
+
+    def apply_shadow(self, model: nn.Module):
+        """Apply EMA weights to model (backup original weights first)."""
+        self.backup = {}
+        for name, param in model.named_parameters():
+            if param.requires_grad and name in self.shadow:
+                self.backup[name] = param.data.clone()
+                param.data.copy_(self.shadow[name])
+
+    def restore(self, model: nn.Module):
+        """Restore original weights from backup."""
+        for name, param in model.named_parameters():
+            if param.requires_grad and name in self.backup:
+                param.data.copy_(self.backup[name])
+        self.backup = {}
+
+    def state_dict(self) -> dict:
+        """Return EMA state for checkpointing."""
+        return {
+            'shadow': self.shadow,
+            'step': self.step,
+            'decay': self.decay
+        }
+
+    def load_state_dict(self, state_dict: dict):
+        """Load EMA state from checkpoint."""
+        self.shadow = state_dict['shadow']
+        self.step = state_dict['step']
+        self.decay = state_dict.get('decay', self.decay)
+
+
 from panoptic_perception.dataset.enums import BDD100KClassesReduced
 
 from panoptic_perception.models.models import YOLOP, get_model_param_groups
@@ -42,11 +127,21 @@ class Trainer:
         self.monitor_val = trainer_kwargs["monitor_val"]
         self.gradient_clipping = trainer_kwargs["gradient_clipping"]
         
-        self.checkpoint_idx = trainer_kwargs['checkpoint_idx']     
+        self.checkpoint_idx = trainer_kwargs['checkpoint_idx']
         self.gradient_accumulation_steps = trainer_kwargs['gradient_accumulation_steps']
         self.reload_optimizer_with_initial_lr = trainer_kwargs["reload_optimizer_with_initial_lr"]
-        self.lr_scheduler_start_epoch = trainer_kwargs["lr_scheduler_start_epoch"]        
+        self.lr_scheduler_start_epoch = trainer_kwargs["lr_scheduler_start_epoch"]
         self.reload_optimizer = trainer_kwargs["reload_optimizer"]
+
+        # EMA settings
+        self.use_ema = trainer_kwargs.get('use_ema', True)
+        self.ema_decay = trainer_kwargs.get('ema_decay', 0.9999)
+        self.ema_warmup_steps = trainer_kwargs.get('ema_warmup_steps', 2000)
+        self.ema = None  # Initialized in train()
+
+        # Best model tracking
+        self.best_map = 0.0
+        self.best_epoch = 0
 
         if not os.path.exists(self.output_dir):
             os.makedirs(self.output_dir)
@@ -289,9 +384,29 @@ class Trainer:
         self.cur_epoch = 0
         # self.best_score = 0.0
         self.best_score = defaultdict(float)
-        
+
+        # Reset best model tracking
+        self.best_map = 0.0
+        self.best_epoch = 0
+
         self.start_epoch = 1
         self.resume_from_ckpt(checkpoint_path)
+
+        # Initialize EMA after loading checkpoint
+        if self.use_ema:
+            self.ema = ModelEMA(self.model, decay=self.ema_decay, warmup_steps=self.ema_warmup_steps)
+            self.logger.log_message(f'EMA enabled with decay={self.ema_decay}, warmup_steps={self.ema_warmup_steps}')
+
+            # If resuming, try to load EMA state
+            if checkpoint_path and os.path.exists(checkpoint_path):
+                ckpt = torch.load(checkpoint_path, map_location=self.device)
+                if 'ema_state' in ckpt and ckpt['ema_state'] is not None:
+                    self.ema.load_state_dict(ckpt['ema_state'])
+                    self.logger.log_message('EMA state loaded from checkpoint')
+                if 'best_map' in ckpt:
+                    self.best_map = ckpt['best_map']
+                    self.best_epoch = ckpt.get('best_epoch', 0)
+                    self.logger.log_message(f'Best mAP from checkpoint: {self.best_map:.4f} (epoch {self.best_epoch})')
 
         for epoch in range(self.start_epoch, self.epochs + 1):
             self.cur_epoch = epoch
@@ -304,16 +419,21 @@ class Trainer:
                     ckpt_dir = f'{self.output_dir}/ckpt_{self.cur_epoch}'
                     if not os.path.exists(ckpt_dir):
                         os.makedirs(ckpt_dir)
-                    
-                    torch.save(
-                        {
-                            "epoch": self.cur_epoch,
-                            "model_state": self.model.state_dict(),
-                            "optimizer_state": self.optimizer.state_dict(),
-                            "scheduler_state": self.lr_scheduler.state_dict() if hasattr(self, "lr_scheduler") else None
-                        },
-                        f"{ckpt_dir}/ckpt-{self.cur_epoch}.pt"
-                    )
+
+                    checkpoint = {
+                        "epoch": self.cur_epoch,
+                        "model_state": self.model.state_dict(),
+                        "optimizer_state": self.optimizer.state_dict(),
+                        "scheduler_state": self.lr_scheduler.state_dict() if hasattr(self, "lr_scheduler") else None,
+                        "best_map": self.best_map,
+                        "best_epoch": self.best_epoch,
+                    }
+
+                    # Save EMA state
+                    if self.use_ema and self.ema is not None:
+                        checkpoint["ema_state"] = self.ema.state_dict()
+
+                    torch.save(checkpoint, f"{ckpt_dir}/ckpt-{self.cur_epoch}.pt")
 
             if self.monitor_val and self.cur_epoch >= self.first_val_epoch:
                 self.eval_one_epoch()
@@ -347,7 +467,11 @@ class Trainer:
                 self.optimizer.step()
                 self.optimizer.zero_grad()
                 current_lr = self.optimizer.param_groups[0]['lr']
-                
+
+                # Update EMA weights after optimizer step
+                if self.use_ema and self.ema is not None:
+                    self.ema.update(self.model)
+
             total_loss += loss.item()
             ten_percent_batch_total_loss += loss.item()
 
@@ -487,6 +611,12 @@ class Trainer:
 
     def eval_one_epoch(self):
         """Evaluate model on validation set."""
+
+        # Apply EMA weights for evaluation
+        if self.use_ema and self.ema is not None:
+            self.ema.apply_shadow(self.model)
+            self.logger.log_message('Using EMA weights for evaluation')
+
         self.model.eval()
         import gc
 
@@ -752,11 +882,55 @@ class Trainer:
             self.logger.log_message(f'  mAP@0.5: {detection_metrics["mAP"]:.4f}')
         if drivable_metrics:
             self.logger.log_message(f'  Drivable mIoU: {drivable_metrics["mIoU"]:.4f}')
+
+        # Save best model checkpoint
+        current_map = detection_metrics.get("mAP", 0.0) if detection_metrics else 0.0
+        if current_map > self.best_map:
+            self.best_map = current_map
+            self.best_epoch = self.cur_epoch
+            self._save_best_checkpoint(current_map, detection_metrics, drivable_metrics)
+
+        self.logger.log_message(f'  Best mAP: {self.best_map:.4f} (epoch {self.best_epoch})')
         self.logger.log_line()
+
+        # Restore original weights after EMA evaluation
+        if self.use_ema and self.ema is not None:
+            self.ema.restore(self.model)
 
         # Final cleanup
         gc.collect()
         torch.cuda.empty_cache()
 
         self.model.train()
-        
+
+    def _save_best_checkpoint(self, current_map: float, detection_metrics: dict,
+                               drivable_metrics: dict = None):
+        """Save the best model checkpoint."""
+        best_ckpt_path = f'{self.output_dir}/best_model.pt'
+
+        checkpoint = {
+            "epoch": self.cur_epoch,
+            "model_state": self.model.state_dict(),
+            "optimizer_state": self.optimizer.state_dict(),
+            "scheduler_state": self.lr_scheduler.state_dict() if hasattr(self, "lr_scheduler") else None,
+            "best_map": current_map,
+            "best_epoch": self.cur_epoch,
+            "detection_metrics": detection_metrics,
+            "drivable_metrics": drivable_metrics,
+        }
+
+        # Save EMA state if using EMA
+        if self.use_ema and self.ema is not None:
+            checkpoint["ema_state"] = self.ema.state_dict()
+            # Also save EMA weights as separate key (for easy inference loading)
+            checkpoint["ema_model_state"] = {k: v.clone() for k, v in self.ema.shadow.items()}
+
+        torch.save(checkpoint, best_ckpt_path)
+
+        self.logger.log_message(f'New best model saved! mAP: {current_map:.4f} -> {best_ckpt_path}')
+
+        # Log to WandB
+        self.wandb_logger.log_metrics({
+            "val/best_map": current_map,
+            "val/best_epoch": self.cur_epoch
+        }, step=self.cur_epoch)
