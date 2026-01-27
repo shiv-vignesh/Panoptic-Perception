@@ -494,7 +494,7 @@ class DetectionLossCalculator:
                             lcls += cls_loss_per_sample.mean()
 
             # Objectness loss
-            obji += torch.nn.functional.binary_cross_entropy_with_logits(pred[..., 4], 
+            obji = torch.nn.functional.binary_cross_entropy_with_logits(pred[..., 4], 
                                                                         tobj, 
                                                                         reduction='mean')
             
