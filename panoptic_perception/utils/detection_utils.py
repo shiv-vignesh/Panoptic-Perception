@@ -467,7 +467,7 @@ class DetectionLossCalculator:
                     cp = 1.0 - 0.5 * DetectionLossCalculator.label_smoothing
                     cn = 0.5 * DetectionLossCalculator.label_smoothing                    
                     
-                    t = torch.full_like(ps[:, 5:], device=device)
+                    t = torch.full_like(ps[:, 5:], device=device, fill_value=cn)
                     t[range(nt), tcls[i]] = cp
                     t = t.detach()
 
