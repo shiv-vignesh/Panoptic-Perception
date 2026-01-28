@@ -282,24 +282,43 @@ class Trainer:
 
         if optimizer_kwargs["_type"] == "SGD":
             self.lr0 = optimizer_kwargs.get("initial_lr", 3e-5)
-            self.optimizer = torch.optim.SGD(
-                self.model.parameters(),
-                # param_groups,
-                lr=optimizer_kwargs.get("initial_lr", 3e-3),
-                momentum=optimizer_kwargs.get("momentum", 0.7)
-            )
-            
+            if param_groups:
+                for pg in param_groups:
+                    pg['lr'] = self.lr0 * pg.pop("lr_scale", 1.0)
+                    
+                self.optimizer = torch.optim.SGD(
+                    param_groups,
+                    momentum=optimizer_kwargs.get("momentum", 0.7)
+                )                
+            else:
+                self.optimizer = torch.optim.SGD(
+                    self.model.parameters(),
+                    lr=optimizer_kwargs.get("initial_lr", 3e-3),
+                    momentum=optimizer_kwargs.get("momentum", 0.7)
+                )                
+
             self.inital_lr = optimizer_kwargs.get("initial_lr", 3e-5)
             
         elif optimizer_kwargs["_type"] == "AdamW":
             self.lr0 = optimizer_kwargs.get("initial_lr", 3e-4)
-            self.optimizer = torch.optim.AdamW(
-                self.model.parameters(),
-                # param_groups,
-                lr=optimizer_kwargs.get("initial_lr", 3e-4),
-                weight_decay=optimizer_kwargs.get("weight_decay", 0.01),
-                betas=(0.937, 0.999)
-            )
+            
+            if param_groups:
+                for pg in param_groups:
+                    pg['lr'] = self.lr0 * pg.pop("lr_scale", 1.0)
+                    
+                self.optimizer = torch.optim.AdamW(
+                    param_groups,
+                    weight_decay=optimizer_kwargs.get("weight_decay", 0.01),
+                    betas=(0.937, 0.999)
+                )
+                
+            else:
+                self.optimizer = torch.optim.AdamW(
+                    self.model.parameters(),
+                    lr=self.lr0,
+                    weight_decay=optimizer_kwargs.get("weight_decay", 0.01),
+                    betas=(0.937, 0.999)
+                )                
             
             self.inital_lr = optimizer_kwargs.get("initial_lr", 3e-5)
     

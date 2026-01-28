@@ -58,15 +58,18 @@
         "groups": {
             "backbone": {
                 "group": [0, 23],
-                "trainable": true
+                "trainable": true,
+                "lr_scale": 0.01
             },
             "detect": {
                 "group": [24],
-                "trainable": true
+                "trainable": true,
+                "lr_scale": 0.01
             },
             "segmentation": {
                 "group": [25, 33],
-                "trainable": true
+                "trainable": true,
+                "lr_scale": 1.0
             }
         }
     },

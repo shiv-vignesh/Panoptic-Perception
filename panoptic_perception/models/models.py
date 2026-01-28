@@ -288,6 +288,7 @@ def get_model_param_groups(model:YOLOP, groups:dict):
     for group_name in groups:
         group = groups[group_name]["group"]
         trainable = groups[group_name]["trainable"]
+        lr_scale = groups[group_name].get("lr_scale", 1.0)
 
         last_layer_index = len(model.module_list) - 1
 
@@ -324,7 +325,7 @@ def get_model_param_groups(model:YOLOP, groups:dict):
             for idx in layer_indices:
                 params.extend(list(model.module_list[idx].parameters()))
             if params:
-                param_groups.append({"params": params, "name": group_name})
+                param_groups.append({"params": params, "name": group_name, "lr_scale":lr_scale})
 
     # Freeze BatchNorm layers in frozen modules by setting them to eval mode
     # This prevents running_mean and running_var from updating
