@@ -40,7 +40,7 @@ class WeightsManager:
                 print(f'Model Checkpoint not found: {ckpt_path}')
             return
         
-        ckpt = torch.load(ckpt_path, map_location="cpu")
+        ckpt = torch.load(ckpt_path, map_location="cpu", weights_only=False)
 
         if "model_state" in ckpt:
             state_dict = ckpt["model_state"]
