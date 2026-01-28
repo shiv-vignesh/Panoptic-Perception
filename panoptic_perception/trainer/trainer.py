@@ -354,7 +354,7 @@ class Trainer:
     def resume_from_ckpt(self, ckpt_path:str):
                 
         if ckpt_path and os.path.exists(ckpt_path):
-            ckpt = torch.load(ckpt_path, map_location=self.device)
+            ckpt = torch.load(ckpt_path, map_location=self.device, weights_only=False)
 
             missing, unexpected, loaded_keys = WeightsManager().load(self.model, ckpt_path)            
             # self.model.load_state_dict(ckpt["model_state"])
@@ -418,7 +418,7 @@ class Trainer:
 
             # If resuming, try to load EMA state
             if checkpoint_path and os.path.exists(checkpoint_path):
-                ckpt = torch.load(checkpoint_path, map_location=self.device)
+                ckpt = torch.load(checkpoint_path, map_location=self.device, weights_only=False)
                 if 'ema_state' in ckpt and ckpt['ema_state'] is not None:
                     self.ema.load_state_dict(ckpt['ema_state'])
                     self.logger.log_message('EMA state loaded from checkpoint')
