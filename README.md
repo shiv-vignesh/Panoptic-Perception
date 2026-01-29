@@ -24,20 +24,20 @@ A PyTorch implementation of multi-task panoptic perception for autonomous drivin
 
 | Class | AP@0.5 |
 |-------|--------|
-| Person | 0.432 |
-| Rider | 0.316 |
+| Person | 0.509 |
+| Rider | 0.336 |
 | Vehicles | 0.715 |
 | Motor | 0.334 |
 | Traffic Light | 0.675 |
 | Traffic Sign | 0.565 |
-| **mAP@0.5** | **0.506** |
+| **mAP@0.5** | **0.52** |
 
 ### Drivable Area Segmentation
 
 | Metric | Value |
 |--------|-------|
-| mIoU | 0.85+ |
-| mDice | 0.90+ |
+| mIoU | 0.65+ |
+| mDice | 0.72+ |
 
 ## Architecture
 
