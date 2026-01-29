@@ -153,6 +153,10 @@ class BDDPreprocessor:
                 [A.Resize(height=self.resized_height, width=self.resized_width)]
             )
         
+        self.mask_only_transformation = A.Compose(
+            [A.Resize(height=self.resized_height, width=self.resized_width, interpolation=cv2.INTER_NEAREST)]
+        )
+        
 
     def load_detection(self, json_path, filter_by_area=False):
         
@@ -305,13 +309,13 @@ class BDDPreprocessor:
 
         # Apply transformation to seg and drivable masks
         if seg is not None:
-            seg = self.image_only_transformation(image=seg)['image']
+            seg = self.mask_only_transformation(image=seg)['image']
             seg_tensor = torch.from_numpy(seg).long()
         else:
             seg_tensor = None
 
         if drivable is not None:
-            drivable = self.image_only_transformation(image=drivable)['image']
+            drivable = self.mask_only_transformation(image=drivable)['image']
             drivable_tensor = torch.from_numpy(drivable).long()
         else:
             drivable_tensor = None
