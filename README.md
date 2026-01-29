@@ -127,7 +127,7 @@ pip install opencv-python numpy matplotlib tqdm wandb terminaltables
 
 ## Dataset Setup
 
-1. Download [BDD100K dataset](https://www.bdd100k.com/):
+1. Download [BDD100K dataset](https://bair.berkeley.edu/blog/2018/05/30/bdd/):
    - Images (100K)
    - Detection labels
    - Drivable area segmentation maps
