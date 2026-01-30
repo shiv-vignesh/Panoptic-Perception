@@ -254,11 +254,11 @@ if __name__ == "__main__":
     model_kwargs = {
         "cfg_path": "panoptic_perception/configs/models/yolo-detection.cfg",
         "device": "cuda:0",
-        "model_path": "yolop-detection-detection-rectified/best-model/best-model.pt"
+        "model_path": "panoptic_perception/yolop-detection-detection-rectified-2/ckpt_53/ckpt-53.pt"
     }
 
     dataset_kwargs = {
-        "images_dir": "panoptic_perception/BDD100k/100k",
+        "images_dir": "panoptic_perception/BDD100k/100k/100k",
         "detection_annotations_dir": "panoptic_perception/BDD100k/bdd100k_labels/100k",
         "segmentation_annotations_dir": "panoptic_perception/BDD100k/bdd100k_seg_maps/labels",
         "drivable_annotations_dir": "panoptic_perception/BDD100k/bdd100k_drivable_maps/labels",

@@ -233,6 +233,8 @@ class BDDPreprocessor:
         if drivable_path is not None:
             if os.path.exists(drivable_path):
                 drivable = cv2.imread(drivable_path, cv2.IMREAD_GRAYSCALE)
+                #merge alternative to drivable
+                drivable[drivable == 2] = 1
 
         # Load detection annotations
         bboxes = []
@@ -448,6 +450,8 @@ class BDD100KDataset(Dataset):
         drivable = None
         if os.path.exists(drivable_path):
             drivable = cv2.imread(drivable_path, cv2.IMREAD_GRAYSCALE)
+            #merge alternative to drivable
+            drivable[drivable == 2] = 1
 
         # Load detection annotations and convert to normalized xywh
         labels_xywh = np.zeros((0, 5))
