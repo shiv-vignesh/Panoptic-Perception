@@ -77,6 +77,6 @@ class SegmentationLossCalculator:
         target_onehot = torch.nn.functional.one_hot(targets, num_classes=c)
         target_onehot = target_onehot.permute(0, 3, 1, 2).float()
 
-        d_loss = SegmentationLossCalculator.dice_loss(pred_softmax, target_onehot)
+        t_loss = SegmentationLossCalculator.tversky_loss(pred_softmax, target_onehot)
 
-        return ce_weight * ce_loss + dice_weight * d_loss
+        return ce_weight * ce_loss + dice_weight * t_loss
