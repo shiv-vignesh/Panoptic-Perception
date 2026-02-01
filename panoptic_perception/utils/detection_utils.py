@@ -328,6 +328,7 @@ class DetectionLossCalculator:
     
     balance:list = [4.0, 1.0, 0.4]
     gamma:float=0.5
+    class_weights = [2.88, 12.93, 1.00, 8.60, 2.01, 1.77]
     
     iou_aware_cls:bool=False
     label_smoothing:float=0.0 
@@ -349,7 +350,9 @@ class DetectionLossCalculator:
             scalar loss or per-element loss if reduction='none'.
         """
         # Compute binary cross-entropy loss with logits (no reduction)
-        bce_loss = torch.nn.functional.binary_cross_entropy_with_logits(inputs, targets, reduction="none")
+        bce_loss = torch.nn.functional.binary_cross_entropy_with_logits(inputs, targets, 
+                                                                    reduction="none",
+                                                                    weight=DetectionLossCalculator.class_weights)
         # Get the probability of the true class
         pt = torch.exp(-bce_loss)
         loss = alpha * (1 - pt) ** gamma * bce_loss
@@ -486,6 +489,7 @@ class DetectionLossCalculator:
                     else:  # BCE
                         cls_loss_per_sample = torch.nn.functional.binary_cross_entropy_with_logits(ps[:, 5:], 
                                                                                                    t, 
+                                                                                                   weight=DetectionLossCalculator.class_weights,
                                                                                                    reduction='none')
                         # Weight by IoU and take mean
                         if DetectionLossCalculator.iou_aware_cls:

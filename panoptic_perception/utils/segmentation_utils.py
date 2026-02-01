@@ -25,7 +25,7 @@ class SegmentationUtils:
 class SegmentationLossCalculator:
 
     BCESeg = torch.nn.BCEWithLogitsLoss()
-    CESeg = torch.nn.CrossEntropyLoss()
+    CESeg = torch.nn.CrossEntropyLoss(weight=torch.tensor([1.0, 4.9]))
     
     @staticmethod
     def dice_loss(pred_softmax:torch.Tensor, target_onehot:torch.Tensor, smooth=1.0):
