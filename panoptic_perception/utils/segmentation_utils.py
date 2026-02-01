@@ -49,7 +49,7 @@ class SegmentationLossCalculator:
         pass
 
     @staticmethod
-    def compute_segmentation_loss(predictions, targets, dice_weight=0.5, ce_weight=0.5):
+    def compute_segmentation_loss(predictions, targets, dice_weight=0.7, ce_weight=0.3):
         """
         Compute combined CE + Dice segmentation loss.
 
