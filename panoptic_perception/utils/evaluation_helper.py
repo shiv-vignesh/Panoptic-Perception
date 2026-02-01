@@ -27,6 +27,143 @@ from panoptic_perception.utils.detection_utils import DetectionHelper
 class DetectionMetrics:
     """Metrics for object detection evaluation (AP, mAP, etc.)."""
 
+    
+    @staticmethod
+    def compute_stats(
+        all_detections: Dict[int, torch.Tensor],
+        all_ground_truths: Dict[int, torch.Tensor],
+        iou_threshold: float = 0.5,
+        num_classes: int = 10        
+    ):
+        """
+            PR Curve - 
+                For each class Calculate Average Precision (AP) and mean AP (mAP)
+                    Collect all detections for that class across all images
+                    Sort them by confidence
+                    Walk the list one detection at a time
+                    After each detection, update cumulative TP / FP
+                    
+            General Stats : 
+                True Positives, False Positives, False Negatives per class
+
+        Args:
+            all_detections: Dict of detection tensors per image 
+                            image_id -> (num_dets, 6)
+                            Each: (num_dets, 6) [x1, y1, x2, y2, conf, class]
+            all_ground_truths: List of ground truth tensors per image
+                            image_id -> (num_gt, 5)
+                            Each: (num_gt, 5) [x1, y1, x2, y2, class]
+            iou_threshold: IoU threshold for matching
+            num_classes: Number of classes
+
+        Returns:
+            Dictionary with AP per class and mAP
+        """
+        
+        ap_per_class = defaultdict(float)
+        stats_per_class = defaultdict(lambda : defaultdict(float))
+
+        tp_img = np.zeros(shape=(len(all_detections), num_classes)) #per image
+        fp_img = np.zeros(shape=(len(all_detections), num_classes)) #per image
+        fn_img = np.zeros(shape=(len(all_detections), num_classes))
+
+        for cls in range(num_classes):
+            all_scores = []
+            all_is_tp = []
+            total_gt = 0
+            
+            for image_idx in all_detections:
+                detetctions = all_detections[image_idx]
+                gts = all_ground_truths.get(image_idx)
+
+                if detetctions is None:
+                    continue
+                if gts is None:
+                    gts = detetctions.new_zeros((0, 5))
+                
+                cls_dets = detetctions[detetctions[:, -1] == cls]
+                cls_gts = gts[gts[:, -1] == cls]
+                total_gt += cls_gts.shape[0]
+                
+                if cls_dets.shape[0] == 0:
+                    #false negatives
+                    if cls_gts.shape[0] > 0:
+                        fn_img[image_idx][cls] += cls_gts.shape[0]                    
+                
+                    continue
+                
+                #false postives
+                if cls_dets.shape[0] > 0 and cls_gts.shape[0] == 0:
+                    fp_img[image_idx][cls] += cls_dets.shape[0]
+                    
+                    all_scores.extend(cls_dets[:, 4].cpu().tolist())
+                    all_is_tp.extend([0]*cls_dets.shape[0])
+                    
+                    continue
+                
+                ious = DetectionHelper.box_iou(
+                    cls_dets[:, :4],
+                    cls_gts[:, :4])
+                
+                sorted_idx = torch.argsort(
+                    cls_dets[:, 4], descending=True
+                )
+                
+                cls_dets = cls_dets[sorted_idx]
+                ious = ious[sorted_idx]
+                
+                matched_gt = torch.zeros(cls_gts.shape[0], dtype=torch.bool)
+                
+                for det_i in range(cls_dets.shape[0]):
+                    max_iou, gt_i = ious[det_i].max(dim=0)
+                    if max_iou >= iou_threshold and not matched_gt[gt_i]:
+                        matched_gt[gt_i] = True
+                        all_is_tp.append(1)
+                        tp_img[image_idx][cls] += 1
+                        
+                    else:
+                        all_is_tp.append(0)
+                        fp_img[image_idx][cls] += 1
+                        
+                    all_scores.append(cls_dets[det_i, 4].item())
+                        
+                fn_img[image_idx][cls] += (~matched_gt).sum().item()
+                
+            if not all_scores:
+                ap_per_class[f"AP_class_{cls}"] = 0.0
+                continue
+            
+            sorted_idx = np.argsort(-np.array(all_scores))
+            tp = np.array(all_is_tp)[sorted_idx]
+            fp = 1 - tp
+            
+            tp_cumsum = np.cumsum(tp)
+            fp_cumsum = np.cumsum(fp)
+            
+            recall = tp_cumsum / (total_gt + 1e-5)
+            precision = tp_cumsum / (tp_cumsum + fp_cumsum + 1e-5)
+            
+            ap_per_class[f"AP_class_{cls}"] = DetectionMetrics.compute_ap_11point(
+                recall, precision
+            )
+            
+            
+        tp_per_cls = tp_img.sum(axis=0)
+        fp_per_cls = fp_img.sum(axis=0)
+        fn_per_cls = fn_img.sum(axis=0)
+        
+        for cls in range(num_classes):
+            tp = tp_per_cls[cls].item()
+            fp = fp_per_cls[cls].item()
+            fn = fn_per_cls[cls].item()
+            
+            stats_per_class[cls]["total_gt"] = tp + fn
+            stats_per_class[cls][f"true_positives"] = tp
+            stats_per_class[cls][f"false_positives"] = fp
+            stats_per_class[cls][f"false_negatives"] = fn
+            
+        return ap_per_class, stats_per_class
+    
     @staticmethod
     def calculate_ap(
         detections: List[torch.Tensor],

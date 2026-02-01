@@ -640,8 +640,11 @@ class Trainer:
         import gc
 
         # Collect detection predictions (smaller memory footprint)
-        all_detections = []
-        all_detection_targets = []
+        # all_detections = []
+        # all_detection_targets = []
+        
+        dets_by_image = defaultdict(None) #image_id -> (num_dets, 6)
+        gt_by_image = defaultdict(None) #image_id -> (num_gt, 5)
 
         # Use confusion matrices for segmentation (memory efficient)
         num_drivable_classes = 3
@@ -653,6 +656,7 @@ class Trainer:
         total_det_loss = 0.0
         total_drivable_loss = 0.0
         total_lane_loss = 0.0
+        global_image_idx = 0
 
         self.logger.log_line()
         self.logger.log_message(f'Evaluating Epoch {self.cur_epoch}')
@@ -711,13 +715,13 @@ class Trainer:
                         max_detections=500
                     )
 
-                    all_detections.extend(nms_results)
-
-                    # Process ground truth detections
-                    for i in range(batch_size):
-                        mask = data_items["detections"][:, 0] == i
+                    for image_idx, dets in enumerate(nms_results):
+                        if dets is not None:
+                            dets_by_image[global_image_idx] = dets
+                        
+                        mask = data_items["detections"][:, 0] == image_idx
                         img_targets = data_items["detections"][mask]
-
+                        
                         if img_targets.shape[0] > 0:
                             boxes_xywh = img_targets[:, 2:6]
                             boxes_xywh[:, [0,2]] *= image_w
@@ -725,9 +729,9 @@ class Trainer:
                             boxes_xyxy = DetectionHelper.xywh2xyxy(boxes_xywh)
                             classes = img_targets[:, 1:2]
                             gts = torch.cat([boxes_xyxy, classes], dim=1)
-                            all_detection_targets.append(gts)
-                        else:
-                            all_detection_targets.append(None)
+                            gt_by_image[global_image_idx] = gts
+
+                        global_image_idx += 1
 
                 # Process segmentation with running confusion matrix (memory efficient)
                 if outputs.drivable_segmentation_predictions is not None:
@@ -769,7 +773,6 @@ class Trainer:
                             lane_preds.cpu(), lane_targets.cpu(), num_lane_classes
                         )
 
-
         # Compute metrics
         num_batches = len(self.val_dataloader)
 
@@ -782,40 +785,59 @@ class Trainer:
         # Detection metrics
         detection_metrics = {}
         num_classes = len(BDD100KClassesReduced)
-        if len(all_detections) > 0 and len(all_detection_targets) > 0:
-            ap_results = DetectionMetrics.calculate_ap(
-                all_detections,
-                all_detection_targets,
-                iou_threshold=0.25,
-                num_classes=num_classes
-            )
-            detection_metrics = ap_results
+        
+        stats_iou_threshold=0.25
+        ap_results, stats_per_class = DetectionMetrics.compute_stats(
+            dets_by_image,
+            gt_by_image,
+            iou_threshold=stats_iou_threshold,
+            num_classes=num_classes
+        )
 
-            # Create AP table for logging with class names
-            ap_table_data = [["Class", "AP"]]
-            for cls in range(num_classes):
-                class_name = BDD100KClassesReduced(cls).name
-                ap_value = ap_results.get(f'AP_class_{cls}', 0.0)
-                ap_table_data.append([f"{cls}: {class_name}", f"{ap_value:.4f}"])
-            ap_table_data.append(["mAP@0.5", f"{ap_results['mAP']:.4f}"])
+        detection_metrics = ap_results
 
-            ap_table_string = AsciiTable(ap_table_data).table
+        # Create AP table for logging with class names
+        ap_table_data = [["Class", "AP"]]
+        for cls in range(num_classes):
+            class_name = BDD100KClassesReduced(cls).name
+            ap_value = ap_results.get(f'AP_class_{cls}', 0.0)
+            ap_table_data.append([f"{cls}: {class_name}", f"{ap_value:.4f}"])
+        ap_table_data.append(["mAP@0.5", f"{ap_results['mAP']:.4f}"])
 
-            self.logger.log_message("\nDetection Metrics (AP@0.5):")
-            self.logger.log_message(ap_table_string)
+        ap_table_string = AsciiTable(ap_table_data).table
+        self.logger.log_message("\nDetection Metrics (AP@0.5):")
+        self.logger.log_message(ap_table_string)
+        
+        #Create Stats (TP, FP, FN)
+        stats_table_data = [["Class", "total GT", f"TP", f"FP", f"FN"]]
+        for cls in range(num_classes):
+            class_name = BDD100KClassesReduced(cls).name            
+            class_stats = stats_per_class[cls]        
 
-            # Log AP table to WandB
-            wandb_ap_data = [[f"{cls}: {BDD100KClassesReduced(cls).name}", ap_results.get(f'AP_class_{cls}', 0.0)] for cls in range(num_classes)]
-            wandb_ap_data.append(["mAP@0.5", ap_results['mAP']])
-            self.wandb_logger.log_table(
-                "val/detection_ap",
-                columns=["Class", "AP"],
-                data=wandb_ap_data,
-                step=self.cur_epoch
-            )
+            total_gt = class_stats.get("total_gt", 0.0)
+            true_positives = class_stats.get("true_positives", 0.0)
+            false_positives = class_stats.get("false_positives", 0.0)
+            false_negatives = class_stats.get("false_negatives", 0.0)
+            
+            stats_table_data.append([f'{cls}: {class_name}', total_gt, 
+                                    true_positives, false_positives, false_negatives])
+            
+        stats_table_string = AsciiTable(stats_table_data).table
+        self.logger.log_message(f"\nDetection Metrics @{stats_iou_threshold}:")
+        self.logger.log_message(stats_table_string)
+
+        # Log AP table to WandB
+        wandb_ap_data = [[f"{cls}: {BDD100KClassesReduced(cls).name}", ap_results.get(f'AP_class_{cls}', 0.0)] for cls in range(num_classes)]
+        wandb_ap_data.append(["mAP@0.5", ap_results['mAP']])
+        self.wandb_logger.log_table(
+            "val/detection_ap",
+            columns=["Class", "AP"],
+            data=wandb_ap_data,
+            step=self.cur_epoch
+        )
 
         # Free detection memory before computing segmentation metrics
-        del all_detections, all_detection_targets
+        del dets_by_image, gt_by_image
         gc.collect()
         torch.cuda.empty_cache()
 
