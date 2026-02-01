@@ -236,7 +236,7 @@ class YOLOP(nn.Module):
             if i in self._cache_layer_idx:
                 cache[i] = x
                 
-            print(f'Layer_idx: {i} - ModuleName: {self.module_names[i]} - TensorShape: {x.shape}')
+            # print(f'Layer_idx: {i} - ModuleName: {self.module_names[i]} - TensorShape: {x.shape}')
 
         
         if targets is not None:
