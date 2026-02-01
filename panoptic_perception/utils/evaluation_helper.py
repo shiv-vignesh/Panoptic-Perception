@@ -146,8 +146,10 @@ class DetectionMetrics:
             ap_per_class[f"AP_class_{cls}"] = DetectionMetrics.compute_ap_11point(
                 recall, precision
             )
-            
-            
+
+        ap_values = [v for k, v in ap_per_class.items() if k.startswith('AP_class_')]
+        ap_per_class['mAP'] = np.mean(ap_values) if ap_values else 0.0                
+
         tp_per_cls = tp_img.sum(axis=0)
         fp_per_cls = fp_img.sum(axis=0)
         fn_per_cls = fn_img.sum(axis=0)
