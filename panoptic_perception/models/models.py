@@ -98,6 +98,10 @@ def create_modules(module_defs: list, num_classes: int = 80,
             concat_ch = sum(output_channels[r] if r != -1 else output_channels[-1] for r in route)
             output_channels.append(concat_ch)
 
+        elif mtype == "ResidualAdd":
+            module = nn.Identity()
+            output_channels.append(output_channels[-1])
+
         # -- HEADS (skip building) ---------------------------------------------
         elif mtype == "Detect":
             num_classes = int(module_def.get("num_classes"))
@@ -182,6 +186,15 @@ class YOLOP(nn.Module):
                         assert r in cache, f"Output for layer {r} not found in cache."                        
                         x = torch.cat([x, cache[r]], dim=1)
 
+                elif self.module_names[i] == "ResidualAdd":
+                    for r in route:
+                        if r == -1:
+                            continue
+                        assert r in cache, f"Output for layer {r} not found in cache."
+                        assert x.shape == cache[r].shape, f"Residual Add Expects Tensors of Same Size, Found: {x.shape} and {cache[r].shape}"
+
+                        x = x + cache[r]
+                
                 elif self.module_names[i] == "Detect":
                     inputs = []
                     for r in route:
@@ -222,6 +235,8 @@ class YOLOP(nn.Module):
 
             if i in self._cache_layer_idx:
                 cache[i] = x
+                
+            print(f'Layer_idx: {i} - ModuleName: {self.module_names[i]} - TensorShape: {x.shape}')
 
         
         if targets is not None:
