@@ -352,7 +352,7 @@ class DetectionLossCalculator:
         # Compute binary cross-entropy loss with logits (no reduction)
         bce_loss = torch.nn.functional.binary_cross_entropy_with_logits(inputs, targets, 
                                                                     reduction="none",
-                                                                    weight=DetectionLossCalculator.class_weights)
+                                                                    weight=DetectionLossCalculator.class_weights.to(inputs.device))
         # Get the probability of the true class
         pt = torch.exp(-bce_loss)
         loss = alpha * (1 - pt) ** gamma * bce_loss
@@ -489,7 +489,7 @@ class DetectionLossCalculator:
                     else:  # BCE
                         cls_loss_per_sample = torch.nn.functional.binary_cross_entropy_with_logits(ps[:, 5:], 
                                                                                                    t, 
-                                                                                                   weight=DetectionLossCalculator.class_weights,
+                                                                                                   weight=DetectionLossCalculator.class_weights.to(device),
                                                                                                    reduction='none')
                         # Weight by IoU and take mean
                         if DetectionLossCalculator.iou_aware_cls:
