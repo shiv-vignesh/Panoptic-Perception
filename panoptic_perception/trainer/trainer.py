@@ -718,6 +718,8 @@ class Trainer:
                     for image_idx, dets in enumerate(nms_results):
                         if dets is not None:
                             dets_by_image[global_image_idx] = dets
+                        else:
+                            dets_by_image[global_image_idx] = None
                         
                         mask = data_items["detections"][:, 0] == image_idx
                         img_targets = data_items["detections"][mask]
@@ -730,6 +732,8 @@ class Trainer:
                             classes = img_targets[:, 1:2]
                             gts = torch.cat([boxes_xyxy, classes], dim=1)
                             gt_by_image[global_image_idx] = gts
+                        else:
+                            gt_by_image[global_image_idx] = None
 
                         global_image_idx += 1
 
