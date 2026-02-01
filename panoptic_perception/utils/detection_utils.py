@@ -328,7 +328,7 @@ class DetectionLossCalculator:
     
     balance:list = [4.0, 1.0, 0.4]
     gamma:float=0.5
-    class_weights = [2.88, 12.93, 1.00, 8.60, 2.01, 1.77]
+    class_weights = torch.tensor([2.88, 12.93, 1.00, 8.60, 2.01, 1.77], dtype=torch.float)
     
     iou_aware_cls:bool=False
     label_smoothing:float=0.0 
