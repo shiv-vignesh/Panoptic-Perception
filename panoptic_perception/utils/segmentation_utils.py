@@ -25,7 +25,7 @@ class SegmentationUtils:
 class SegmentationLossCalculator:
 
     BCESeg = torch.nn.BCEWithLogitsLoss()
-    _ce_weight = torch.tensor([1.0, 4.9])
+    _ce_weight = torch.tensor([1.0, 3.0])
     _ce_device = None
     CESeg = None
 
