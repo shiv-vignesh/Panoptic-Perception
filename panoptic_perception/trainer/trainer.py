@@ -647,7 +647,7 @@ class Trainer:
         gt_by_image = defaultdict(None) #image_id -> (num_gt, 5)
 
         # Use confusion matrices for segmentation (memory efficient)
-        num_drivable_classes = 3
+        num_drivable_classes = 2
         num_lane_classes = 2  # Will be updated dynamically if needed
         drivable_confusion_matrix = None
         lane_confusion_matrix = None
