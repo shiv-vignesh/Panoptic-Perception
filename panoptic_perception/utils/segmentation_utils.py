@@ -25,8 +25,19 @@ class SegmentationUtils:
 class SegmentationLossCalculator:
 
     BCESeg = torch.nn.BCEWithLogitsLoss()
-    CESeg = torch.nn.CrossEntropyLoss(weight=torch.tensor([1.0, 4.9]))
-    
+    _ce_weight = torch.tensor([1.0, 4.9])
+    _ce_device = None
+    CESeg = None
+
+    @staticmethod
+    def _get_ce_loss(device):
+        if SegmentationLossCalculator.CESeg is None or SegmentationLossCalculator._ce_device != device:
+            SegmentationLossCalculator.CESeg = torch.nn.CrossEntropyLoss(
+                weight=SegmentationLossCalculator._ce_weight.to(device)
+            )
+            SegmentationLossCalculator._ce_device = device
+        return SegmentationLossCalculator.CESeg
+
     @staticmethod
     def dice_loss(pred_softmax:torch.Tensor, target_onehot:torch.Tensor, smooth=1.0):
         dims = (0, 2, 3)
@@ -68,7 +79,7 @@ class SegmentationLossCalculator:
         assert h == h_t and w == w_t, "Prediction and target spatial dimensions must match."
 
         # Cross-Entropy loss (expects raw logits)
-        ce_loss = SegmentationLossCalculator.CESeg(
+        ce_loss = SegmentationLossCalculator._get_ce_loss(predictions.device)(
             predictions.view(bs, c, -1), targets.view(bs, -1)
         )
 
