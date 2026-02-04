@@ -20,17 +20,10 @@ nvidia-smi --query-gpu=name,memory.total,driver_version --format=csv,noheader 2>
 python3 --version
 echo ""
 
-# ---- Step 2: Create data directories ----
-IMAGES_DIR="${DATA_DIR}/100k/"
-LABELS_DIR="${DATA_DIR}/bdd100k_labels/"
-DRIVABLE_MAPS="${DATA_DIR}/bdd100k_drivable_maps/"
-
-echo "[2/6] Creating data directories"
+echo "[2/6] Creating data directory"
 echo "----------------------------------------"
-mkdir -p "${IMAGES_DIR}"
-mkdir -p "${LABELS_DIR}"
-mkdir -p "${DRIVABLE_MAPS}"
-echo "Data directories created at ${DATA_DIR}"
+mkdir -p "${DATA_DIR}"
+echo "Data directory created at ${DATA_DIR}"
 echo ""
 
 # ---- Step 3: Download BDD100K data ----
@@ -69,14 +62,34 @@ download_and_extract() {
     echo ""
 }
 
-download_and_extract "${IMAGES_URL}" "${DATA_DIR}" "100k"
-download_and_extract "${DET_LABELS_URL}" "${DATA_DIR}" "labels"
-download_and_extract "${DRIVABLE_MAPS_URL}" "${DATA_DIR}" "drivable_maps"
+download_and_extract "${IMAGES_URL}" "${DATA_DIR}" "BDD100K Images"
+download_and_extract "${DET_LABELS_URL}" "${DATA_DIR}" "BDD100K Detection Labels"
+download_and_extract "${DRIVABLE_MAPS_URL}" "${DATA_DIR}" "BDD100K Drivable Maps"
 
-# ---- Step 4: Verify data directories ----
-echo "[4/6] Verifying extracted data"
+# ---- Step 4: Create symlinks for config compatibility ----
+# Extracted structure:
+#   data/100k/{train,val,test}/  ← images (*.jpg) + det labels (*.json)
+#   data/color_labels/{train,val}/
+#   data/labels/{train,val}/     ← drivable masks (*.png)
+#
+# Config expects:
+#   images_dir:                /workspace/data/100k
+#   detection_annotations_dir: /workspace/data/bdd100k_labels
+#   drivable_annotations_dir:  /workspace/data/bdd100k_drivable_maps/labels
+
+echo "[4/7] Creating symlinks for config paths"
 echo "----------------------------------------"
-for dir in "${IMAGES_DIR}/train" "${IMAGES_DIR}/val" "${LABELS_DIR}/train" "${LABELS_DIR}/val" "${DRIVABLE_MAPS}/labels/train" "${DRIVABLE_MAPS}/labels/val"; do
+ln -sfn "${DATA_DIR}/100k" "${DATA_DIR}/bdd100k_labels"
+mkdir -p "${DATA_DIR}/bdd100k_drivable_maps"
+ln -sfn "${DATA_DIR}/labels" "${DATA_DIR}/bdd100k_drivable_maps/labels"
+echo "bdd100k_labels -> 100k"
+echo "bdd100k_drivable_maps/labels -> labels"
+echo ""
+
+# ---- Step 5: Verify data directories ----
+echo "[5/7] Verifying extracted data"
+echo "----------------------------------------"
+for dir in "${DATA_DIR}/100k/train" "${DATA_DIR}/100k/val" "${DATA_DIR}/labels/train" "${DATA_DIR}/labels/val"; do
     if [ -d "${dir}" ]; then
         count=$(ls "${dir}" | wc -l)
         echo "OK: ${dir} (${count} files)"
@@ -87,7 +100,7 @@ done
 echo ""
 
 # ---- Step 5: Check Python version and install system deps ----
-echo "[5/6] Checking Python and installing system dependencies"
+echo "[6/7] Checking Python and installing system dependencies"
 echo "----------------------------------------"
 sudo apt update -qq
 
@@ -106,7 +119,7 @@ fi
 echo ""
 
 # ---- Step 6: Install Python packages ----
-echo "[6/6] Installing Python packages"
+echo "[7/7] Installing Python packages"
 echo "----------------------------------------"
 pip install torch==2.6.0+cu118 torchvision==0.21.0+cu118 torchaudio==2.6.0+cu118 \
     --index-url https://download.pytorch.org/whl/cu118
