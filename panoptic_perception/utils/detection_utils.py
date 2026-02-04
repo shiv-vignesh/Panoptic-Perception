@@ -53,7 +53,8 @@ class DetectionHelper:
                 if DIoU:
                     return iou - rho2 / c2
                 elif CIoU:
-                    v = (4/ (torch.pi ** 2)) * torch.pow(torch.atan(w2 / h2) - torch.atan(w1 / h1), 2)
+                    # Clamp aspect ratios to prevent gradient explosion through atan when w or h ≈ 0
+                    v = (4/ (torch.pi ** 2)) * torch.pow(torch.atan(torch.clamp(w2 / h2, -1e4, 1e4)) - torch.atan(torch.clamp(w1 / h1, -1e4, 1e4)), 2)
                     with torch.no_grad():
                         alpha = v / (1 - iou + v + eps)
                     return iou - (rho2 / c2 + v * alpha)
