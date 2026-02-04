@@ -78,27 +78,28 @@ class SegmentationLossCalculator:
         FIXME, replace cross_entropy() with BCESeg()
         """
         
-        target_onehot = torch.nn.functional.one_hot(targets, num_classes=c)
-        target_onehot = target_onehot.permute(0, 3, 1, 2).float()
-        
-        bce_loss = torch.nn.functional.binary_cross_entropy_with_logits(
-            input=predictions.view(bs, c, -1),
-            target=target_onehot.view(bs, c, -1),
-            reduction="mean"
-        )
-        
-        return bce_loss
-        
-        # ce_loss = torch.nn.functional.cross_entropy(
+        # target_onehot = torch.nn.functional.one_hot(targets, num_classes=c)
+        # target_onehot = target_onehot.permute(0, 3, 1, 2).float()
+
+        # bce_loss = torch.nn.functional.binary_cross_entropy_with_logits(
         #     input=predictions.view(bs, c, -1),
-        #     target=targets.view(bs, -1),
-        #     reduction="mean",
-        #     weight=SegmentationLossCalculator._ce_weights.to(predictions.device)
+        #     target=target_onehot.view(bs, c, -1),
+        #     reduction="mean"
         # )
 
-        # Dice loss (expects softmax probabilities + one-hot targets)
-        # pred_softmax = torch.softmax(predictions, dim=1)
+        # return bce_loss
 
-        # t_loss = SegmentationLossCalculator.tversky_loss(predictions, target_onehot)
+        ce_loss = torch.nn.functional.cross_entropy(
+            input=predictions.view(bs, c, -1),
+            target=targets.view(bs, -1),
+            reduction="mean",
+            weight=SegmentationLossCalculator._ce_weights.to(predictions.device)
+        )
 
-        # return ce_weight * bce_loss + dice_weight * t_loss
+        pred_softmax = torch.softmax(predictions, dim=1)
+        target_onehot = torch.nn.functional.one_hot(targets, num_classes=c)
+        target_onehot = target_onehot.permute(0, 3, 1, 2).float()
+
+        t_loss = SegmentationLossCalculator.tversky_loss(pred_softmax, target_onehot)
+
+        return ce_weight * ce_loss + dice_weight * t_loss
