@@ -83,7 +83,7 @@ class SegmentationLossCalculator:
         
         bce_loss = torch.nn.functional.binary_cross_entropy_with_logits(
             input=predictions.view(bs, c, -1),
-            target=targets.view(bs, c, -1),
+            target=target_onehot.view(bs, c, -1),
             reduction="mean"
         )
         
