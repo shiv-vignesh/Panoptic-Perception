@@ -578,11 +578,15 @@ class Trainer:
         if outputs.lane_segmentation_loss is not None:
             loss += outputs.lane_segmentation_loss
 
+        if torch.isnan(loss).any() or torch.isinf(loss).any():
+            self.optimizer.zero_grad()
+            return loss.detach(), outputs
+
         loss.backward()
 
         if self.gradient_clipping:
             torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.gradient_clipping)
-            
+
         return loss, outputs
 
     def _compute_confusion_matrix(self, preds: torch.Tensor, targets: torch.Tensor, num_classes: int) -> torch.Tensor:
