@@ -217,10 +217,20 @@ class YOLOP(nn.Module):
 
             # Capture segmentation outputs
             if self.module_names[i] == "DrivableAreaSegmentation":
-                model_outputs.drivable_segmentation_logits = x
+                """
+                FIXME, change to sigmoid(x)
+                    model_outputs.drivable_segmentation_logits = torch.sigmoid(x)
+                    if not self.training:
+                        model_outputs.drivable_segmentation_predictions = torch.sigmoid(x)
+                """
+
+                # model_outputs.drivable_segmentation_logits = x
+                model_outputs.drivable_segmentation_logits = torch.sigmoid(x)
                 if not self.training:
                     # predictions["drivable_area_seg"] = x
-                    model_outputs.drivable_segmentation_predictions = torch.softmax(x, dim=1)
+                    
+                    # model_outputs.drivable_segmentation_predictions = torch.softmax(x, dim=1)
+                    model_outputs.drivable_segmentation_predictions = torch.sigmoid(x)
                 # print(f'Layer: {i} - Module Name: {self.module_names[i]} (Drivable Area Seg Head) - output shape: {x.shape}')
 
             elif self.module_names[i] == "LaneSegmentation":

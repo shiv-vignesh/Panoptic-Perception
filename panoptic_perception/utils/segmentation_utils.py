@@ -74,12 +74,22 @@ class SegmentationLossCalculator:
         #     predictions.view(bs, c, -1), targets.view(bs, -1)
         # )
         
-        ce_loss = torch.nn.functional.cross_entropy(
+        """
+        FIXME, replace cross_entropy() with BCESeg()
+        """
+        
+        bce_loss = torch.nn.functional.binary_cross_entropy_with_logits(
             input=predictions.view(bs, c, -1),
             target=targets.view(bs, -1),
-            reduction="mean",
-            weight=SegmentationLossCalculator._ce_weights.to(predictions.device)
+            reduction="mean"
         )
+        
+        # ce_loss = torch.nn.functional.cross_entropy(
+        #     input=predictions.view(bs, c, -1),
+        #     target=targets.view(bs, -1),
+        #     reduction="mean",
+        #     weight=SegmentationLossCalculator._ce_weights.to(predictions.device)
+        # )
 
         # Dice loss (expects softmax probabilities + one-hot targets)
         pred_softmax = torch.softmax(predictions, dim=1)
@@ -88,4 +98,4 @@ class SegmentationLossCalculator:
 
         t_loss = SegmentationLossCalculator.tversky_loss(pred_softmax, target_onehot)
 
-        return ce_weight * ce_loss + dice_weight * t_loss
+        return ce_weight * bce_loss + dice_weight * t_loss
