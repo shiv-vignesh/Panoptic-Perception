@@ -38,11 +38,11 @@ class SegmentationLossCalculator:
         return 1.0 - dice.mean()
         
     @staticmethod
-    def tversky_loss(pred_softmax:torch.Tensor, target_onehot:torch.Tensor, alpha=0.3, beta=0.7, smooth=1.0):
+    def tversky_loss(predictions:torch.Tensor, target_onehot:torch.Tensor, alpha=0.3, beta=0.7, smooth=1.0):
         dims = (0, 2, 3)                                                                 
-        tp = (pred_softmax * target_onehot).sum(dim=dims)                                
-        fp = (pred_softmax * (1 - target_onehot)).sum(dim=dims)                          
-        fn = ((1 - pred_softmax) * target_onehot).sum(dim=dims)                          
+        tp = (predictions * target_onehot).sum(dim=dims)                                
+        fp = (predictions * (1 - target_onehot)).sum(dim=dims)                          
+        fn = ((1 - predictions) * target_onehot).sum(dim=dims)                          
         tversky = (tp + smooth) / (tp + alpha * fp + beta * fn + smooth)                 
         return 1.0 - tversky.mean()
     
@@ -78,11 +78,16 @@ class SegmentationLossCalculator:
         FIXME, replace cross_entropy() with BCESeg()
         """
         
+        target_onehot = torch.nn.functional.one_hot(targets, num_classes=c)
+        target_onehot = target_onehot.permute(0, 3, 1, 2).float()
+        
         bce_loss = torch.nn.functional.binary_cross_entropy_with_logits(
             input=predictions.view(bs, c, -1),
-            target=targets.view(bs, -1),
+            target=targets.view(bs, c, -1),
             reduction="mean"
         )
+        
+        return bce_loss
         
         # ce_loss = torch.nn.functional.cross_entropy(
         #     input=predictions.view(bs, c, -1),
@@ -92,10 +97,8 @@ class SegmentationLossCalculator:
         # )
 
         # Dice loss (expects softmax probabilities + one-hot targets)
-        pred_softmax = torch.softmax(predictions, dim=1)
-        target_onehot = torch.nn.functional.one_hot(targets, num_classes=c)
-        target_onehot = target_onehot.permute(0, 3, 1, 2).float()
+        # pred_softmax = torch.softmax(predictions, dim=1)
 
-        t_loss = SegmentationLossCalculator.tversky_loss(pred_softmax, target_onehot)
+        # t_loss = SegmentationLossCalculator.tversky_loss(predictions, target_onehot)
 
-        return ce_weight * bce_loss + dice_weight * t_loss
+        # return ce_weight * bce_loss + dice_weight * t_loss
