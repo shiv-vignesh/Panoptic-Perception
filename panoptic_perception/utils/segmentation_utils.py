@@ -51,7 +51,25 @@ class SegmentationLossCalculator:
         pass
 
     @staticmethod
-    def compute_segmentation_loss(predictions, targets, dice_weight=0.7, ce_weight=0.3):
+    def compute_segmentation_loss(predictions, targets, dice_weight=0.0, ce_weight=1.0):                                         
+        bs, c, h, w = predictions.shape
+
+        # Targets are class indices (B, H, W) — convert to one-hot (B, C, H, W)
+        target_onehot = torch.nn.functional.one_hot(targets, num_classes=c)
+        target_onehot = target_onehot.permute(0, 3, 1, 2).float()
+
+        # BCEWithLogitsLoss applies sigmoid internally (second sigmoid = double sigmoid)
+        # Flatten spatial dims: (B, C, H*W)
+        bce_loss = torch.nn.functional.binary_cross_entropy_with_logits(
+            predictions.view(bs, c, -1),
+            target_onehot.view(bs, c, -1),
+            reduction="mean"
+        )
+
+        return bce_loss
+
+    @staticmethod
+    def compute_segmentation_loss_2(predictions, targets, dice_weight=0.7, ce_weight=0.3):
         """
         Compute combined CE + Dice segmentation loss.
 
