@@ -367,6 +367,13 @@ class BDDPreprocessor:
                 
         batch_images_tensor = torch.stack(batch_images, dim=0)
         batch_targets_tensor = torch.cat(batch_targets, dim=0) if batch_targets else None
+
+        # Sanitize detection targets — all paths (augment, mosaic, mixup, non-augment)
+        # can produce out-of-bounds or degenerate boxes
+        # Format: [batch_idx, class_id, cx, cy, w, h]
+        if batch_targets_tensor is not None:
+            batch_targets_tensor[:, 2:4] = batch_targets_tensor[:, 2:4].clamp(0.0, 1.0)  # cx, cy
+            batch_targets_tensor[:, 4:6] = batch_targets_tensor[:, 4:6].clamp(0.001, 1.0)  # w, h
         batch_segmentation_masks_tensor = torch.stack(batch_segmentation_masks, dim=0) if batch_segmentation_masks else None
         batch_drivable_masks_tensor = torch.stack(batch_drivable_masks, dim=0) if batch_drivable_masks else None
         
