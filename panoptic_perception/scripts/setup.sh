@@ -41,6 +41,7 @@ download_and_extract() {
 
     local filename=$(basename "${url}")
 
+    mkdir -p "${dest}"
     echo "Downloading ${name}..."
     wget -q --show-progress -O "${dest}/${filename}" "${url}"
 
