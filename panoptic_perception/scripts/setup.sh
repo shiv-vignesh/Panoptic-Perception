@@ -66,30 +66,29 @@ download_and_extract "${IMAGES_URL}" "${DATA_DIR}" "BDD100K Images"
 download_and_extract "${DET_LABELS_URL}" "${DATA_DIR}" "BDD100K Detection Labels"
 download_and_extract "${DRIVABLE_MAPS_URL}" "${DATA_DIR}" "BDD100K Drivable Maps"
 
-# ---- Step 4: Create symlinks for config compatibility ----
-# Extracted structure:
-#   data/100k/{train,val,test}/  ← images (*.jpg) + det labels (*.json)
-#   data/color_labels/{train,val}/
-#   data/labels/{train,val}/     ← drivable masks (*.png)
+# ---- Step 4: Separate images and detection labels ----
+# Both zips extract into 100k/{train,val}/ mixing *.jpg and *.json
+# Move json files to a separate directory so get_image_ids() doesn't double count
 #
-# Config expects:
-#   images_dir:                /workspace/data/100k
-#   detection_annotations_dir: /workspace/data/bdd100k_labels
-#   drivable_annotations_dir:  /workspace/data/bdd100k_drivable_maps/labels
+# Drivable maps extract into labels/{train,val}/ and color_labels/{train,val}/
+#
+# Final structure:
+#   data/100k/{train,val}/             ← images only (*.jpg)
+#   data/bdd100k_labels/{train,val}/   ← det labels only (*.json)
+#   data/labels/{train,val}/           ← drivable masks (*.png)
 
-echo "[4/7] Creating symlinks for config paths"
+echo "[4/7] Separating images and detection labels"
 echo "----------------------------------------"
-ln -sfn "${DATA_DIR}/100k" "${DATA_DIR}/bdd100k_labels"
-mkdir -p "${DATA_DIR}/bdd100k_drivable_maps"
-ln -sfn "${DATA_DIR}/labels" "${DATA_DIR}/bdd100k_drivable_maps/labels"
-echo "bdd100k_labels -> 100k"
-echo "bdd100k_drivable_maps/labels -> labels"
+mkdir -p "${DATA_DIR}/bdd100k_labels/train"
+mkdir -p "${DATA_DIR}/bdd100k_labels/val"
+mv ${DATA_DIR}/100k/train/*.json "${DATA_DIR}/bdd100k_labels/train/" 2>/dev/null && echo "Moved train labels" || echo "No train labels to move"
+mv ${DATA_DIR}/100k/val/*.json "${DATA_DIR}/bdd100k_labels/val/" 2>/dev/null && echo "Moved val labels" || echo "No val labels to move"
 echo ""
 
 # ---- Step 5: Verify data directories ----
 echo "[5/7] Verifying extracted data"
 echo "----------------------------------------"
-for dir in "${DATA_DIR}/100k/train" "${DATA_DIR}/100k/val" "${DATA_DIR}/labels/train" "${DATA_DIR}/labels/val"; do
+for dir in "${DATA_DIR}/100k/train" "${DATA_DIR}/100k/val" "${DATA_DIR}/bdd100k_labels/train" "${DATA_DIR}/bdd100k_labels/val" "${DATA_DIR}/labels/train" "${DATA_DIR}/labels/val"; do
     if [ -d "${dir}" ]; then
         count=$(ls "${dir}" | wc -l)
         echo "OK: ${dir} (${count} files)"
