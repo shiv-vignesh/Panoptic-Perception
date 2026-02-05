@@ -284,7 +284,7 @@ class Trainer:
             self.lr0 = optimizer_kwargs.get("initial_lr", 3e-5)
             if param_groups:
                 for pg in param_groups:
-                    pg['lr'] = self.lr0 * pg.pop("lr_scale", 1.0)
+                    pg['lr'] = self.lr0 * pg.get("lr_scale", 1.0)
                     
                 self.optimizer = torch.optim.SGD(
                     param_groups,
@@ -304,8 +304,8 @@ class Trainer:
             
             if param_groups:
                 for pg in param_groups:
-                    pg['lr'] = self.lr0 * pg.pop("lr_scale", 1.0)
-                    
+                    pg['lr'] = self.lr0 * pg.get("lr_scale", 1.0)
+
                 self.optimizer = torch.optim.AdamW(
                     param_groups,
                     weight_decay=optimizer_kwargs.get("weight_decay", 0.01),
@@ -505,10 +505,11 @@ class Trainer:
 
                     # LR warmup per param group (bias gets special warmup LR)
                     for pg in self.optimizer.param_groups:
+                        scale = pg.get('lr_scale', 1.0)
                         if 'bias' in pg.get('name',''):
-                            pg['lr'] = self.warmup_bias_lr + warmup_factor * (self.lr0 - self.warmup_bias_lr)
+                            pg['lr'] = (self.warmup_bias_lr + warmup_factor * (self.lr0 - self.warmup_bias_lr)) * scale
                         else:
-                            pg['lr'] = warmup_factor * self.lr0
+                            pg['lr'] = warmup_factor * self.lr0 * scale
 
                     # Momentum warmup if optimizer supports momentum
                     if 'momentum' in self.optimizer.param_groups[0]:
