@@ -62,33 +62,20 @@ download_and_extract() {
     echo ""
 }
 
-download_and_extract "${IMAGES_URL}" "${DATA_DIR}" "BDD100K Images"
-download_and_extract "${DET_LABELS_URL}" "${DATA_DIR}" "BDD100K Detection Labels"
-download_and_extract "${DRIVABLE_MAPS_URL}" "${DATA_DIR}" "BDD100K Drivable Maps"
+download_and_extract "${IMAGES_URL}" "${DATA_DIR}/100k" "BDD100K Images"
+download_and_extract "${DET_LABELS_URL}" "${DATA_DIR}/bdd100k_labels" "BDD100K Detection Labels"
+download_and_extract "${DRIVABLE_MAPS_URL}" "${DATA_DIR}/drivable_maps" "BDD100K Drivable Maps"
 
-# ---- Step 4: Separate images and detection labels ----
-# Both zips extract into 100k/{train,val}/ mixing *.jpg and *.json
-# Move json files to a separate directory so get_image_ids() doesn't double count
-#
-# Drivable maps extract into labels/{train,val}/ and color_labels/{train,val}/
-#
 # Final structure:
-#   data/100k/{train,val}/             ← images only (*.jpg)
-#   data/bdd100k_labels/{train,val}/   ← det labels only (*.json)
-#   data/labels/{train,val}/           ← drivable masks (*.png)
+#   data/100k/100k/{train,val}/*.jpg                              ← images
+#   data/bdd100k_labels/bdd100k_labels/{train,val}/*.json         ← detection labels
+#   data/drivable_maps/drivable_maps/color_labels/{train,val}/    ← color drivable masks
+#   data/drivable_maps/drivable_maps/labels/{train,val}/          ← drivable masks (grayscale)
 
-echo "[4/7] Separating images and detection labels"
+# ---- Step 4: Verify data directories ----
+echo "[4/6] Verifying extracted data"
 echo "----------------------------------------"
-mkdir -p "${DATA_DIR}/bdd100k_labels/train"
-mkdir -p "${DATA_DIR}/bdd100k_labels/val"
-mv ${DATA_DIR}/100k/train/*.json "${DATA_DIR}/bdd100k_labels/train/" 2>/dev/null && echo "Moved train labels" || echo "No train labels to move"
-mv ${DATA_DIR}/100k/val/*.json "${DATA_DIR}/bdd100k_labels/val/" 2>/dev/null && echo "Moved val labels" || echo "No val labels to move"
-echo ""
-
-# ---- Step 5: Verify data directories ----
-echo "[5/7] Verifying extracted data"
-echo "----------------------------------------"
-for dir in "${DATA_DIR}/100k/train" "${DATA_DIR}/100k/val" "${DATA_DIR}/bdd100k_labels/train" "${DATA_DIR}/bdd100k_labels/val" "${DATA_DIR}/labels/train" "${DATA_DIR}/labels/val"; do
+for dir in "${DATA_DIR}/100k/100k/train" "${DATA_DIR}/100k/100k/val" "${DATA_DIR}/bdd100k_labels/bdd100k_labels/train" "${DATA_DIR}/bdd100k_labels/bdd100k_labels/val" "${DATA_DIR}/drivable_maps/drivable_maps/labels/train" "${DATA_DIR}/drivable_maps/drivable_maps/labels/val"; do
     if [ -d "${dir}" ]; then
         count=$(ls "${dir}" | wc -l)
         echo "OK: ${dir} (${count} files)"
@@ -99,7 +86,7 @@ done
 echo ""
 
 # ---- Step 5: Check Python version and install system deps ----
-echo "[6/7] Checking Python and installing system dependencies"
+echo "[5/6] Checking Python and installing system dependencies"
 echo "----------------------------------------"
 sudo apt update -qq
 
@@ -118,7 +105,7 @@ fi
 echo ""
 
 # ---- Step 6: Install Python packages ----
-echo "[7/7] Installing Python packages"
+echo "[6/6] Installing Python packages"
 echo "----------------------------------------"
 pip install torch==2.6.0+cu118 torchvision==0.21.0+cu118 torchaudio==2.6.0+cu118 \
     --index-url https://download.pytorch.org/whl/cu118
