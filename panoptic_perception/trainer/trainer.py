@@ -483,6 +483,14 @@ class Trainer:
 
             if ((batch_idx + 1) % self.gradient_accumulation_steps == 0) or (batch_idx == self.train_dataloader.__len__() - 1):
 
+                # Clip gradients and check for non-finite norms before optimizer step
+                # NaN/inf gradients from CIoU or other ops can poison all weights via AdamW
+                if self.gradient_clipping:
+                    grad_norm = torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.gradient_clipping)
+                    if not torch.isfinite(grad_norm):
+                        self.optimizer.zero_grad()
+                        continue
+
                 self.optimizer.step()
                 self.optimizer.zero_grad()
                 current_lr = self.optimizer.param_groups[0]['lr']
@@ -581,9 +589,6 @@ class Trainer:
 
         loss.backward()
 
-        if self.gradient_clipping:
-            torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.gradient_clipping)
-            
         return loss, outputs
 
     def _compute_confusion_matrix(self, preds: torch.Tensor, targets: torch.Tensor, num_classes: int) -> torch.Tensor:
