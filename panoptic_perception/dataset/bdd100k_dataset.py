@@ -10,9 +10,12 @@ import albumentations as A
 
 from panoptic_perception.dataset.enums import BDD100KClasses, BDD100KClassesReduced
 from panoptic_perception.dataset.augmentations import (
-    apply_augmentations, copy_paste_instances, mixup_augmentation
+    apply_augmentations, copy_paste_instances, 
+    mixup_augmentation, augment_hsv, flip_horizontal,
+    letterbox_with_masks
 )
 from panoptic_perception.dataset.mosaic_augmentation import mosaic_augmentation
+from enum import Enum
 
 def visualize_batch(images, seg, drivable, targets, save_dir, batch_index=0):
     """
@@ -90,6 +93,12 @@ def visualize_batch(images, seg, drivable, targets, save_dir, batch_index=0):
         cv2.imwrite(f'{save_dir}/sample_batch_drivable_{batch_index}.png', drivable_colored)
     
 
+
+class DatasetMode(Enum):
+    TRAIN = "train"
+    EVAL = "eval"
+    INFER = "infer"
+
 class BDDPreprocessor:
     def __init__(self, preprocess_kwargs:dict):
         self.preprocess_kwargs = preprocess_kwargs
@@ -127,36 +136,28 @@ class BDDPreprocessor:
             # Output size
             "img_size": (self.resized_height, self.resized_width)
         })
+        
+        base_resize_image = [A.LongestMaxSize(max_size=640, interpolation=cv2.INTER_LINEAR), 
+                       A.PadIfNeeded(640, 640, border_mode=cv2.BORDER_CONSTANT)]
+        
+        base_resize_mask = [A.LongestMaxSize(max_size=640, interpolation=cv2.INTER_NEAREST), 
+                       A.PadIfNeeded(640, 640, border_mode=cv2.BORDER_CONSTANT)]        
 
-        # self.transformation = A.Compose(
-        #     [
-        #         A.LongestMaxSize(max_size=max(self.image_resize)),
-        #         A.PadIfNeeded(
-        #             min_height=self.resized_height,
-        #             min_width=self.resized_width,
-        #             border_mode=cv2.BORDER_CONSTANT),
-        #         A.CenterCrop(
-        #             height=self.resized_height,
-        #             width=self.resized_width),
-        #     ],
-        #     bbox_params=A.BboxParams(format='pascal_voc',
-        #                             label_fields=['class_labels'])
-        # )
-
-        self.transformation = A.Compose([
-                    A.LongestMaxSize(max_size=640),
-                    A.PadIfNeeded(640, 640, border_mode=cv2.BORDER_CONSTANT)],
+        self.transformation = A.Compose(
+            base_resize_image,
             bbox_params=A.BboxParams(format="pascal_voc", label_fields=["class_labels"])
             )
 
-        self.image_only_transformation = A.Compose(
-                [A.Resize(height=self.resized_height, width=self.resized_width)]
-            )
+        # self.image_only_transformation = A.Compose(
+        #         [A.Resize(height=self.resized_height, width=self.resized_width)]
+        #     )
+
+        # self.mask_only_transformation = A.Compose(
+        #     [A.Resize(height=self.resized_height, width=self.resized_width, interpolation=cv2.INTER_NEAREST)]
+        # )
         
-        self.mask_only_transformation = A.Compose(
-            [A.Resize(height=self.resized_height, width=self.resized_width, interpolation=cv2.INTER_NEAREST)]
-        )
-        
+        self.image_only_transformation = A.Compose(base_resize_image)        
+        self.mask_only_transformation = A.Compose(base_resize_mask)
 
     def load_detection(self, json_path, filter_by_area=False):
         
@@ -192,13 +193,12 @@ class BDDPreprocessor:
                         class_labels.append(label_id)
 
         return bboxes, class_labels
-        
+                
     def prepare_targets_2d(self, boxes, labels):
         if len(boxes) == 0:
-            return torch.zeros((0, 5), dtype=torch.float32)
+            return np.zeros((0, 5), dtype=np.float32)
 
         targets = []
-
         for bbox, class_id in zip(boxes, labels):
             left, top, right, bottom = bbox
 
@@ -209,125 +209,123 @@ class BDDPreprocessor:
 
             targets.append([class_id, x_center, y_center, width, height])
 
-        return torch.tensor(targets)
+        return np.array(targets, dtype=np.float32)
 
+    def to_pascal_voc(self, labels_xywh, h, w):
+        bboxes, class_labels = [], []
+        for label in labels_xywh:
+            cls, cx, cy, bw, bh = label
+            x1 = (cx - bw/2) * w
+            y1 = (cy - bh/2) * h
+            x2 = (cx + bw/2) * w
+            y2 = (cy + bh/2) * h
+            
+            bboxes.append([x1, y1, x2, y2])
+            class_labels.append(int(cls))
+            
+        return bboxes, class_labels
+
+    def to_normalize_xywh(self, bboxes, labels, h, w):
+        
+        source_labels = []
+        for (x1, y1, x2, y2), cls in zip(bboxes, labels):
+            cx = (x1 + x2)/2/w
+            cy = (y1 + y2)/2/h
+            bw = (x2 - x1)/w
+            bh = (y2 - y1)/h
+            
+            source_labels.append([cls, cx, cy, bw, bh])
+        
+        source_labels = np.array(source_labels) if source_labels else np.zeros((0, 5))
+        return source_labels
+    
     def normalize_tensor(self, tensor:torch.Tensor):
 
         tensor = tensor.float() / 255.0 
         return tensor
+    
+    def mosaic_augmentation(self, images_list, bboxes_list, class_labels_list, segs_list, drivables_list):
+        
+        image, labels_xywh, seg, drivable = mosaic_augmentation(
+            images_list, bboxes_list, class_labels_list, segs_list, drivables_list,
+            output_size=self.image_resize
+        )
 
-    def __call__(self, image_path, seg_path=None, drivable_path=None, det_path=None, augment:bool=False):
+        # Apply remaining augmentations (HSV, flip, etc. but skip letterbox since mosaic outputs correct size)
+        augment_hsv(
+            image, 
+            self.augment_params.get("hsv_h", 0.015),
+            self.augment_params.get("hsv_s", 0.7),
+            self.augment_params.get("hsv_v", 0.4)
+        )
 
-        assert os.path.exists(image_path), f"Image path {image_path} does not exist."
-        image = cv2.imread(image_path)
-        image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
-
-        # Load segmentation mask (original size if augmenting)
-        seg = None
-        if seg_path is not None:
-            if os.path.exists(seg_path):
-                seg = cv2.imread(seg_path, cv2.IMREAD_GRAYSCALE)
-
-        # Load drivable area mask (original size if augmenting)
-        drivable = None
-        if drivable_path is not None:
-            if os.path.exists(drivable_path):
-                drivable = cv2.imread(drivable_path, cv2.IMREAD_GRAYSCALE)
-                #merge alternative to drivable
-                drivable[drivable == 2] = 1
-
-        # Load detection annotations
-        bboxes = []
-        class_labels = []
-        if det_path is not None:
-            assert os.path.exists(det_path), f"Detection path {det_path} does not exist."
-            bboxes, class_labels = self.load_detection(det_path)
-
-        if augment:
-            # -------------------------------------------
-            # Convert pixel xyxy → normalized xywh
-            # -------------------------------------------
-            h0, w0 = image.shape[:2]
-            labels_xywh = []
-            for (x1, y1, x2, y2), cls in zip(bboxes, class_labels):
-                cx = ((x1 + x2) / 2) / w0
-                cy = ((y1 + y2) / 2) / h0
-                bw = (x2 - x1) / w0
-                bh = (y2 - y1) / h0
-                labels_xywh.append([cls, cx, cy, bw, bh])
-            labels_xywh = np.array(labels_xywh) if labels_xywh else np.zeros((0, 5))
-
-            # -------------------------------------------
-            # Apply YOLOP augmentations
-            # (includes: random_perspective, HSV, flip, letterbox)
-            # -------------------------------------------
-            image, seg, drivable, labels_xywh = apply_augmentations(
-                img=image,
-                seg=seg,
-                drivable=drivable,
-                labels=labels_xywh,
-                params=self.augment_params
+        if random.random() < 0.5:
+            image, seg, drivable, labels_xywh = flip_horizontal(
+                image, seg, drivable, labels_xywh
             )
 
-            # -------------------------------------------
-            # Already resized by letterbox, convert to tensor
-            # labels_xywh is already in normalized format
-            # -------------------------------------------
-            targets = torch.tensor(labels_xywh, dtype=torch.float32) if len(labels_xywh) else torch.zeros((0, 5))
+        return image, seg, drivable, labels_xywh
+    
+    def mixup_augmentation(self, img1, bboxes1, class_labels1, seg1, drivable1,
+                           img2, bboxes2, class_labels2, seg2, drivable2):
+        
+        # Transform image 1
+        t1 = self.transformation(
+            image=img1, bboxes=bboxes1, class_labels=class_labels1
+        )        
+        img1, bboxes1, class_labels1 = t1['image'], t1['bboxes'], t1['class_labels']
+        
+        if seg1 is not None:
+            seg1 = self.mask_only_transformation(image=seg1)['image']
+        if drivable1 is not None:
+            drivable1 = self.mask_only_transformation(image=drivable1)['image']
+            
+        # Transform image 2
+        t2 = self.transformation(
+            image=img2, bboxes=bboxes2, class_labels=class_labels2
+        )        
+        img2, bboxes2, class_labels2 = t2['image'], t2['bboxes'], t2['class_labels']
+        
+        if seg2 is not None:
+            seg2 = self.mask_only_transformation(image=seg2)['image']
+        if drivable2 is not None:
+            drivable2 = self.mask_only_transformation(image=drivable2)['image']
+            
+        labels1 = self.prepare_targets_2d(boxes=bboxes1, labels=class_labels1)
+        labels2 = self.prepare_targets_2d(boxes=bboxes2, labels=class_labels2)
+        
+        image, labels_xywh, seg, drivable = mixup_augmentation(
+            img1=img1, img2=img2, seg1=seg1, seg2=seg2,
+            drivable1=drivable1, drivable2=drivable2,
+            labels1=labels1, labels2=labels2, alpha=0.5
+        )
+        
+        return image, labels_xywh, seg, drivable
 
-            # Convert masks to tensors
-            if seg is not None:
-                seg_tensor = torch.from_numpy(seg).long()
-            else:
-                seg_tensor = None
+    def standard_augmentations(self, image, seg, drivable, bboxes, class_labels):
 
-            if drivable is not None:
-                drivable_tensor = torch.from_numpy(drivable).long()
-            else:
-                drivable_tensor = None
+        t = self.transformation(image=image, 
+                            bboxes=bboxes, 
+                            class_labels=class_labels)
 
-            # Convert image to tensor and normalize
-            image_tensor = torch.from_numpy(image).permute(2, 0, 1).float()
-            image_tensor = self.normalize_tensor(image_tensor)
-
-            return image_tensor, seg_tensor, drivable_tensor, targets
-
-        # -------------------------------------------
-        # NO AUGMENTATION: Use albumentations as before
-        # -------------------------------------------
-        if len(bboxes) > 0:
-            transformed_dict = self.transformation(
-                image=image, bboxes=bboxes, class_labels=class_labels
-            )
-            targets = self.prepare_targets_2d(
-                transformed_dict['bboxes'],
-                transformed_dict['class_labels']
-            )
-        else:
-            transformed_dict = self.image_only_transformation(image=image)
-            targets = torch.zeros((0, 5), dtype=torch.float32)
-
-        image = transformed_dict['image']
-
-        # Apply transformation to seg and drivable masks
+        image, bboxes, class_labels = t['image'], t['bboxes'], t['class_labels']
         if seg is not None:
             seg = self.mask_only_transformation(image=seg)['image']
-            seg_tensor = torch.from_numpy(seg).long()
-        else:
-            seg_tensor = None
-
         if drivable is not None:
             drivable = self.mask_only_transformation(image=drivable)['image']
-            drivable_tensor = torch.from_numpy(drivable).long()
-        else:
-            drivable_tensor = None
+        
+        labels_xywh = self.prepare_targets_2d(bboxes, class_labels)
+        
+        image, seg, drivable, labels_xywh = apply_augmentations(
+            img=image,
+            seg=seg,
+            drivable=drivable,
+            labels=labels_xywh,
+            params=self.augment_params
+        )
 
-        # Convert image to tensor and normalize
-        image_tensor = torch.from_numpy(image).permute(2, 0, 1).float()
-        image_tensor = self.normalize_tensor(image_tensor)
-
-        return image_tensor, seg_tensor, drivable_tensor, targets
-    
+        return image, seg, drivable, labels_xywh
+        
     @staticmethod
     def collate_fn(batch:dict):
         
@@ -387,17 +385,16 @@ class BDDPreprocessor:
     
     def prepare_inference(self, image_path=None):
         
-        assert os.path.exists(image_path), f"Image path {image_path} does not exist."
+        assert image_path is not None and os.path.exists(image_path), f"Invalid Image path {image_path}"
         img = cv2.imread(image_path)
         
         orig = img.copy()
         h0, w0 = img.shape[:2]
 
-        # Your letterbox or resizing logic
         transformed = self.image_only_transformation(image=img)
         img = transformed['image']
 
-        img = torch.from_numpy(img).permute(2,0,1).float() / 255.0
+        img = self.normalize_tensor(torch.from_numpy(img).permute(2, 0, 1))
 
         return {
             "image": img.unsqueeze(0),  # add batch dim
@@ -407,7 +404,8 @@ class BDDPreprocessor:
         }
 
 class BDD100KDataset(Dataset):
-    def __init__(self, dataset_kwargs:dict, dataset_type:str='train', perform_augmentation:bool=False):
+    def __init__(self, dataset_kwargs:dict, dataset_type:str='train',
+                perform_augmentation:bool=False, mode:DatasetMode = DatasetMode.TRAIN):
         super(BDD100KDataset, self).__init__()
 
         assert os.path.exists(dataset_kwargs["images_dir"]), f"Images directory {dataset_kwargs['images_dir']} does not exist."
@@ -419,6 +417,7 @@ class BDD100KDataset(Dataset):
 
         self.dataset_type = dataset_type
         self.perform_augmentation = perform_augmentation
+        self.mode = mode
 
         self.preprocessor = BDDPreprocessor(dataset_kwargs.get("preprocessor_kwargs", {}))
         self.image_ids = self.get_image_ids()
@@ -442,12 +441,12 @@ class BDD100KDataset(Dataset):
         image_path = os.path.join(self.images_dir, self.dataset_type, f"{image_id}.jpg")
         seg_path = os.path.join(self.segmentation_annotations_dir, self.dataset_type, f"{image_id}_train_id.png")
         drivable_path = os.path.join(self.drivable_annotations_dir, self.dataset_type, f"{image_id}_drivable_id.png")
-        det_path = os.path.join(self.detection_annotations_dir, self.dataset_type, f"{image_id}.json")
+        
+        assert os.path.exists(image_path), f"Image path {image_path} does not exist."
 
         # Load image
-        image = cv2.imread(image_path)
+        image = cv2.imread(image_path, cv2.COLOR_BGR2RGB)
         image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
-        h0, w0 = image.shape[:2]
 
         # Load masks
         seg = None
@@ -461,121 +460,130 @@ class BDD100KDataset(Dataset):
             drivable[drivable == 2] = 1
 
         # Load detection annotations and convert to normalized xywh
-        labels_xywh = np.zeros((0, 5))
-        if os.path.exists(det_path):
-            bboxes, class_labels = self.preprocessor.load_detection(det_path)
-            if len(bboxes) > 0:
-                labels_list = []
-                for (x1, y1, x2, y2), cls in zip(bboxes, class_labels):
-                    cx = ((x1 + x2) / 2) / w0
-                    cy = ((y1 + y2) / 2) / h0
-                    bw = (x2 - x1) / w0
-                    bh = (y2 - y1) / h0
-                    labels_list.append([cls, cx, cy, bw, bh])
-                labels_xywh = np.array(labels_list)
+        bboxes = []
+        class_labels = []
 
-        return image, labels_xywh, seg, drivable, image_path
+        det_path = os.path.join(self.detection_annotations_dir, self.dataset_type, f"{image_id}.json")
+        if self.mode != DatasetMode.INFER:
+            assert os.path.exists(det_path), f"Detection path {det_path} does not exist."            
+            bboxes, class_labels = self.preprocessor.load_detection(det_path)
+
+        return image, bboxes, class_labels, seg, drivable, image_path
 
     def __getitem__(self, index):
-        image_id = self.image_ids[index]
-        image_path = os.path.join(self.images_dir, self.dataset_type, f"{image_id}.jpg")
+        if self.mode == DatasetMode.INFER:
+            image_id = self.image_ids[index]
+            image_path = os.path.join(self.images_dir, self.dataset_type, f"{image_id}.jpg")
+            return self.preprocessor.prepare_inference(image_path)
+        else:
+            return self.prepare_training_sample(index)
+
+    def prepare_training_sample(self, index):
+        # image_id = self.image_ids[index]
+        # image_path = os.path.join(self.images_dir, self.dataset_type, f"{image_id}.jpg")
 
         # Check for advanced augmentations (mosaic, mixup, copy-paste)
         use_mosaic = self.perform_augmentation and random.random() < self.mosaic_prob
         use_mixup = self.perform_augmentation and random.random() < self.mixup_prob
         use_copy_paste = self.perform_augmentation and random.random() < self.copy_paste_prob
+        image_path = None
 
         if use_mosaic:
             # Mosaic: combine 4 images
             indices = [index] + [random.randint(0, len(self) - 1) for _ in range(3)]
-            images_list, labels_list, segs_list, drivables_list = [], [], [], []
+            images_list, class_labels_list, bboxes_list = [], [], []
+            segs_list, drivables_list = [], []
 
             for idx in indices:
-                img, labels, seg, drivable, _ = self._load_raw(idx)
-                images_list.append(img)
-                labels_list.append(labels)
+                if idx == index:
+                    image, bboxes, class_labels, seg, drivable, image_path = self._load_raw(idx)
+                else:
+                    image, bboxes, class_labels, seg, drivable, _ = self._load_raw(idx)
+                
+                images_list.append(image)
+                class_labels_list.append(class_labels)
+                bboxes_list.append(bboxes)
                 segs_list.append(seg)
                 drivables_list.append(drivable)
 
-            # Apply mosaic
-            image, labels_xywh, seg, drivable = mosaic_augmentation(
-                images_list, labels_list, segs_list, drivables_list,
-                output_size=self.preprocessor.augment_params.get('img_size', (640, 640))
+            image, seg, drivable, labels_xywh = self.preprocessor.mosaic_augmentation(
+                images_list, bboxes_list, class_labels_list, 
+                segs_list, drivables_list
             )
-
-            # Apply remaining augmentations (HSV, flip, etc. but skip letterbox since mosaic outputs correct size)
-            from panoptic_perception.dataset.augmentations import augment_hsv, flip_horizontal
-            augment_hsv(image,
-                       self.preprocessor.augment_params.get("hsv_h", 0.015),
-                       self.preprocessor.augment_params.get("hsv_s", 0.7),
-                       self.preprocessor.augment_params.get("hsv_v", 0.4))
-            if random.random() < 0.5:
-                image, seg, drivable, labels_xywh = flip_horizontal(image, seg, drivable, labels_xywh)
 
         elif use_mixup:
             # MixUp: blend 2 images
-            img1, labels1, seg1, drivable1, _ = self._load_raw(index)
+            image1, bboxes1, class_labels1, seg1, drivable1, image_path = self._load_raw(index)
             idx2 = random.randint(0, len(self) - 1)
-            img2, labels2, seg2, drivable2, _ = self._load_raw(idx2)
-
-            # Resize both to same size first
-            from panoptic_perception.dataset.augmentations import letterbox_with_masks
-            img_size = self.preprocessor.augment_params.get('img_size', (640, 640))
-            img1, seg1, drivable1, labels1 = letterbox_with_masks(img1, seg1, drivable1, labels1, new_shape=img_size)
-            img2, seg2, drivable2, labels2 = letterbox_with_masks(img2, seg2, drivable2, labels2, new_shape=img_size)
+            image2, bboxes2, class_labels2, seg2, drivable2, _ = self._load_raw(idx2)
 
             # Apply mixup
-            image, labels_xywh, seg, drivable = mixup_augmentation(
-                img1, labels1, img2, labels2, seg1, seg2, drivable1, drivable2, alpha=0.5
+            image, labels_xywh, seg, drivable = self.preprocessor.mixup_augmentation(
+                img1=image1,
+                bboxes1=bboxes1,
+                class_labels1=class_labels1,
+                seg1=seg1,
+                drivable1=drivable1,
+                img2=image2,
+                bboxes2=bboxes2,
+                class_labels2=class_labels2,
+                seg2=seg2,
+                drivable2=drivable2
             )
 
         else:
             # Standard augmentation path
-            image, labels_xywh, seg, drivable, _ = self._load_raw(index)
+            image, bboxes, class_labels, seg, drivable, image_path = self._load_raw(index)
 
             if self.perform_augmentation:
                 # Apply copy-paste for long-tail classes before other augmentations
+                #TODO, modify random -> sampling from known images containing long tail classes. 
                 if use_copy_paste:
                     source_idx = random.randint(0, len(self) - 1)
-                    source_img, source_labels, _, _, _ = self._load_raw(source_idx)
-                    # Resize source to match
+                    source_img, source_bboxes, source_class_labels, _, _, _ = self._load_raw(source_idx)
+
                     h, w = image.shape[:2]
-                    source_img = cv2.resize(source_img, (w, h))
+                    if source_img.shape[:2] != image.shape[:2]:                        
+                        source_img = cv2.resize(source_img, (w, h)) # Resize source to match
+
+                    labels_xywh = self.preprocessor.to_normalize_xywh(bboxes, class_labels, h, w)
+                    source_labels = self.preprocessor.to_normalize_xywh(source_bboxes, source_class_labels, h, w)
+
                     image, labels_xywh = copy_paste_instances(
                         image, labels_xywh, source_img, source_labels,
                         target_classes=[1, 3],  # RIDER=1, MOTOR=3
                         max_instances=2
                     )
 
-                # Apply standard YOLOP augmentations
-                from panoptic_perception.dataset.augmentations import apply_augmentations
-                image, seg, drivable, labels_xywh = apply_augmentations(
-                    img=image, seg=seg, drivable=drivable,
-                    labels=labels_xywh, params=self.preprocessor.augment_params
-                )
-            else:
-                # No augmentation - just resize
-                seg_path = os.path.join(self.segmentation_annotations_dir, self.dataset_type, f"{image_id}_train_id.png")
-                drivable_path = os.path.join(self.drivable_annotations_dir, self.dataset_type, f"{image_id}_drivable_id.png")
-                det_path = os.path.join(self.detection_annotations_dir, self.dataset_type, f"{image_id}.json")
+                    bboxes, class_labels = self.preprocessor.to_pascal_voc(
+                        labels_xywh, h, w
+                    )
 
-                image_tensor, seg_tensor, drivable_tensor, targets = self.preprocessor(
-                    image_path=image_path, seg_path=seg_path,
-                    drivable_path=drivable_path, det_path=det_path, augment=False
+                image, seg, drivable, labels_xywh = self.preprocessor.standard_augmentations(
+                    image=image, seg=seg, drivable=drivable,
+                    bboxes=bboxes,
+                    class_labels=class_labels
                 )
-                return {
-                    "image": image_tensor,
-                    "segmentation_mask": seg_tensor,
-                    "drivable_mask": drivable_tensor,
-                    "detection_targets": targets,
-                    "image_path": image_path
-                }
+
+            else:
+                image, bboxes, class_labels, seg, drivable, image_path = self._load_raw(index)
+                t = self.preprocessor.transformation(image=image, 
+                                                    bboxes=bboxes, 
+                                                    class_labels=class_labels)
+
+                image, bboxes, class_labels = t['image'], t['bboxes'], t['class_labels']
+                if seg is not None:
+                    seg = self.preprocessor.mask_only_transformation(image=seg)['image']
+                if drivable is not None:
+                    drivable = self.preprocessor.mask_only_transformation(image=drivable)['image']
+
+                labels_xywh = self.preprocessor.prepare_targets_2d(bboxes, class_labels)
 
         # Convert to tensors
-        targets = torch.tensor(labels_xywh, dtype=torch.float32) if len(labels_xywh) else torch.zeros((0, 5))
+        image_tensor = self.preprocessor.normalize_tensor(torch.from_numpy(image).permute(2, 0, 1))
+        targets = torch.from_numpy(labels_xywh).float()
         seg_tensor = torch.from_numpy(seg).long() if seg is not None else None
-        drivable_tensor = torch.from_numpy(drivable).long() if drivable is not None else None
-        image_tensor = torch.from_numpy(image).permute(2, 0, 1).float() / 255.0
+        drivable_tensor = torch.from_numpy(drivable).long() if drivable is not None else None        
 
         return {
             "image": image_tensor,

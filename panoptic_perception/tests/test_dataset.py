@@ -11,7 +11,7 @@ from torch.utils.data import DataLoader
 
 # Add parent directory to path
 sys.path.insert(0, str(Path(__file__).parent.parent))
-
+import torch
 from dataset.bdd100k_dataset import BDDPreprocessor, BDD100KDataset, visualize_batch
 from dataset.enums import BDD100KClasses
 
@@ -147,7 +147,9 @@ def test_collate_function():
     print(f"  Batch indices: {result['detection_targets'][:, 0].tolist()}")
 
 
-def test_dataset_creation():
+def test_dataset_creation(dataset_type='train', perform_augmentation=False, 
+                        augment_params:dict={},
+                        advanced_aug:dict={}):
     """Test creating BDD100K dataset object."""
     print("\n" + "="*60)
     print("TEST: Dataset Creation")
@@ -155,18 +157,22 @@ def test_dataset_creation():
 
     # Define paths (adjust these to your actual data paths)
     dataset_kwargs = {
-        "images_dir": "panoptic_perception/BDD100k/100k",
+        "images_dir": "panoptic_perception/BDD100k/100k/100k",
         "detection_annotations_dir": "panoptic_perception/BDD100k/bdd100k_labels/100k",
-        "segmentation_annotations_dir": "panoptic_perception/BDD100k/bdd100k_seg_maps/labels",
+        "segmentation_annotations_dir": "",
         "drivable_annotations_dir": "panoptic_perception/BDD100k/bdd100k_drivable_maps/labels",
         "preprocessor_kwargs": {
             "image_resize": (640, 640),
-            "original_image_size": (720, 1280)
+            "original_image_size": (720, 1280),
+            "augment_params":augment_params,
+            "advanced_aug":advanced_aug
         }
-    }        
+    }
 
     try:
-        dataset = BDD100KDataset(dataset_kwargs, dataset_type='train', perform_augmentation=False)
+        dataset = BDD100KDataset(dataset_kwargs, 
+                                dataset_type=dataset_type, 
+                                perform_augmentation=perform_augmentation)
         print(f"✓ Dataset created successfully")
         print(f"  Dataset type: {dataset.dataset_type}")
         print(f"  Dataset length: {len(dataset)}")
@@ -250,7 +256,7 @@ def test_dataloader_creation(dataset=None):
         return None
 
 
-def test_dataloader_iteration(dataloader=None):
+def test_dataloader_iteration(dataloader:torch.utils.data.DataLoader=None):
     """Test iterating through DataLoader."""
     print("\n" + "="*60)
     print("TEST: DataLoader Iteration")
@@ -286,8 +292,9 @@ def test_dataloader_iteration(dataloader=None):
             print(f"  Detection targets shape: {batch['detections'].shape}")
             print(f"  Total objects in batch: {batch['detections'].shape[0]}")
             print(f"  Batch indices: {batch['detections'][:, 0].unique().tolist()}")
-            
-        save_dir = "panoptic_perception/BDD100k/sample_target_visualizations-2"
+
+        dataset_type = dataloader.dataset.dataset_type
+        save_dir = f"panoptic_perception/BDD100k/sample_target_visualizations-2/{dataset_type}"
         for batch_idx in range(batch["images"].shape[0]):
             print(f"  Visualizing: {batch_idx}")
             visualize_batch(batch["images"], batch["segmentation_masks"],
@@ -305,18 +312,49 @@ def run_all_tests():
     print("BDD100K DATASET TESTS")
     print("="*60)
 
-    # Basic tests (always run)
-    # test_bdd_classes()
-    # test_preprocessor()
-    # test_prepare_targets()
-    # test_collate_function()
+    train_augment_params = {
+        "degrees": 10,
+        "translate": 0.1,
+        "scale": 0.25,
+        "shear": 5,
+        "hsv_h": 0.015,
+        "hsv_s": 0.7,
+        "hsv_v": 0.4,
+        "salt_prob": 0.005,
+        "pepper_prob": 0.005,
+        "flip_prob": 0.5,
+        "img_size": [640, 640]
+    }
+
+    train_advanced_aug = {
+        "mosaic_prob": 0.0,
+        "mixup_prob": 0.0,
+        "copy_paste_prob": 0.3
+    }
+    
+    eval_advanced_aug = {
+        "mosaic_prob": 0.0,
+        "mixup_prob": 0.0,
+        "copy_paste_prob": 0.0
+    }    
 
     # Dataset tests (require actual data)
-    dataset = test_dataset_creation()
+    train_dataset = test_dataset_creation(dataset_type="train", perform_augmentation=True,
+                                          augment_params=train_augment_params, 
+                                          advanced_aug=train_advanced_aug)
+    eval_dataset = test_dataset_creation(dataset_type="val", perform_augmentation=False,
+                                        advanced_aug=eval_advanced_aug)
 
-    if dataset is not None:
-        test_dataset_getitem(dataset)
-        dataloader = test_dataloader_creation(dataset)
+    if train_dataset is not None:
+        test_dataset_getitem(train_dataset)
+        dataloader = test_dataloader_creation(train_dataset)
+
+        if dataloader is not None:
+            test_dataloader_iteration(dataloader)
+
+    if eval_dataset is not None:
+        test_dataset_getitem(eval_dataset)
+        dataloader = test_dataloader_creation(eval_dataset)
 
         if dataloader is not None:
             test_dataloader_iteration(dataloader)

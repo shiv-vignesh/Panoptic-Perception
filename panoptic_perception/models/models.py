@@ -137,7 +137,7 @@ class YOLOP(nn.Module):
         # Multi-task loss weights (detection prioritized by default)
         self.loss_weights = loss_weights or {
             "detection": 1.0,
-            "drivable_segmentation": 0.2,
+            "drivable_segmentation": 1.0,
             "lane_segmentation": 0.0
         }
 
@@ -220,8 +220,8 @@ class YOLOP(nn.Module):
                 model_outputs.drivable_segmentation_logits = x                
                 if not self.training:
                     # predictions["drivable_area_seg"] = x
-                    # model_outputs.drivable_segmentation_predictions = torch.softmax(x, dim=1)
-                    model_outputs.drivable_segmentation_predictions = torch.sigmoid(x)
+                    model_outputs.drivable_segmentation_predictions = torch.softmax(x, dim=1)
+                    # model_outputs.drivable_segmentation_predictions = torch.sigmoid(x)
                 # print(f'Layer: {i} - Module Name: {self.module_names[i]} (Drivable Area Seg Head) - output shape: {x.shape}')
 
             elif self.module_names[i] == "LaneSegmentation":

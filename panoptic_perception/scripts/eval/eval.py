@@ -1,6 +1,7 @@
 import os
 from tqdm import tqdm
 from typing import List, Optional
+from collections import defaultdict
 
 import torch
 
@@ -10,6 +11,9 @@ from panoptic_perception.dataset.enums import BDD100KClassesReduced
 from panoptic_perception.models.models import YOLOP, PanopticModelOutputs
 from panoptic_perception.models.utils import WeightsManager
 from panoptic_perception.utils.detection_utils import DetectionHelper
+from panoptic_perception.utils.evaluation_helper import DetectionMetrics
+
+from terminaltables import AsciiTable
 
 # Get class names from enum
 CLASS_NAMES = [cls.name for cls in BDD100KClassesReduced]
@@ -91,7 +95,9 @@ def initialize_eval_pipeline(model_kwargs:dict, dataset_kwargs:dict):
 
 def process_detection_outputs(outputs: PanopticModelOutputs, images: torch.Tensor,
                     target_detections: torch.Tensor, image_paths: List[str],
-                    output_dir: Optional[str] = None, visualize: bool = True):
+                    dets_by_image:defaultdict, gt_by_image:defaultdict,
+                    global_image_idx:int, output_dir: Optional[str] = None,
+                    visualize: bool = True) -> int:
     """
     Process model outputs, convert to proper format, and optionally visualize.
 
@@ -107,10 +113,9 @@ def process_detection_outputs(outputs: PanopticModelOutputs, images: torch.Tenso
     Returns:
         List of tuples (predictions, targets) for each image in batch
     """
-    results = []
 
     if outputs.detection_predictions is None:
-        return results
+        return
 
     detection_preds = outputs.detection_predictions
     batch_size, _, image_h, image_w = images.shape
@@ -137,6 +142,11 @@ def process_detection_outputs(outputs: PanopticModelOutputs, images: torch.Tenso
     for i in range(batch_size):
         # Get predictions for this image (already in xyxy format from NMS)
         img_predictions = nms_results[i]  # Shape: (N, 6) or None
+        
+        if img_predictions is not None:
+            dets_by_image[global_image_idx] = img_predictions
+        else:
+            dets_by_image[global_image_idx] = None
 
         # Process ground truth detections for this image
         img_targets = None
@@ -158,8 +168,14 @@ def process_detection_outputs(outputs: PanopticModelOutputs, images: torch.Tenso
 
                 # Combine: [x1, y1, x2, y2, class_id]
                 img_targets = torch.cat([boxes_xyxy, classes], dim=1)
+                gt_by_image[global_image_idx] = img_targets
+            else:
+                gt_by_image[global_image_idx] = None
+        else:
+            gt_by_image[global_image_idx] = None
 
-        results.append((img_predictions, img_targets))
+        global_image_idx += 1
+        # results.append((img_predictions, img_targets))
 
         # Visualize if requested
         if visualize:
@@ -183,7 +199,7 @@ def process_detection_outputs(outputs: PanopticModelOutputs, images: torch.Tenso
                 save_path=save_path
             )
 
-    return results
+    return global_image_idx
 
 def run_eval_pipeline(model: torch.nn.Module,
                       dataloader: torch.utils.data.DataLoader,
@@ -207,6 +223,9 @@ def run_eval_pipeline(model: torch.nn.Module,
 
     all_results = []
     vis_count = 0
+    dets_by_image = defaultdict(None) #image_id -> (num_dets, 6)
+    gt_by_image = defaultdict(None) #image_id -> (num_gt, 5)    
+    global_image_idx = 0
 
     for batch_idx, data_items in enumerate(val_iter):
         # Move data to device
@@ -229,32 +248,75 @@ def run_eval_pipeline(model: torch.nn.Module,
         should_visualize = visualize and vis_count < max_visualizations
 
         # Process outputs and optionally visualize
-        batch_results = process_detection_outputs(
+        global_image_idx = process_detection_outputs(
             outputs=outputs,
             images=data_items["images"],
             target_detections=data_items.get("detections"),
             image_paths=data_items.get("image_paths", []),
+            dets_by_image=dets_by_image,
+            gt_by_image=gt_by_image,
+            global_image_idx=global_image_idx,
             output_dir=output_dir,
             visualize=should_visualize
         )
 
-        all_results.extend(batch_results)
-
         if should_visualize:
-            vis_count += len(batch_results)
+            vis_count = global_image_idx            
 
-    print(f"\nEvaluation complete. Processed {len(all_results)} images.")
+    print(f"\nEvaluation complete. Processed {global_image_idx} images.")
     if visualize:
         print(f"Saved {min(vis_count, max_visualizations)} visualizations to '{output_dir}/'")
 
-    return all_results
+    # Detection metrics
+    detection_metrics = {}
+    num_classes = len(BDD100KClassesReduced)
+    
+    stats_iou_threshold=0.25
+    ap_results, stats_per_class = DetectionMetrics.compute_stats(
+        dets_by_image,
+        gt_by_image,
+        iou_threshold=stats_iou_threshold,
+        num_classes=num_classes
+    )
+
+    detection_metrics = ap_results
+
+    # Create AP table for logging with class names
+    ap_table_data = [["Class", "AP"]]
+    for cls in range(num_classes):
+        class_name = BDD100KClassesReduced(cls).name
+        ap_value = ap_results.get(f'AP_class_{cls}', 0.0)
+        ap_table_data.append([f"{cls}: {class_name}", f"{ap_value:.4f}"])
+    ap_table_data.append(["mAP@0.5", f"{ap_results['mAP']:.4f}"])
+
+    ap_table_string = AsciiTable(ap_table_data).table
+    print("\nDetection Metrics (AP@0.5):")
+    print(ap_table_string)
+    
+    #Create Stats (TP, FP, FN)
+    stats_table_data = [["Class", "total GT", f"TP", f"FP", f"FN"]]
+    for cls in range(num_classes):
+        class_name = BDD100KClassesReduced(cls).name            
+        class_stats = stats_per_class[cls]        
+
+        total_gt = class_stats.get("total_gt", 0.0)
+        true_positives = class_stats.get("true_positives", 0.0)
+        false_positives = class_stats.get("false_positives", 0.0)
+        false_negatives = class_stats.get("false_negatives", 0.0)
         
+        stats_table_data.append([f'{cls}: {class_name}', total_gt, 
+                                true_positives, false_positives, false_negatives])
+        
+    stats_table_string = AsciiTable(stats_table_data).table
+    print(f"\nDetection Metrics @{stats_iou_threshold}:")
+    print(stats_table_string)
+    
 if __name__ == "__main__":
 
     model_kwargs = {
         "cfg_path": "panoptic_perception/configs/models/yolo-detection.cfg",
         "device": "cuda:0",
-        "model_path": "panoptic_perception/yolop-detection-detection-rectified-2/ckpt_53/ckpt-53.pt"
+        "model_path": "checkpoints/yolop-detection-5060Ti/best_model.pt"
     }
 
     dataset_kwargs = {
@@ -262,7 +324,7 @@ if __name__ == "__main__":
         "detection_annotations_dir": "panoptic_perception/BDD100k/bdd100k_labels/100k",
         "segmentation_annotations_dir": "panoptic_perception/BDD100k/bdd100k_seg_maps/labels",
         "drivable_annotations_dir": "panoptic_perception/BDD100k/bdd100k_drivable_maps/labels",
-        "dataset_type": "val",
+        "dataset_type": "test",
         "batch_size": 1
     }
 
@@ -271,7 +333,7 @@ if __name__ == "__main__":
     )
 
     # Run evaluation with visualization
-    results = run_eval_pipeline(
+    run_eval_pipeline(
         model=model,
         dataloader=dataloader,
         device=device,

@@ -38,20 +38,22 @@ class SegmentationLossCalculator:
         return 1.0 - dice.mean()
         
     @staticmethod
-    def tversky_loss(pred_softmax:torch.Tensor, target_onehot:torch.Tensor, alpha=0.3, beta=0.7, smooth=1.0):
+    def tversky_loss(pred_softmax:torch.Tensor, target_onehot:torch.Tensor, alpha=0.2, beta=0.8, 
+                    smooth=1.0, gamma=0.75):
         dims = (0, 2, 3)                                                                 
         tp = (pred_softmax * target_onehot).sum(dim=dims)                                
         fp = (pred_softmax * (1 - target_onehot)).sum(dim=dims)                          
         fn = ((1 - pred_softmax) * target_onehot).sum(dim=dims)                          
         tversky = (tp + smooth) / (tp + alpha * fp + beta * fn + smooth)                 
-        return 1.0 - tversky.mean()
+
+        return (1.0 - tversky.mean()) ** gamma 
     
     @staticmethod
     def focal_loss():
         pass
 
     @staticmethod
-    def compute_segmentation_loss(predictions, targets, dice_weight=0.0, ce_weight=1.0):                                         
+    def compute_segmentation_loss_2(predictions, targets, dice_weight=0.0, ce_weight=1.0):                                         
         bs, c, h, w = predictions.shape
 
         # Targets are class indices (B, H, W) — convert to one-hot (B, C, H, W)
@@ -69,7 +71,7 @@ class SegmentationLossCalculator:
         return bce_loss
 
     @staticmethod
-    def compute_segmentation_loss_2(predictions, targets, dice_weight=0.7, ce_weight=0.3):
+    def compute_segmentation_loss(predictions, targets, dice_weight=0.7, ce_weight=0.3):
         """
         Compute combined CE + Dice segmentation loss.
 
