@@ -752,8 +752,8 @@ class Trainer:
                         if self.eval_visualize_outputs and (batch_idx + 1) % 100 == 0:
                             if not os.path.exists(f'{self.output_dir}/visualizations/detections'):
                                 os.makedirs(f'{self.output_dir}/visualizations/detections')
-                            
-                            epoch_vis_dir = f'{self.output_dir}/visualizations/detections/{self.cur_epoch}'
+
+                            epoch_vis_dir = f'{self.output_dir}/visualizations/detections/eval_epoch_{self.cur_epoch}'
                             if not os.path.exists(epoch_vis_dir):
                                 os.makedirs(epoch_vis_dir)
 
@@ -789,8 +789,8 @@ class Trainer:
                         if self.eval_visualize_outputs and (batch_idx + 1) % 100 == 0:
                             if not os.path.exists(f'{self.output_dir}/visualizations/drivable_area'):
                                 os.makedirs(f'{self.output_dir}/visualizations/drivable_area')
-                            
-                            epoch_vis_dir = f'{self.output_dir}/visualizations/drivable_area/{self.cur_epoch}'
+
+                            epoch_vis_dir = f'{self.output_dir}/visualizations/drivable_area/eval_epoch_{self.cur_epoch}'
                             if not os.path.exists(epoch_vis_dir):
                                 os.makedirs(epoch_vis_dir)
                                 

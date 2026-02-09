@@ -218,8 +218,8 @@ class DetectionHelper:
         class_names: Optional[List[str]] = None,
         pred_color: tuple = (0, 255, 0),  # Green for predictions
         target_color: tuple = (255, 0, 0),  # Red for targets
-        thickness: int = 2,
-        font_scale: float = 0.5,
+        thickness: int = 1,
+        font_scale: float = 0.2,
         save_path: Optional[str] = None
     ) -> np.ndarray:
         """
