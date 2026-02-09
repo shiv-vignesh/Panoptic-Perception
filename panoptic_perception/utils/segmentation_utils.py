@@ -1,4 +1,32 @@
 import torch
+import numpy as np
+import cv2
+
+from enum import Enum
+from collections import defaultdict
+
+class DriveableAreaColor(Enum):
+    BACKGROUND = (0, (0, 0, 0))
+    DRIVABLE = (1, (0, 255, 0))
+    ALTERNATIVE = (2, (255, 255, 0))
+
+    def __init__(self, class_id:int, color):
+        self.class_id = class_id
+        self.color = color
+
+    @classmethod
+    def from_id(cls, class_id: int):
+        for member in cls:
+            if member.class_id == class_id:
+                return member
+        return None
+
+    @classmethod
+    def from_label(cls, label: str):
+        try:
+            return cls[label.upper()]
+        except KeyError:
+            return None
 
 class SegmentationUtils:
     @staticmethod
@@ -21,6 +49,61 @@ class SegmentationUtils:
 
         return mask
     
+    @staticmethod
+    def transparent_overlay(original_imgs:torch.Tensor, masks:torch.Tensor, alpha:float=0.3):        
+        """
+        Create a transparent overlay of segmentation mask on an image
+            Args:
+            original_img: Input image in RGB format (bs, 3, resize_h, resize_w)
+            mask: binary mask (0 or 1) or discrete class (bs, resize_h, resize_w)
+            alpha: Transparency level (0-1)
+        Returns:         
+            Image with transparent overlay     
+            
+        torch.Size([16, 640, 640]) torch.Size([16, 640, 640]) torch.Size([16, 3, 640, 640])                  
+        """
+        
+        assert len(masks.shape) == 3, f'Expected 3 dimension shape mask, got: {masks.shape}'
+        assert len(original_imgs.shape) == 4, f'Expected 4 dimension shape image, got: {original_imgs.shape}'
+        
+        # Convert to numpy, (bs, H, W, 3)
+        if original_imgs.max() <= 1.0:
+            original_imgs = (original_imgs.permute(0, 2, 3, 1).cpu().numpy() * 255).astype(np.uint8)
+        else:
+            original_imgs = (original_imgs.permute(0, 2, 3, 1).cpu().numpy()).astype(np.uint8)
+        
+        masks = masks.cpu().numpy()        
+        batch_results = []
+        for b in range(original_imgs.shape[0]):
+            original_img = original_imgs[b] # (H, W, 3)
+            mask = masks[b] # (H, W)
+            
+            overlayed_image = original_img.copy()
+
+            for cls in DriveableAreaColor:
+                if cls == DriveableAreaColor.BACKGROUND:
+                    continue
+            
+                class_id = cls.class_id
+                color = cls.color
+                class_mask = (mask == class_id).astype(np.uint8)
+            
+                #convert to binary mask with 3 channels
+                if np.any(class_mask):
+                    class_mask = class_mask * 255
+                    class_mask_rgb = cv2.cvtColor(class_mask, cv2.COLOR_GRAY2RGB)                
+                    colored_mask = cv2.bitwise_and(class_mask_rgb, color)
+                    
+                    overlayed_image = cv2.addWeighted(
+                        overlayed_image, 1 - alpha, colored_mask, alpha, 0
+                    )
+            batch_results.append(overlayed_image)
+
+        return batch_results
+
+    @staticmethod
+    def save_overlay_image(vis_image:np.array, save_path:str):
+        cv2.imwrite(save_path, cv2.cvtColor(vis_image, cv2.COLOR_RGB2BGR))
 
 class SegmentationLossCalculator:
 

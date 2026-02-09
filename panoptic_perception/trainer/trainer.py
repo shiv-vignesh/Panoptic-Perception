@@ -104,9 +104,11 @@ from panoptic_perception.models.utils import PanopticModelOutputs, WeightsManage
 from panoptic_perception.utils.logger import Logger
 from panoptic_perception.utils.wandb_logger import WandBLogger
 from panoptic_perception.utils.detection_utils import DetectionHelper
+from panoptic_perception.utils.segmentation_utils import SegmentationUtils
 from panoptic_perception.utils.evaluation_helper import DetectionMetrics, SegmentationMetrics
 from terminaltables import AsciiTable
 
+CLASS_NAMES = [cls.name for cls in BDD100KClassesReduced]
 
 class Trainer:
     
@@ -121,6 +123,7 @@ class Trainer:
         self.output_dir = trainer_kwargs["output_dir"]
         self.is_training = trainer_kwargs["is_training"]
         self.first_val_epoch = trainer_kwargs["first_val_epoch"]
+        self.eval_visualize_outputs = trainer_kwargs.get("eval_visualize_outputs", False)
 
         self.epochs = trainer_kwargs["epochs"]
         self.monitor_train = trainer_kwargs["monitor_train"]
@@ -435,7 +438,7 @@ class Trainer:
                 self.train_one_epoch()
 
                 if (self.cur_epoch + 1) % self.checkpoint_idx == 0:
-                    ckpt_dir = f'{self.output_dir}/ckpt_{self.cur_epoch}'
+                    ckpt_dir = f'{self.output_dir}/checkpoints/ckpt_{self.cur_epoch}'
                     if not os.path.exists(ckpt_dir):
                         os.makedirs(ckpt_dir)
 
@@ -720,6 +723,8 @@ class Trainer:
                         iou_threshold=0.45,
                         max_detections=500
                     )
+                    
+                    image_paths = data_items.get("image_paths", [])
 
                     for image_idx, dets in enumerate(nms_results):
                         if dets is not None:
@@ -729,6 +734,7 @@ class Trainer:
                         
                         mask = data_items["detections"][:, 0] == image_idx
                         img_targets = data_items["detections"][mask]
+                        gts = None
                         
                         if img_targets.shape[0] > 0:
                             boxes_xywh = img_targets[:, 2:6]
@@ -742,6 +748,28 @@ class Trainer:
                             gt_by_image[global_image_idx] = None
 
                         global_image_idx += 1
+                        
+                        if self.eval_visualize_outputs and (batch_idx + 1) % 100 == 0:
+                            if not os.path.exists(f'{self.output_dir}/visualizations/detections'):
+                                os.makedirs(f'{self.output_dir}/visualizations/detections')
+                            
+                            epoch_vis_dir = f'{self.output_dir}/visualizations/detections/{self.cur_epoch}'
+                            if not os.path.exists(epoch_vis_dir):
+                                os.makedirs(epoch_vis_dir)
+
+                            if image_paths and image_idx < len(image_paths):
+                                img_name = os.path.basename(image_paths[image_idx])
+                                save_path = os.path.join(epoch_vis_dir, f'vis_{img_name}.png')
+                            else:
+                                save_path = os.path.join(epoch_vis_dir, f'vis_{image_idx}.png')
+                                
+                            DetectionHelper.visualize_detections(
+                                image=data_items["images"][image_idx],
+                                predictions=dets,
+                                targets=gts,
+                                class_names=CLASS_NAMES,
+                                save_path=save_path
+                            )
 
                 # Process segmentation with running confusion matrix (memory efficient)
                 if outputs.drivable_segmentation_predictions is not None:
@@ -757,6 +785,44 @@ class Trainer:
                         drivable_confusion_matrix += self._compute_confusion_matrix(
                             drivable_preds.cpu(), drivable_targets.cpu(), num_drivable_classes
                         )
+
+                        if self.eval_visualize_outputs and (batch_idx + 1) % 100 == 0:
+                            if not os.path.exists(f'{self.output_dir}/visualizations/drivable_area'):
+                                os.makedirs(f'{self.output_dir}/visualizations/drivable_area')
+                            
+                            epoch_vis_dir = f'{self.output_dir}/visualizations/drivable_area/{self.cur_epoch}'
+                            if not os.path.exists(epoch_vis_dir):
+                                os.makedirs(epoch_vis_dir)
+                                
+                            batch_drivable_preds = SegmentationUtils.transparent_overlay(
+                                original_imgs=data_items["images"],
+                                masks=drivable_preds
+                            )
+                            
+                            batch_drivable_gts = SegmentationUtils.transparent_overlay(
+                                original_imgs=data_items["images"],
+                                masks=drivable_targets
+                            )
+                            
+                            image_paths = data_items.get("image_paths", [])
+                            for image_idx, (pred_overlay, gt_overlay) in enumerate(zip(batch_drivable_preds, batch_drivable_gts)):
+                                if image_paths and image_idx < len(image_paths):
+                                    img_name = os.path.basename(image_paths[image_idx])
+                                    pred_save_path = os.path.join(epoch_vis_dir, f'vis_{img_name}_pred.png')
+                                    gt_save_path = os.path.join(epoch_vis_dir, f'vis_{img_name}_gt.png')
+                                else:
+                                    pred_save_path = os.path.join(epoch_vis_dir, f'vis_{image_idx}_pred.png')
+                                    gt_save_path = os.path.join(epoch_vis_dir, f'vis_{image_idx}_gt.png')
+                                    
+                                SegmentationUtils.save_overlay_image(
+                                    vis_image=pred_overlay,
+                                    save_path=pred_save_path
+                                )
+                                
+                                SegmentationUtils.save_overlay_image(
+                                    vis_image=gt_overlay,
+                                    save_path=gt_save_path
+                                )
 
                 if outputs.lane_segmentation_predictions is not None:
                     lane_preds = torch.argmax(outputs.lane_segmentation_predictions, dim=1)
