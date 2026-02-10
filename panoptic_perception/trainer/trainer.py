@@ -264,6 +264,7 @@ class Trainer:
         self.main_momentum = optimizer_kwargs.get("momentum", 0.937)
         
         self.groups = optimizer_kwargs.get("groups", {})
+        self.dcn_lr_mult = optimizer_kwargs.get("dcn_lr_mult", 0.1)  # DCN offset LR = base_lr * 0.1
 
         if not self.groups:
             # No custom groups: train full model
@@ -271,8 +272,8 @@ class Trainer:
             self.logger.log_message('Full model training (all layers trainable)')
             self.logger.log_new_line()
         else:
-            # Custom groups: get param groups
-            param_groups = get_model_param_groups(self.model, self.groups)
+            # Custom groups: get param groups with DCN-aware differential LR
+            param_groups = get_model_param_groups(self.model, self.groups, self.dcn_lr_mult)
             self.logger.log_message('Training with specified groups:')
             for group_name in self.groups:
                 group_info = self.groups[group_name]
@@ -281,6 +282,14 @@ class Trainer:
                     f'trainable: {group_info["trainable"]} - '
                     f'layer start/end: {group_info["group"]}'
                 )
+            # Log DCN-specific param groups
+            for pg in param_groups:
+                if pg.get("name", "").startswith("dcn"):
+                    self.logger.log_message(
+                        f'  DCN Group: {pg["name"]} - '
+                        f'params: {len(pg["params"])} - '
+                        f'lr_scale: {pg["lr_scale"]}'
+                    )
             self.logger.log_new_line()
 
         if optimizer_kwargs["_type"] == "SGD":

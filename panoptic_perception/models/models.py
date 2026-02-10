@@ -286,9 +286,14 @@ class YOLOP(nn.Module):
 
         return model_outputs
 
-def get_model_param_groups(model:YOLOP, groups:dict):
+def get_model_param_groups(model:YOLOP, groups:dict, dcn_lr_mult:float=0.1):
     """
     Configure parameter groups for training with selective freezing.
+
+    Supports differential learning rates for DCN layers:
+    - offset_conv parameters: base_lr * dcn_lr_mult (slowest, for stability)
+    - deform_conv parameters: base_lr * dcn_lr_mult * 5 (slower than normal)
+    - other parameters: base_lr (normal)
 
     For frozen layers:
     - Sets requires_grad = False for all parameters
@@ -302,6 +307,10 @@ def get_model_param_groups(model:YOLOP, groups:dict):
 
     param_groups = []
     frozen_layers = []
+
+    # Collect DCN parameters separately
+    dcn_offset_params = []
+    dcn_conv_params = []
 
     for group_name in groups:
         group = groups[group_name]["group"]
@@ -339,11 +348,33 @@ def get_model_param_groups(model:YOLOP, groups:dict):
                 frozen_layers.append(idx)
 
         if trainable:
-            params = []
+            regular_params = []
             for idx in layer_indices:
-                params.extend(list(model.module_list[idx].parameters()))
-            if params:
-                param_groups.append({"params": params, "name": group_name, "lr_scale":lr_scale})
+                for name, param in model.module_list[idx].named_parameters():
+                    if 'offset_conv' in name:
+                        dcn_offset_params.append(param)
+                    elif 'deform_conv' in name:
+                        dcn_conv_params.append(param)
+                    else:
+                        regular_params.append(param)
+
+            if regular_params:
+                param_groups.append({"params": regular_params, "name": group_name, "lr_scale": lr_scale})
+
+    # Add DCN parameter groups with lower learning rates
+    if dcn_offset_params:
+        param_groups.append({
+            "params": dcn_offset_params,
+            "name": "dcn_offset",
+            "lr_scale": dcn_lr_mult  # e.g., 0.1 = 10x lower LR
+        })
+
+    if dcn_conv_params:
+        param_groups.append({
+            "params": dcn_conv_params,
+            "name": "dcn_conv",
+            "lr_scale": dcn_lr_mult * 5  # e.g., 0.5 = 2x lower LR
+        })
 
     # Freeze BatchNorm layers in frozen modules by setting them to eval mode
     # This prevents running_mean and running_var from updating
