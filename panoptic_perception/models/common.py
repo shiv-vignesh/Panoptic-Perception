@@ -1,5 +1,6 @@
 import torch
 import torch.nn as nn
+import torchvision.ops as ops
 
 from typing import List, Tuple
 
@@ -25,6 +26,52 @@ class ConvBlock(nn.Module):
         x = self.norm(x)
         return self.act(x)
 
+class DeformableConv2d(nn.Module):
+    def __init__(self, in_channels:int, out_channels:int, 
+                kernel_size:int=3, stride:int=1, padding:int=1, 
+                dilation:int=1, groups:int=1,
+                activation:bool=True, batch_norm:bool=True):
+        super(DeformableConv2d, self).__init__()
+        self.kernel_size = kernel_size if isinstance(kernel_size, tuple) else (kernel_size, kernel_size)        
+
+        # offset predictions (2 values per kernel position: dx, dy)
+        # offsets need bias for learning
+        self.offset_conv = nn.Conv2d(in_channels, 
+                                    2 * self.kernel_size[0] * self.kernel_size[1], 
+                                    kernel_size=self.kernel_size, 
+                                    stride=stride,
+                                    padding=padding,
+                                    dilation=dilation,
+                                    bias=True)
+
+        self.deform_conv = ops.DeformConv2d(
+            in_channels,
+            out_channels,
+            kernel_size=self.kernel_size,
+            stride=stride,
+            padding=padding,
+            dilation=dilation,
+            groups=groups,
+            bias=False
+        )
+
+        self.bn = nn.BatchNorm2d(out_channels) if batch_norm else nn.Identity()
+        self.act = nn.SiLU() if activation else (activation if isinstance(activation, nn.Module) else nn.Identity())
+
+    def _init_weights(self):
+
+        # Zero-init offsets for stable training (acts like standard conv initially)
+        nn.init.constant_(self.offset_conv.weight, 0.0)
+        nn.init.constant_(self.offset_conv.bias, 0.0)
+        nn.init.kaiming_normal_(self.deform_conv.weight, mode="fan_out", nonlinearity="relu")
+
+    def forward(self, x):
+        offset = self.offset_conv(x)
+        x = self.deform_conv(x, offset)
+        x = self.bn(x)
+        x = self.act(x)
+        return x
+
 class Focus(nn.Module):
     def __init__(self, in_channels:int, out_channels:int, kernel_size:int=1, stride:int=1, padding:int=None):
         super(Focus, self).__init__()
@@ -46,20 +93,24 @@ class Focus(nn.Module):
         return x 
 
 class Bottleneck(nn.Module):
-    def __init__(self, in_channels:int, out_channels:int, residual:bool=True):
+    def __init__(self, in_channels:int, out_channels:int, residual:bool=True, use_deform:bool=False):
         super(Bottleneck, self).__init__()
-        
+
         c_ = in_channels // 2
-        
+
         self.conv1 = ConvBlock(in_channels, c_, kernel_size=1, stride=1)
-        self.conv2 = ConvBlock(c_, out_channels, kernel_size=3, stride=1)
+        if use_deform:
+            self.conv2 = DeformableConv2d(c_, out_channels, kernel_size=3, stride=1)
+        else:
+            self.conv2 = ConvBlock(c_, out_channels, kernel_size=3, stride=1)
+
         self.add = (in_channels == out_channels) and residual
-        
+
     def forward(self, x):
         return x + self.conv2(self.conv1(x)) if self.add else self.conv2(self.conv1(x))
 
 class BottleneckCSP(nn.Module):
-    def __init__(self, in_channels:int, out_channels:int, n:int, residual:bool=True):
+    def __init__(self, in_channels:int, out_channels:int, n:int, residual:bool=True, use_deform:bool=False):
         super(BottleneckCSP, self).__init__()
         
         c_ = in_channels // 2
@@ -70,7 +121,7 @@ class BottleneckCSP(nn.Module):
         self.conv4 = ConvBlock(2 * c_, out_channels, kernel_size=1, stride=1)
         self.bn = nn.BatchNorm2d(2 * c_)
         self.act = nn.LeakyReLU(0.1)
-        self.bottlenecks = nn.Sequential(*[Bottleneck(c_, c_, residual) for _ in range(n)])
+        self.bottlenecks = nn.Sequential(*[Bottleneck(c_, c_, residual, use_deform) for _ in range(n)])
 
     def forward(self, x):
         y1 = self.conv3(self.bottlenecks(self.conv1(x)))

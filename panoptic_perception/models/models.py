@@ -71,7 +71,9 @@ def create_modules(module_defs: list, num_classes: int = 80,
             out_ch = int(module_def["out_channels"])
             n = int(module_def["num_bottlenecks"])
             residual = str(module_def.get("residual", "True")) == "True"
-            module = BottleneckCSP(in_ch, out_ch, n, residual)
+            use_deform = str(module_def.get("use_deform", "False")) == "True"
+            
+            module = BottleneckCSP(in_ch, out_ch, n, residual, use_deform)
             output_channels.append(out_ch)
 
         # -- SPP ---------------------------------------------------------------

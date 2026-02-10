@@ -114,7 +114,7 @@ def test_parse_basic_structure():
     return model
 
 def parse_cfg_file():
-    cfg_path = 'panoptic_perception/configs/models/yolop.cfg'
+    cfg_path = 'panoptic_perception/configs/models/yolo-detection-deform.cfg'
     model = YOLOP(cfg_path)
     module_defs = model.module_defs
 
