@@ -482,10 +482,13 @@ class Trainer:
 
         total_loss = 0.0
         ten_percent_batch_total_loss = 0
-        
+
         epoch_training_time = 0.0
         ten_percent_training_time = 0.0
-        
+
+        # Initialize current_lr from optimizer (avoid UnboundLocalError if logging before first grad step)
+        current_lr = self.optimizer.param_groups[0]['lr']
+
         train_iter = tqdm(self.train_dataloader, desc=f'Training Epoch: {self.cur_epoch}')
         for batch_idx, data_items in enumerate(train_iter):
             
