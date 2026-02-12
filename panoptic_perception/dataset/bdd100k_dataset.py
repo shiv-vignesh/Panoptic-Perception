@@ -10,7 +10,7 @@ import albumentations as A
 
 from panoptic_perception.dataset.enums import BDD100KClasses, BDD100KClassesReduced
 from panoptic_perception.dataset.augmentations import (
-    apply_augmentations, copy_paste_instances, 
+    apply_augmentations, copy_paste_instances, random_perspective,
     mixup_augmentation, augment_hsv, flip_horizontal,
     letterbox_with_masks
 )
@@ -65,7 +65,7 @@ def visualize_batch(images, seg, drivable, targets, save_dir, batch_index=0):
     if not os.path.exists(save_dir):
         os.makedirs(save_dir)
     
-    cv2.imwrite(f'{save_dir}/sample_batch_{batch_index}.png', img_draw)
+    cv2.imwrite(f'{save_dir}/sample_batch_{batch_index}.png', cv2.cvtColor(img_draw, cv2.COLOR_RGB2BGR))
     
     if seg is not None:
         if seg[batch_index].ndim == 3:
@@ -76,7 +76,7 @@ def visualize_batch(images, seg, drivable, targets, save_dir, batch_index=0):
         # Scale segmentation class IDs for visibility (multiply by factor)
         # BDD100K has ~19 semantic classes, scale to spread across 0-255
         seg_scaled = (seg_vis * 12).clip(0, 255).astype(np.uint8)
-        cv2.imwrite(f'{save_dir}/sample_batch_seg_{batch_index}.png', seg_scaled)
+        cv2.imwrite(f'{save_dir}/sample_batch_seg_{batch_index}.png', cv2.cvtColor(seg_scaled, cv2.COLOR_RGB2BGR))
 
     if drivable is not None:
         if drivable[batch_index].ndim == 3:
@@ -137,11 +137,15 @@ class BDDPreprocessor:
             "img_size": (self.resized_height, self.resized_width)
         })
         
-        base_resize_image = [A.LongestMaxSize(max_size=640, interpolation=cv2.INTER_LINEAR), 
-                       A.PadIfNeeded(640, 640, border_mode=cv2.BORDER_CONSTANT)]
-        
-        base_resize_mask = [A.LongestMaxSize(max_size=640, interpolation=cv2.INTER_NEAREST), 
-                       A.PadIfNeeded(640, 640, border_mode=cv2.BORDER_CONSTANT)]        
+        max_size = max(self.resized_height, self.resized_width)
+
+        base_resize_image = [A.LongestMaxSize(max_size=max_size, interpolation=cv2.INTER_LINEAR), 
+                       A.PadIfNeeded(self.resized_height, self.resized_width, 
+                                    border_mode=cv2.BORDER_CONSTANT, fill=(114, 114, 114))]
+
+        base_resize_mask = [A.LongestMaxSize(max_size=max_size, interpolation=cv2.INTER_NEAREST), 
+                       A.PadIfNeeded(self.resized_height, self.resized_width, 
+                                    border_mode=cv2.BORDER_CONSTANT, fill_mask=0)]
 
         self.transformation = A.Compose(
             base_resize_image,
@@ -249,6 +253,14 @@ class BDDPreprocessor:
         image, labels_xywh, seg, drivable = mosaic_augmentation(
             images_list, bboxes_list, class_labels_list, segs_list, drivables_list,
             output_size=self.image_resize
+        )
+        
+        image, seg, drivable, labels_xywh = random_perspective(
+            image, seg, drivable, labels_xywh,
+            degrees=self.augment_params["degrees"],
+            translate=self.augment_params["translate"],
+            scale=self.augment_params["scale"],
+            shear=self.augment_params["shear"],            
         )
 
         # Apply remaining augmentations (HSV, flip, etc. but skip letterbox since mosaic outputs correct size)

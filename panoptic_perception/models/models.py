@@ -243,8 +243,8 @@ class YOLOP(nn.Module):
 
         
         if targets is not None:
-            
-            if model_outputs.detection_logits is not None:
+
+            if model_outputs.detection_logits is not None and targets["detections"] is not None:
                 output_name = "detections"
                 assert output_name in targets, f"Target for {output_name} not provided."
 
@@ -261,7 +261,7 @@ class YOLOP(nn.Module):
                 model_outputs.detection_loss = det_loss * self.loss_weights.get("detection", 1.0)
                 # print(f'Detection Loss: {det_loss}')
 
-            if model_outputs.drivable_segmentation_logits is not None:
+            if model_outputs.drivable_segmentation_logits is not None and targets["drivable_area_seg"] is not None:
                 output_name = "drivable_area_seg"
                 assert output_name in targets, f"Target for {output_name} not provided."
                 drivable_seg_loss = SegmentationLossCalculator.compute_segmentation_loss(

@@ -133,10 +133,14 @@ def test_forward_pass():
 
     model.eval()
 
-    x = torch.randn(2, model.in_channels, 640, 640)
+    x = torch.randn(2, model.in_channels, 768, 768)
 
     predictions = model(x)
     print(f"\nEvaluation mode outputs: {predictions.keys()}")
+    
+    if predictions.detection_predictions is not None:
+        for detection in predictions.detection_predictions:
+            print(detection.shape)
 
     return predictions
 
@@ -191,7 +195,7 @@ def test_forward_pass_with_targets():
 
 if __name__ == "__main__":
     # Test evaluation mode
-    # test_forward_pass()
+    test_forward_pass()
 
     # Test training mode with targets
-    test_forward_pass_with_targets()
+    # test_forward_pass_with_targets()

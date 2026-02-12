@@ -305,6 +305,80 @@ def test_dataloader_iteration(dataloader:torch.utils.data.DataLoader=None):
         print(f"✗ Failed to iterate DataLoader")
         print(f"  Error: {e}")
 
+def test_augmentation_effect(aug_dataloader:torch.utils.data.DataLoader,
+                            no_aug_dataloader:torch.utils.data.DataLoader,
+                            root_save_path:str):
+    
+    try:
+        aug_batch = next(iter(aug_dataloader))
+        no_aug_batch = next(iter(no_aug_dataloader))
+        
+        import os
+
+        if not os.path.exists(root_save_path):
+            os.makedirs(root_save_path)
+
+        aug_samples_dir = f'{root_save_path}/aug_samples'
+        no_aug_samples_dir = f'{root_save_path}/no_aug_samples'
+
+        os.makedirs(aug_samples_dir, exist_ok=True)
+        os.makedirs(no_aug_samples_dir, exist_ok=True)
+
+        def save_samples(batch, save_dir:str):
+            for batch_idx in range(batch["images"].shape[0]):
+                print(f"  Visualizing: {batch_idx}")
+                visualize_batch(batch["images"], batch["segmentation_masks"],
+                                batch["drivable_area_seg"], batch["detections"], 
+                                save_dir=save_dir, batch_index=batch_idx)
+                
+        save_samples(aug_batch, aug_samples_dir)
+        save_samples(no_aug_batch, no_aug_samples_dir)
+        
+    except Exception as e:
+        print(f"✗ Failed to iterate DataLoader")
+        print(f"  Error: {e}")
+        
+def run_augmentation_test():
+
+    train_augment_params = {
+        "degrees": 10,
+        "translate": 0.1,
+        "scale": 0.25,
+        "shear": 5,
+        "hsv_h": 0.015,
+        "hsv_s": 0.7,
+        "hsv_v": 0.4,
+        "salt_prob": 0.005,
+        "pepper_prob": 0.005,
+        "flip_prob": 0.5,
+        "img_size": [640, 640]
+    }
+
+    train_advanced_aug = {
+        "mosaic_prob": 0.0,
+        "mixup_prob": 1.0,
+        "copy_paste_prob": 0.0
+    }
+    
+    aug_dataset = test_dataset_creation(
+        dataset_type="train", perform_augmentation=True,
+        augment_params=train_augment_params,
+        advanced_aug=train_advanced_aug
+    )
+    
+    no_aug_dataset = test_dataset_creation(
+        dataset_type="train", perform_augmentation=False,
+        augment_params=train_augment_params,
+        advanced_aug=train_advanced_aug
+    )    
+    
+    aug_dataloader = test_dataloader_creation(aug_dataset)
+    no_aug_dataloader = test_dataloader_creation(no_aug_dataset)
+    
+    test_augmentation_effect(
+        aug_dataloader, no_aug_dataloader,
+        root_save_path = f"panoptic_perception/BDD100k/samples-augmentation-effect"
+    )
 
 def run_all_tests():
     """Run all tests."""
@@ -365,4 +439,5 @@ def run_all_tests():
 
 
 if __name__ == "__main__":
-    run_all_tests()
+    # run_all_tests()
+    run_augmentation_test()

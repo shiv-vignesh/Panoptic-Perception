@@ -133,7 +133,10 @@ class DetectionHelper:
                 keep_boxes.append(cls_detections[keep_idx])
 
             if keep_boxes:
-                output[img_idx] = torch.cat(keep_boxes, 0)[:max_detections]
+                all_dets = torch.cat(keep_boxes, 0)
+                if max_detections > 0:
+                    all_dets = all_dets[all_dets[:, 4].argsort(descending=True)][:max_detections]
+                output[img_idx] = all_dets
 
         return output
 

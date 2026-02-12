@@ -143,7 +143,7 @@ class DetectionMetrics:
             recall = tp_cumsum / (total_gt + 1e-5)
             precision = tp_cumsum / (tp_cumsum + fp_cumsum + 1e-5)
             
-            ap_per_class[f"AP_class_{cls}"] = DetectionMetrics.compute_ap_11point(
+            ap_per_class[f"AP_class_{cls}"] = DetectionMetrics.compute_ap(
                 recall, precision
             )
 
@@ -174,7 +174,7 @@ class DetectionMetrics:
         num_classes: int = 10
     ) -> Dict[str, float]:
         """
-        Calculate Average Precision (AP) for each class and mean AP (mAP).
+        [Deprecated] Calculate Average Precision (AP) for each class and mean AP (mAP).
 
         Args:
             detections: List of detection tensors per image
@@ -288,6 +288,19 @@ class DetectionMetrics:
                 p = np.max(precision[recall >= t])
             ap += p / 11
 
+        return ap
+
+    @staticmethod
+    def compute_ap(recall: np.ndarray, precision: np.ndarray):
+        mrec = np.concatenate(([0.0], recall, [1.0]))
+        mpre = np.concatenate(([1.0], precision, [0.0]))
+
+        #precision monotonically decreasing left to right
+        for i in range(len(mpre) - 1, 0, -1):
+            mpre[i - 1] = max(mpre[i - 1], mpre[i])
+
+        idx = np.where(mrec[1:] != mrec[:-1])[0] # Find indices where recall changes
+        ap = np.sum((mrec[idx + 1] - mrec[idx]) * mpre[idx + 1]) #rectangular areas: width * height
         return ap
 
     @staticmethod

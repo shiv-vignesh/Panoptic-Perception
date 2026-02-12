@@ -11,6 +11,7 @@ from panoptic_perception.dataset.enums import BDD100KClassesReduced
 from panoptic_perception.models.models import YOLOP, PanopticModelOutputs
 from panoptic_perception.models.utils import WeightsManager
 from panoptic_perception.utils.detection_utils import DetectionHelper
+from panoptic_perception.utils.segmentation_utils import SegmentationUtils
 from panoptic_perception.utils.evaluation_helper import DetectionMetrics
 
 from terminaltables import AsciiTable
@@ -133,9 +134,9 @@ def process_detection_outputs(outputs: PanopticModelOutputs, images: torch.Tenso
     # Each tensor has shape (num_detections, 6) [x1, y1, x2, y2, confidence, class_id]
     nms_results = DetectionHelper.non_max_suppression(
         concatenated_preds,
-        conf_threshold=0.25,
+        conf_threshold=0.001,
         iou_threshold=0.45,
-        max_detections=500
+        max_detections=300
     )
 
     # Process each image in the batch
@@ -201,6 +202,66 @@ def process_detection_outputs(outputs: PanopticModelOutputs, images: torch.Tenso
 
     return global_image_idx
 
+def process_drivable_area_outputs(outputs:PanopticModelOutputs, images: torch.Tensor,
+                                drivable_area_targets:torch.Tensor, image_paths: List[str],
+                                drivable_confusion_matrix:torch.Tensor, num_drivable_classes,
+                                output_dir: Optional[str] = None,
+                                visualize: bool = True):
+    
+    """
+        images - (bs, 3, h, w)
+        drivable_area_targets - (bs, h, w)
+    """
+
+    batch_drivable_gts = None
+    batch_drivable_preds = None
+    
+    drivable_preds = torch.argmax(outputs.drivable_segmentation_predictions, dim=1)
+    if drivable_area_targets is not None:
+        drivable_confusion_matrix += SegmentationUtils._compute_confusion_matrix(
+            drivable_preds.cpu(), drivable_area_targets.cpu(), num_drivable_classes
+        )
+
+    if not visualize:
+        return
+
+    if not os.path.exists(output_dir):
+        os.makedirs(output_dir)
+    
+    if drivable_area_targets is not None:
+        batch_drivable_gts = SegmentationUtils.transparent_overlay(
+            original_imgs=images,
+            masks=drivable_area_targets
+        )
+        
+    batch_drivable_preds = SegmentationUtils.transparent_overlay(
+        original_imgs=images,
+        masks=drivable_preds
+    )    
+    
+    for image_idx in range(len(batch_drivable_preds)):        
+        if image_paths and image_idx < len(image_paths):
+            img_name = os.path.basename(image_paths[image_idx])
+        else:
+            img_name = f'vis_{image_idx}'
+        
+        if batch_drivable_gts is not None and batch_drivable_gts:
+            gt_save_path = os.path.join(output_dir, f'{img_name}_gt.png')
+            gt_overlay = batch_drivable_gts[image_idx]
+            
+            SegmentationUtils.save_overlay_image(
+                vis_image=gt_overlay,
+                save_path=gt_save_path
+            )
+            
+        pred_save_path = os.path.join(output_dir, f'{img_name}_pred.png')
+        pred_overlay = batch_drivable_preds[image_idx]
+        
+        SegmentationUtils.save_overlay_image(
+            vis_image=pred_overlay,
+            save_path=pred_save_path
+        )
+
 def run_eval_pipeline(model: torch.nn.Module,
                       dataloader: torch.utils.data.DataLoader,
                       device: torch.device,
@@ -226,6 +287,8 @@ def run_eval_pipeline(model: torch.nn.Module,
     dets_by_image = defaultdict(None) #image_id -> (num_dets, 6)
     gt_by_image = defaultdict(None) #image_id -> (num_gt, 5)    
     global_image_idx = 0
+    drivable_confusion_matrix = None
+    num_drivable_classes = 2
 
     for batch_idx, data_items in enumerate(val_iter):
         # Move data to device
@@ -256,12 +319,29 @@ def run_eval_pipeline(model: torch.nn.Module,
             dets_by_image=dets_by_image,
             gt_by_image=gt_by_image,
             global_image_idx=global_image_idx,
-            output_dir=output_dir,
+            output_dir=f"{output_dir}/detections",
             visualize=should_visualize
         )
 
+        if outputs.drivable_segmentation_predictions is not None:
+            if drivable_confusion_matrix is None:
+                drivable_confusion_matrix = torch.zeros(
+                    num_drivable_classes, num_drivable_classes, dtype=torch.int64
+                )
+            
+            process_drivable_area_outputs(
+                outputs=outputs,
+                images=data_items["images"],
+                drivable_area_targets=data_items.get("drivable_area_seg"),
+                image_paths=data_items.get("image_paths", []),
+                drivable_confusion_matrix=drivable_confusion_matrix,
+                num_drivable_classes=num_drivable_classes,
+                output_dir=f"{output_dir}/drivable_area",
+                visualize=should_visualize
+            )
+
         if should_visualize:
-            vis_count = global_image_idx            
+            vis_count = global_image_idx
 
     print(f"\nEvaluation complete. Processed {global_image_idx} images.")
     if visualize:
@@ -311,6 +391,25 @@ def run_eval_pipeline(model: torch.nn.Module,
     print(f"\nDetection Metrics @{stats_iou_threshold}:")
     print(stats_table_string)
     
+    if drivable_confusion_matrix is not None:
+        drivable_iou, drivable_dice = SegmentationUtils._compute_metrics_from_confusion_matrix(
+            drivable_confusion_matrix, num_drivable_classes
+        )
+    
+        drivable_metrics = {**drivable_iou, **drivable_dice}
+
+        # Create drivable metrics table
+        drivable_table_data = [["Metric", "Value"]]
+        drivable_table_data.append(["mIoU", f"{drivable_iou['mIoU']:.4f}"])
+        drivable_table_data.append(["mDice", f"{drivable_dice['mDice']:.4f}"])
+        for cls in range(num_drivable_classes):
+            drivable_table_data.append([f"IoU Class {cls}", f"{drivable_iou.get(f'IoU_class_{cls}', 0.0):.4f}"])
+
+        drivable_table_string = AsciiTable(drivable_table_data).table
+
+        print("\nDrivable Segmentation Metrics:")
+        print(drivable_table_string)
+    
 if __name__ == "__main__":
 
     model_kwargs = {
@@ -324,8 +423,8 @@ if __name__ == "__main__":
         "detection_annotations_dir": "panoptic_perception/BDD100k/bdd100k_labels/100k",
         "segmentation_annotations_dir": "panoptic_perception/BDD100k/bdd100k_seg_maps/labels",
         "drivable_annotations_dir": "panoptic_perception/BDD100k/bdd100k_drivable_maps/labels",
-        "dataset_type": "test",
-        "batch_size": 1
+        "dataset_type": "val",
+        "batch_size": 4
     }
 
     model, device, dataloader = initialize_eval_pipeline(
@@ -337,7 +436,7 @@ if __name__ == "__main__":
         model=model,
         dataloader=dataloader,
         device=device,
-        output_dir="eval_outputs",
+        output_dir="eval_outputs-detections-1",
         visualize=True,
         max_visualizations=50  # Limit to 50 images to avoid too many files
     )

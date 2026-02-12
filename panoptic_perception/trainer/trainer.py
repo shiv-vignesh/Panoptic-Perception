@@ -794,7 +794,7 @@ class Trainer:
                                 num_drivable_classes, num_drivable_classes, dtype=torch.int64
                             )
                         # Update confusion matrix
-                        drivable_confusion_matrix += self._compute_confusion_matrix(
+                        drivable_confusion_matrix += SegmentationUtils._compute_confusion_matrix(
                             drivable_preds.cpu(), drivable_targets.cpu(), num_drivable_classes
                         )
 
@@ -857,7 +857,7 @@ class Trainer:
                                 num_lane_classes, num_lane_classes, dtype=torch.int64
                             )
                         # Update confusion matrix
-                        lane_confusion_matrix += self._compute_confusion_matrix(
+                        lane_confusion_matrix += SegmentationUtils._compute_confusion_matrix(
                             lane_preds.cpu(), lane_targets.cpu(), num_lane_classes
                         )
 
@@ -932,7 +932,7 @@ class Trainer:
         # Drivable segmentation metrics (computed from confusion matrix)
         drivable_metrics = {}
         if drivable_confusion_matrix is not None:
-            drivable_iou, drivable_dice = self._compute_metrics_from_confusion_matrix(
+            drivable_iou, drivable_dice = SegmentationUtils._compute_metrics_from_confusion_matrix(
                 drivable_confusion_matrix, num_drivable_classes
             )
             drivable_metrics = {**drivable_iou, **drivable_dice}
@@ -967,7 +967,7 @@ class Trainer:
         # Lane segmentation metrics (computed from confusion matrix)
         lane_metrics = {}
         if lane_confusion_matrix is not None:
-            lane_iou, lane_dice = self._compute_metrics_from_confusion_matrix(
+            lane_iou, lane_dice = SegmentationUtils._compute_metrics_from_confusion_matrix(
                 lane_confusion_matrix, num_lane_classes
             )
             lane_metrics = {**lane_iou, **lane_dice}

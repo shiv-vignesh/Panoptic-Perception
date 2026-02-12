@@ -50,6 +50,51 @@ class SegmentationUtils:
         return mask
     
     @staticmethod
+    def _compute_confusion_matrix(preds: torch.Tensor, targets: torch.Tensor, num_classes: int) -> torch.Tensor:
+        """Compute confusion matrix for a batch of predictions and targets."""
+        preds_flat = preds.view(-1)
+        targets_flat = targets.view(-1)
+
+        # Filter valid indices (in case of ignore labels)
+        mask = (targets_flat >= 0) & (targets_flat < num_classes)
+        preds_flat = preds_flat[mask]
+        targets_flat = targets_flat[mask]
+
+        # Compute confusion matrix using bincount
+        indices = targets_flat * num_classes + preds_flat
+        conf_matrix = torch.bincount(indices, minlength=num_classes * num_classes)
+        return conf_matrix.reshape(num_classes, num_classes)    
+    
+    @staticmethod
+    def _compute_metrics_from_confusion_matrix(conf_matrix: torch.Tensor, num_classes: int) -> tuple:
+        """Compute IoU and Dice metrics from confusion matrix."""
+        iou_dict = {}
+        dice_dict = {}
+
+        iou_per_class = []
+        dice_per_class = []
+
+        for cls in range(num_classes):
+            tp = conf_matrix[cls, cls].float()
+            fp = conf_matrix[:, cls].sum().float() - tp
+            fn = conf_matrix[cls, :].sum().float() - tp
+
+            # IoU = TP / (TP + FP + FN)
+            iou = tp / (tp + fp + fn + 1e-10)
+            iou_dict[f'IoU_class_{cls}'] = iou.item()
+            iou_per_class.append(iou.item())
+
+            # Dice = 2*TP / (2*TP + FP + FN)
+            dice = (2 * tp) / (2 * tp + fp + fn + 1e-10)
+            dice_dict[f'Dice_class_{cls}'] = dice.item()
+            dice_per_class.append(dice.item())
+
+        iou_dict['mIoU'] = np.mean(iou_per_class)
+        dice_dict['mDice'] = np.mean(dice_per_class)
+
+        return iou_dict, dice_dict    
+    
+    @staticmethod
     def transparent_overlay(original_imgs:torch.Tensor, masks:torch.Tensor, alpha:float=0.3):        
         """
         Create a transparent overlay of segmentation mask on an image
