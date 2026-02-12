@@ -731,7 +731,8 @@ class Trainer:
                     # Apply NMS
                     nms_results = DetectionHelper.non_max_suppression(
                         concatenated_preds,
-                        conf_threshold=0.25,
+                        # conf_threshold=0.25,
+                        conf_threshold=0.001,
                         iou_threshold=0.45,
                         max_detections=500
                     )
