@@ -333,7 +333,8 @@ class BDDPreprocessor:
             seg=seg,
             drivable=drivable,
             labels=labels_xywh,
-            params=self.augment_params
+            params=self.augment_params,
+            img_size=self.image_resize
         )
 
         return image, seg, drivable, labels_xywh

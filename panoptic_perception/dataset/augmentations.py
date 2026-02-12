@@ -358,7 +358,7 @@ def copy_paste_instances(img, labels, source_img, source_labels, target_classes=
     return img, np.array(labels_list) if labels_list else np.zeros((0, 5))
 
 
-def apply_augmentations(img, seg, drivable, labels, params):
+def apply_augmentations(img, seg, drivable, labels, params, img_size=(640, 640)):
 
     # -----------------------------------------
     # 1) GEOMETRIC AUG (on original size)
@@ -393,7 +393,7 @@ def apply_augmentations(img, seg, drivable, labels, params):
     # -----------------------------------------
     # 5) LETTERBOX RESIZE (after augmentations)
     # -----------------------------------------
-    img_size = params.get("img_size", (640, 640))
+    # img_size = params.get("img_size", (640, 640))
     img, seg, drivable, labels = letterbox_with_masks(img, seg, drivable, labels, new_shape=img_size)
 
     return img, seg, drivable, labels
