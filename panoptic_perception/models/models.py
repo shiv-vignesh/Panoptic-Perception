@@ -1,15 +1,17 @@
 import os, ast
-from typing import Tuple
+from typing import Tuple, Optional, Union
 
 import torch
 import torch.nn as nn
 
-from panoptic_perception.models.common import ConvBlock, Focus, BottleneckCSP, SPP, Upsample, Detect
+from panoptic_perception.models.common import (
+    ConvBlock, Focus, BottleneckCSP, SPP, Upsample, Detect, C2F, SPPF
+)
 from panoptic_perception.models.utils import parse_model_config, initialize_weights, PanopticModelOutputs
 from panoptic_perception.utils.detection_utils import DetectionLossCalculator
 from panoptic_perception.utils.segmentation_utils import SegmentationLossCalculator
 
-def create_modules(module_defs: list, num_classes: int = 80,
+def create_modules(module_defs: list,
                    segmentation_head_idx: int = -1,
                    lane_segmentation_head_idx: int = -1) -> Tuple[nn.ModuleList, list, list, list]:
     """
@@ -55,7 +57,10 @@ def create_modules(module_defs: list, num_classes: int = 80,
             out_ch = int(module_def["out_channels"])
             k = int(module_def["kernel_size"])
             s = int(module_def["stride"])
-            module = ConvBlock(in_ch, out_ch, k, s)
+            p = int(module_def["padding"]) if "padding" in module_def else None
+            activation_func = str(module_def.get("activation_func", "hardswish"))
+            
+            module = ConvBlock(in_ch, out_ch, k, s, p, activation_func=activation_func)
             output_channels.append(out_ch)
 
             # Check if this ConvBlock is a segmentation head
@@ -76,6 +81,15 @@ def create_modules(module_defs: list, num_classes: int = 80,
             module = BottleneckCSP(in_ch, out_ch, n, residual, use_deform)
             output_channels.append(out_ch)
 
+        elif mtype == "C2F":
+            in_ch = output_channels[-1] if len(output_channels) > 0 else int(module_def["in_channels"])
+            out_ch = int(module_def["out_channels"])
+            n = int(module_def["n"])
+            shortcut = bool(module_def["shortcut"])
+            
+            module = C2F(in_ch, out_ch, n, shortcut)
+            output_channels.append(out_ch)
+        
         # -- SPP ---------------------------------------------------------------
         elif mtype == "SPP":
             in_ch = output_channels[-1] if len(output_channels) > 0 else int(module_def["in_channels"])
@@ -83,6 +97,13 @@ def create_modules(module_defs: list, num_classes: int = 80,
             
             ks = [int(x) for x in module_def.get("pool_sizes", "5,9,13").split(",")]
             module = SPP(in_ch, out_ch, ks)
+            output_channels.append(out_ch)
+
+        elif mtype == "SPPF":
+            in_ch = output_channels[-1] if len(output_channels) > 0 else int(module_def["in_channels"])
+            out_ch = int(module_def["out_channels"])
+
+            module = SPPF(in_ch, out_ch)
             output_channels.append(out_ch)
 
         # -- UPSAMPLE ----------------------------------------------------------
@@ -150,10 +171,9 @@ class YOLOP(nn.Module):
             self.lane_segmentation_head_idx = int(module_defs[0].get('lane_segmentation_head_idx', -1))
             self.detection_head_idx = int(module_defs[0].get('detection_head_idx', -1))
 
-        self.in_channels = self.module_defs[0].get('channels', 3)
+        self.in_channels = self.module_defs[0].get('in_channels', 3)
         self.module_list, self.routes, self.module_names, self._cache_layer_idx = create_modules(
             self.module_defs,
-            num_classes=num_classes,
             segmentation_head_idx=self.segmentation_head_idx,
             lane_segmentation_head_idx=self.lane_segmentation_head_idx
         )
@@ -185,7 +205,7 @@ class YOLOP(nn.Module):
                     for r in route:
                         if r == -1:
                             continue
-                        assert r in cache, f"Output for layer {r} not found in cache."                        
+                        assert r in cache, f"Output for layer {r} not found in cache."
                         x = torch.cat([x, cache[r]], dim=1)
 
                 elif self.module_names[i] == "ResidualAdd":
@@ -219,7 +239,7 @@ class YOLOP(nn.Module):
 
             # Capture segmentation outputs
             if self.module_names[i] == "DrivableAreaSegmentation":
-                model_outputs.drivable_segmentation_logits = x                
+                model_outputs.drivable_segmentation_logits = x
                 if not self.training:
                     # predictions["drivable_area_seg"] = x
                     model_outputs.drivable_segmentation_predictions = torch.softmax(x, dim=1)
@@ -286,7 +306,149 @@ class YOLOP(nn.Module):
 
         return model_outputs
 
-def get_model_param_groups(model:YOLOP, groups:dict, dcn_lr_mult:float=0.1):
+class YOLOv8P(nn.Module):
+    def __init__(self, cfg:str, loss_weights: dict = None):
+        super(YOLOv8P, self).__init__()
+        
+        module_defs = parse_model_config(cfg)
+        # Multi-task loss weights (detection prioritized by default)
+        self.loss_weights = loss_weights or {
+            "detection": 1.0,
+            "drivable_segmentation": 1.0,
+            "lane_segmentation": 0.0
+        }
+        
+        if module_defs[0]["type"] == "heads":
+            self.module_defs = module_defs[1:]
+            
+            self.detection_head_idx = int(module_defs[0].get('detection_head_idx', -1))
+            self.segmentation_head_idx = int(module_defs[0].get('segmentation_head_idx', -1))
+            self.lane_segmentation_head_idx = int(module_defs[0].get('lane_segmentation_head_idx', -1))
+            
+            
+        self.in_channels = int(self.module_defs[0].get("in_channels", 3))
+        self.module_list, self.routes, self.module_names, self._cache_layer_idx = create_modules(
+            self.module_defs,
+            segmentation_head_idx=self.segmentation_head_idx,
+            lane_segmentation_head_idx=self.lane_segmentation_head_idx
+        )
+
+        # Initialize model weights
+        initialize_weights(self)
+        
+    def forward(self, x, targets=None):
+
+        cache = {} # Cache for layer outputs
+        _, _, height, width = x.shape
+        
+        model_outputs = PanopticModelOutputs()
+        
+        for i, (module, route) in enumerate(zip(self.module_list, self.routes)):
+            if route == -1:
+                x = module(x)
+                
+            elif len(route) == 1:
+                # single previous layer route
+                if route[0] == -1:
+                    x = module(x)
+                else:
+                    x = module(cache[route[0]])
+                    
+            elif len(route) > 1:
+                
+                if self.module_names[i] == "Concat":
+                    for r in route:
+                        if r == -1:
+                            continue
+                        assert r in cache, f"Output for layer {r} not found in cache."
+                        x = torch.cat([x, cache[r]], dim=1)
+                
+                elif self.module_names[i] == "ResidualAdd":
+                    for r in route:
+                        if r == -1:
+                            continue
+                        assert r in cache, f"Output for layer {r} not found in cache."
+                        assert x.shape == cache[r].shape, f"Residual Add Expects Tensors of Same Size, Found: {x.shape} and {cache[r].shape}"
+
+                        x = x + cache[r]
+                        
+                elif self.module_names[i] == "Detect":
+                    inputs = []
+                    for r in route:
+                        if r == -1:
+                            continue
+                        assert r in cache, f"Output for layer {r} not found in cache."
+                        inputs.append(cache[r])
+
+                    detection_outputs  = module(inputs, image_size=(height, width))
+                    model_outputs.detection_logits = detection_outputs
+
+                    if not self.training:
+                        model_outputs.detection_predictions = module.activation(detection_outputs)
+                
+                else: #TODO, future modules
+                    pass # concatenate multiple previous layers                
+            
+            # Capture segmentation outputs
+            if self.module_names[i] == "DrivableAreaSegmentation":
+                model_outputs.drivable_segmentation_logits = x
+                if not self.training:
+                    model_outputs.drivable_segmentation_predictions = torch.softmax(x, dim=1)
+            
+            # Capture segmentation outputs
+            if self.module_names[i] == "LaneSegmentation":
+                model_outputs.drivable_segmentation_logits = x
+                if not self.training:
+                    model_outputs.drivable_segmentation_predictions = torch.softmax(x, dim=1)
+            
+            if i in self._cache_layer_idx:
+                cache[i] = x            
+
+        if targets is not None:
+
+            if model_outputs.detection_logits is not None and targets["detections"] is not None:
+                output_name = "detections"
+                assert output_name in targets, f"Target for {output_name} not provided."
+
+                det_loss, det_loss_items = DetectionLossCalculator.compute_detection_loss_2(
+                    model_outputs.detection_logits,
+                    targets["detections"],
+                    self.module_list[self.detection_head_idx].num_layers,
+                    self.module_list[self.detection_head_idx].anchors,
+                    self.module_list[self.detection_head_idx].stride,
+                    cls_loss_type='focal'  # Use focal loss for better class imbalance handling
+                )
+
+                # Apply multi-task loss weight
+                model_outputs.detection_loss = det_loss * self.loss_weights.get("detection", 1.0)
+                # print(f'Detection Loss: {det_loss}')
+
+            if model_outputs.drivable_segmentation_logits is not None and targets["drivable_area_seg"] is not None:
+                output_name = "drivable_area_seg"
+                assert output_name in targets, f"Target for {output_name} not provided."
+                drivable_seg_loss = SegmentationLossCalculator.compute_segmentation_loss(
+                    model_outputs.drivable_segmentation_logits,
+                    targets["drivable_area_seg"]
+                )
+                # Apply multi-task loss weight
+                model_outputs.drivable_segmentation_loss = drivable_seg_loss * self.loss_weights.get("drivable_segmentation", 0.2)
+                # print(f'Drivable Area Segmentation Loss: {drivable_seg_loss}')
+                
+            if model_outputs.lane_segmentation_logits is not None:
+                output_name = "lane_seg"
+                assert output_name in targets, f"Target for {output_name} not provided."
+
+                lane_seg_loss = SegmentationLossCalculator.compute_segmentation_loss(
+                    model_outputs.lane_segmentation_logits,
+                    targets["lane_seg"]
+                )
+                # Apply multi-task loss weight
+                model_outputs.lane_segmentation_loss = lane_seg_loss * self.loss_weights.get("lane_segmentation", 0.0)
+                # print(f'Lane Segmentation Loss: {lane_seg_loss}')
+
+        return model_outputs
+    
+def get_model_param_groups(model:Optional[Union[YOLOP, YOLOv8P]], groups:dict, dcn_lr_mult:float=0.1):
     """
     Configure parameter groups for training with selective freezing.
 
@@ -405,4 +567,4 @@ def get_model_param_groups(model:YOLOP, groups:dict, dcn_lr_mult:float=0.1):
     if len(param_groups) == 0:
         raise ValueError("No trainable parameter groups selected by trainable_cfg!")
 
-    return param_groups
+    return param_groups    

@@ -48,13 +48,14 @@ def create_model(model_kwargs:dict):
 
 def create_dataloader(images_dir:str, detection_annotations_dir:str, 
                     segmentation_annotations_dir:str, drivable_annotations_dir:str, 
-                    batch_size:int=1, dataset_type:str="eval"):
+                    preprocessor_kwargs:dict, batch_size:int=1, dataset_type:str="eval"):
 
     dataset = BDD100KDataset({
         "images_dir":images_dir, 
         "detection_annotations_dir":detection_annotations_dir,
         "segmentation_annotations_dir":segmentation_annotations_dir,
-        "drivable_annotations_dir":drivable_annotations_dir
+        "drivable_annotations_dir":drivable_annotations_dir,
+        "preprocessor_kwargs":preprocessor_kwargs,
     }, dataset_type=dataset_type)
 
     return torch.utils.data.DataLoader(
@@ -86,6 +87,7 @@ def initialize_eval_pipeline(model_kwargs:dict, dataset_kwargs:dict):
                                 dataset_kwargs["detection_annotations_dir"], 
                                 dataset_kwargs["segmentation_annotations_dir"],
                                 dataset_kwargs["drivable_annotations_dir"], 
+                                dataset_kwargs["preprocessor_kwargs"], 
                                 dataset_type=dataset_kwargs["dataset_type"],
                                 batch_size=dataset_kwargs.get("batch_size", 1))
         
@@ -342,6 +344,9 @@ def run_eval_pipeline(model: torch.nn.Module,
 
         if should_visualize:
             vis_count = global_image_idx
+        
+        if batch_idx > 5:
+            break
 
     print(f"\nEvaluation complete. Processed {global_image_idx} images.")
     if visualize:
@@ -415,7 +420,7 @@ if __name__ == "__main__":
     model_kwargs = {
         "cfg_path": "panoptic_perception/configs/models/yolo-detection.cfg",
         "device": "cuda:0",
-        "model_path": "checkpoints/yolop-detection-5060Ti/best_model.pt"
+        "model_path": "checkpoints/yolop-detection-768x1280-new-anchors/best_model.pt"
     }
 
     dataset_kwargs = {
@@ -424,7 +429,11 @@ if __name__ == "__main__":
         "segmentation_annotations_dir": "panoptic_perception/BDD100k/bdd100k_seg_maps/labels",
         "drivable_annotations_dir": "panoptic_perception/BDD100k/bdd100k_drivable_maps/labels",
         "dataset_type": "val",
-        "batch_size": 4
+        "batch_size": 4,
+        "preprocessor_kwargs": {
+            "image_resize": [768, 1280],
+            "original_image_size": [720, 1280]
+        }        
     }
 
     model, device, dataloader = initialize_eval_pipeline(

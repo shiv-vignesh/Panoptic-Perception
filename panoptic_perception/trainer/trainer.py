@@ -2,7 +2,7 @@ import os, math, time, copy
 from tqdm import tqdm
 from datetime import datetime
 
-from typing import Iterable, Union
+from typing import Iterable, Union, Optional
 from collections import defaultdict
 
 import torch
@@ -98,7 +98,7 @@ class ModelEMA:
 
 from panoptic_perception.dataset.enums import BDD100KClassesReduced
 
-from panoptic_perception.models.models import YOLOP, get_model_param_groups
+from panoptic_perception.models.models import YOLOP, YOLOv8P, get_model_param_groups
 from panoptic_perception.models.utils import PanopticModelOutputs, WeightsManager
 
 from panoptic_perception.utils.logger import Logger
@@ -112,7 +112,7 @@ CLASS_NAMES = [cls.name for cls in BDD100KClassesReduced]
 
 class Trainer:
     
-    def __init__(self, model:Union[YOLOP], device:torch.device,
+    def __init__(self, model:Optional[Union[YOLOP, YOLOv8P]], device:torch.device,
                  dataset_kwargs:dict, 
                  optimizer_kwargs:dict, lr_scheduler_kwargs:dict,
                  trainer_kwargs:dict):

@@ -331,7 +331,7 @@ class DetectionLossCalculator:
     cls_weight: float = 0.5
     
     balance:list = [4.0, 1.0, 0.4]
-    gamma:float=0.5
+    gamma:float=2.0
     class_weights = None  # Not needed: detection loss is computed on matched targets which are already balanced
     
     iou_aware_cls:bool=False

@@ -5,7 +5,7 @@ from torch.utils.data import DataLoader
 import numpy as np
 
 from panoptic_perception.dataset.bdd100k_dataset import BDD100KDataset, BDDPreprocessor
-from panoptic_perception.models.models import YOLOP
+from panoptic_perception.models.models import YOLOP, YOLOv8P
 from panoptic_perception.utils.detection_utils import DetectionHelper
 from panoptic_perception.utils.evaluation_helper import (
     DetectionMetrics,
@@ -69,8 +69,11 @@ def test_integration():
     print("TEST: Model Forward Pass with DataLoader")
     print("="*60)
     
-    cfg_path = 'panoptic_perception/configs/models/yolop.cfg'
-    model = YOLOP(cfg_path)
+    # cfg_path = 'panoptic_perception/configs/models/yolop.cfg'
+    # model = YOLOP(cfg_path)
+
+    cfg_path = 'panoptic_perception/configs/models/yolov8-detection.cfg'
+    model = YOLOv8P(cfg_path)
     module_defs = model.module_defs
 
     assert isinstance(module_defs, list), "Module definitions should be a list"
@@ -132,8 +135,10 @@ def test_evaluation_helpers():
 
     # Create dataloader and model
     dataloader = create_dataloader()
-    cfg_path = 'panoptic_perception/configs/models/yolop.cfg'
-    model = YOLOP(cfg_path)
+    # cfg_path = 'panoptic_perception/configs/models/yolop.cfg'
+    # model = YOLOP(cfg_path)
+    cfg_path = 'panoptic_perception/configs/models/yolov8-detection.cfg'
+    model = YOLOv8P(cfg_path)
     model.eval()
 
     # Get a batch and run forward pass

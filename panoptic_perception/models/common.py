@@ -6,14 +6,24 @@ from typing import List, Tuple
 
 class ConvBlock(nn.Module):
     def __init__(self, in_channels:int, out_channels:int, kernel_size:int=1, stride:int=1, padding:int=None, 
-                activation:bool=True, batch_norm:bool=True):
+                activation:bool=True, batch_norm:bool=True, activation_func:str="hardswish"):
         super(ConvBlock, self).__init__()
 
         self.conv = nn.Conv2d(in_channels, out_channels, kernel_size=kernel_size, 
                             stride=stride, padding=self.autopad(kernel_size, padding))        
 
         self.norm = nn.BatchNorm2d(out_channels) if batch_norm else nn.Identity()
-        self.act = nn.Hardswish() if activation else nn.Identity()
+        if activation:
+            if activation_func == "silu":
+                self.act = nn.SiLU()
+            elif activation_func == "hardswish":
+                self.act = nn.Hardswish()
+            else:
+                self.act = nn.ReLU()        
+        else:
+            self.act = nn.Identity()
+
+        # self.act = nn.Hardswish() if activation else nn.Identity()
         
     def autopad(self, kernel_size:int, padding:int=None):
         if padding is None:
@@ -228,3 +238,67 @@ class Detect(nn.Module):
             outputs.append(y)
 
         return outputs
+
+class BottleneckV8(nn.Module):
+    def __init__(self, in_channels:int, out_channels, residual:bool=True, e=0.5):
+        super(BottleneckV8, self).__init__()
+
+        c_ = int(in_channels * e) #expansion_factor
+        self.conv1 = ConvBlock(in_channels, c_,
+                               kernel_size=3, stride=1, padding=1, 
+                               activation=True, activation_func="silu")
+        self.conv2 = ConvBlock(c_, out_channels, 
+                               kernel_size=3, stride=1, padding=1,
+                               activation=True, activation_func="silu")
+        self.add = residual and in_channels == out_channels
+
+    def forward(self, x):
+        return x + self.conv2(self.conv1(x)) if self.add else self.conv2(self.conv1(x))
+    
+class C2F(nn.Module):
+    def __init__(self, in_channels:int, out_channels:int, n:int, residual:bool=True, e=0.5):
+        super(C2F, self).__init__()
+        
+        _c1 = int(out_channels * e)
+        self.conv1 = ConvBlock(in_channels, _c1 * 2, 
+                               kernel_size=1, stride=1, padding=0,
+                               activation=True, activation_func="silu")
+
+        self.bottlenecks = nn.Sequential(*[
+            BottleneckV8(_c1, _c1, residual=residual, e=1.0) for _ in range(n)
+        ])
+
+        _c2 = (2 + n) * _c1
+        self.conv2 = ConvBlock(_c2, out_channels, 
+                               kernel_size=1, stride=1, padding=0,
+                               activation=True, activation_func="silu")
+        
+    def forward(self, x):
+        y = list(self.conv1(x).chunk(2, 1)) #split num_chunks and channel_dim
+        y.extend(bottlneck(y[-1]) for bottlneck in self.bottlenecks)
+        return self.conv2(torch.cat(y, dim=1))
+    
+class SPPF(nn.Module):
+    def __init__(self, in_channels:int, out_channels:int, k=5):
+        super(SPPF, self).__init__()
+        
+        c_ = in_channels // 2
+        self.conv1 = ConvBlock(in_channels, c_, 
+                               kernel_size=1, stride=1, padding=0,
+                               activation=True, activation_func="silu")
+
+        self.maxpool = nn.MaxPool2d(kernel_size=k, stride=1, padding=k//2)
+
+        self.conv2 = ConvBlock(c_ * 4, out_channels,
+                               kernel_size=1, stride=1, padding=0,
+                               activation=True, activation_func="silu")        
+        
+    def forward(self, x):
+        y1 = self.conv1(x)
+        y2 = self.maxpool(y1)
+        y3 = self.maxpool(y2)
+        y4 = self.maxpool(y3)
+
+        y = torch.cat([y1, y2, y3, y4], dim=1)        
+
+        return self.conv2(y)

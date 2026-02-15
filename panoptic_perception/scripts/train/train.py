@@ -4,17 +4,21 @@ import argparse
 
 import torch
 
-from panoptic_perception.models.models import YOLOP
+from panoptic_perception.models.models import YOLOP, YOLOv8P
 from panoptic_perception.trainer.trainer import Trainer
 
 
 def create_model(model_kwargs: dict, loss_weights: dict = None):
     """Create YOLOP model with optional multi-task loss weights."""
+    model_type = model_kwargs["model_type"]
     cfg_path = model_kwargs["cfg_path"]
     device = model_kwargs["device"]
 
     assert os.path.exists(cfg_path), f'{cfg_path} does not exists'
-    model = YOLOP(cfg_path, loss_weights=loss_weights)
+    if model_type == "yolop":
+        model = YOLOP(cfg_path, loss_weights=loss_weights)
+    elif model_type == "yolov8p":
+        model = YOLOv8P(cfg_path, loss_weights=loss_weights)
 
     device = torch.device(device) if torch.cuda.is_available() and "cuda" in device else torch.device("cpu")
     model.to(device)
