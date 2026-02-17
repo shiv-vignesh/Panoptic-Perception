@@ -108,8 +108,8 @@ echo ""
 # ---- Step 6: Install Python packages ----
 echo "[6/6] Installing Python packages"
 echo "----------------------------------------"
-pip install torch==2.6.0+cu118 torchvision==0.21.0+cu118 torchaudio==2.6.0+cu118 \
-    --index-url https://download.pytorch.org/whl/cu118
+pip install torch==2.10.0+cu128 torchvision==0.25.0+cu128 torchaudio==2.10.0+cu128 \
+    --index-url https://download.pytorch.org/whl/cu128
 
 pip install \
     albumentations==2.0.3 \
