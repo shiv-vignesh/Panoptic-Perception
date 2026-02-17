@@ -6,6 +6,18 @@ A PyTorch implementation of multi-task panoptic perception for autonomous drivin
 ![PyTorch](https://img.shields.io/badge/PyTorch-2.0+-red.svg)
 ![License](https://img.shields.io/badge/License-MIT-green.svg)
 
+## Example Results
+
+### Object Detection
+| | |
+|:---:|:---:|
+| ![Detection Example 1](assets/examples/detection_example_1.png) | ![Detection Example 2](assets/examples/detection_example_2.png) |
+
+### Drivable Area Segmentation
+| | |
+|:---:|:---:|
+| ![Drivable Example 1](assets/examples/drivable_example_1.png) | ![Drivable Example 2](assets/examples/drivable_example_2.png) |
+
 ## Highlights
 
 - **Multi-Task Learning**: Joint training for object detection and drivable area segmentation
@@ -20,40 +32,52 @@ A PyTorch implementation of multi-task panoptic perception for autonomous drivin
 
 ## Results
 
+### Best Performing Model: YOLOP (Detection + Drivable Segmentation)
+
+**Model:** `yolo-detection-drivable-unet.cfg` @ 640×640
+**Checkpoint:** `yolop-detection-drivable-unet-5060Ti/best_model.pt` (Epoch 20)
+
 ### Object Detection (BDD100K Validation Set)
 
 | Class | AP@0.5 |
 |-------|--------|
-| Person | 0.509 |
-| Rider | 0.336 |
-| Vehicles | 0.715 |
-| Motor | 0.334 |
-| Traffic Light | 0.675 |
-| Traffic Sign | 0.565 |
-| **mAP@0.5** | **0.52** |
+| Person | 0.501 |
+| Rider | 0.318 |
+| Vehicles | 0.713 |
+| Motor | 0.395 |
+| Traffic Light | 0.678 |
+| Traffic Sign | 0.568 |
+| **mAP@0.5** | **0.529** |
 
 ### Drivable Area Segmentation
 
 | Metric | Value |
 |--------|-------|
-| mIoU | 0.65+ |
-| mDice | 0.72+ |
+| mIoU | **0.917** |
+| mDice | **0.955** |
+| IoU (Background) | 0.982 |
+| IoU (Drivable) | 0.851 |
 
-## Architecture
+> **Note:** YOLOv8P experiments are in progress and will be added once results stabilize.
+
+## Architectures
+
+This project supports two backbone architectures:
+
+### YOLOP (YOLOv5-style) - Current Best
 
 ```
-Input Image (640x640)
+Input Image (640x640 or 768x1280)
         │
         ▼
 ┌───────────────────┐
-│   CSPDarknet53    │  ← Backbone (Focus + CSP Blocks)
-│   Backbone        │
+│   CSPDarknet      │  ← Backbone (Focus + BottleneckCSP Blocks)
+│   Backbone        │     Bottleneck: 1×1 → 3×3
 └───────────────────┘
         │
         ▼
 ┌───────────────────┐
 │   SPP Module      │  ← Spatial Pyramid Pooling (5, 9, 13)
-│   (5, 9, 13)      │
 └───────────────────┘
         │
         ▼
@@ -68,11 +92,44 @@ Input Image (640x640)
 │  Detection    │     │   Drivable    │     │    Lane       │
 │  Head (P3-P5) │     │  Seg Head     │     │  Seg Head     │
 └───────────────┘     └───────────────┘     └───────────────┘
-        │                     │                     │
-        ▼                     ▼                     ▼
-   Bounding Boxes      Drivable Mask         Lane Mask
-   + Classes           (3 classes)           (2 classes)
 ```
+
+### YOLOv8P (YOLOv8-style) - Experimental
+
+```
+Input Image (640x640 or 768x1280)
+        │
+        ▼
+┌───────────────────┐
+│   YOLOv8          │  ← Backbone (Stride-2 Conv + C2F Blocks)
+│   Backbone        │     BottleneckV8: 3×3 → 3×3 (richer features)
+└───────────────────┘
+        │
+        ▼
+┌───────────────────┐
+│   SPPF Module     │  ← Fast SPP (sequential 5×5 maxpool)
+└───────────────────┘
+        │
+        ▼
+┌───────────────────┐
+│   FPN + PAN       │  ← C2F-based neck
+│   Neck (C2F)      │
+└───────────────────┘
+        │
+        ▼
+┌───────────────┐
+│  Detection    │  ← YOLOv5-style anchor-based head
+│  Head (P3-P5) │
+└───────────────┘
+```
+
+**Key Differences:**
+| Feature | YOLOP | YOLOv8P |
+|---------|-------|---------|
+| Bottleneck | 1×1 → 3×3 | 3×3 → 3×3 |
+| Feature Block | BottleneckCSP | C2F (split → chain → concat) |
+| Pooling | SPP (parallel) | SPPF (sequential) |
+| Memory Usage | Lower | ~2-3× higher |
 
 ## Project Structure
 
@@ -92,8 +149,8 @@ panoptic_perception/
 │   ├── mosaic_augmentation.py # Mosaic augmentation
 │   └── enums.py               # Class definitions
 ├── models/
-│   ├── models.py              # YOLOP model definition
-│   ├── common.py              # Building blocks (CSP, SPP, Focus, etc.)
+│   ├── models.py              # YOLOP & YOLOv8P model definitions
+│   ├── common.py              # Building blocks (CSP, C2F, SPP, SPPF, Focus, etc.)
 │   └── utils.py               # Model utilities
 ├── trainer/
 │   └── trainer.py             # Training loop with EMA, multi-GPU support
