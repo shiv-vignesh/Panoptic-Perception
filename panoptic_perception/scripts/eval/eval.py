@@ -8,7 +8,7 @@ import torch
 from panoptic_perception.dataset.bdd100k_dataset import BDD100KDataset, BDDPreprocessor
 from panoptic_perception.dataset.enums import BDD100KClassesReduced
 
-from panoptic_perception.models.models import YOLOP, PanopticModelOutputs
+from panoptic_perception.models.models import YOLOP, YOLOv8P, PanopticModelOutputs
 from panoptic_perception.models.utils import WeightsManager
 from panoptic_perception.utils.detection_utils import DetectionHelper
 from panoptic_perception.utils.segmentation_utils import SegmentationUtils
@@ -24,9 +24,13 @@ def create_model(model_kwargs:dict):
     cfg_path = model_kwargs["cfg_path"]
     device = model_kwargs["device"]
     model_path = model_kwargs["model_path"]
+    model_type = model_kwargs["model_type"]
     
     assert os.path.exists(cfg_path), f'{cfg_path} does not exists'
-    model = YOLOP(cfg_path)
+    if model_type == "yolop":
+        model = YOLOP(cfg_path)
+    elif model_type == "yolov8p":
+        model = YOLOv8P(cfg_path)
     
     if model_path and os.path.exists(model_path):
 
@@ -120,26 +124,41 @@ def process_detection_outputs(outputs: PanopticModelOutputs, images: torch.Tenso
     if outputs.detection_predictions is None:
         return
 
-    detection_preds = outputs.detection_predictions
+    conf_threshold=0.001
+    iou_threshold=0.45
+    max_detections=300
+
     batch_size, _, image_h, image_w = images.shape
 
-    # Concatenate predictions from all detection layers
-    batch_predictions = []
-    for layer_pred in detection_preds:
-        b, na, h, w, nc = layer_pred.shape
-        layer_pred_flat = layer_pred.view(b, na * h * w, nc)
-        batch_predictions.append(layer_pred_flat)
+    if isinstance(outputs.detection_predictions, torch.Tensor):
+        # yolov8 anchor-free postProcess
+        nms_results = DetectionHelper.non_max_suppression_v8(
+            outputs.detection_predictions,
+            conf_threshold=conf_threshold,
+            iou_threshold=iou_threshold,
+            max_detections=max_detections
+        )
+    
+    else:    
+        detection_preds = outputs.detection_predictions
 
-    concatenated_preds = torch.cat(batch_predictions, dim=1)
+        # Concatenate predictions from all detection layers
+        batch_predictions = []
+        for layer_pred in detection_preds:
+            b, na, h, w, nc = layer_pred.shape
+            layer_pred_flat = layer_pred.view(b, na * h * w, nc)
+            batch_predictions.append(layer_pred_flat)
 
-    # Apply NMS - returns list of tensors, one per image
-    # Each tensor has shape (num_detections, 6) [x1, y1, x2, y2, confidence, class_id]
-    nms_results = DetectionHelper.non_max_suppression(
-        concatenated_preds,
-        conf_threshold=0.001,
-        iou_threshold=0.45,
-        max_detections=300
-    )
+        concatenated_preds = torch.cat(batch_predictions, dim=1)
+
+        # Apply NMS - returns list of tensors, one per image
+        # Each tensor has shape (num_detections, 6) [x1, y1, x2, y2, confidence, class_id]
+        nms_results = DetectionHelper.non_max_suppression(
+            concatenated_preds,
+            conf_threshold=conf_threshold,
+            iou_threshold=iou_threshold,
+            max_detections=max_detections
+        )
 
     # Process each image in the batch
     for i in range(batch_size):
@@ -418,9 +437,10 @@ def run_eval_pipeline(model: torch.nn.Module,
 if __name__ == "__main__":
 
     model_kwargs = {
+        "model_type":"yolop",
         "cfg_path": "panoptic_perception/configs/models/yolo-detection.cfg",
         "device": "cuda:0",
-        "model_path": "checkpoints/yolop-detection-768x1280-new-anchors/best_model.pt"
+        "model_path": "checkpoints/yolop-checkpoints/yolop-detection-640x640/best_model.pt"
     }
 
     dataset_kwargs = {
@@ -431,7 +451,7 @@ if __name__ == "__main__":
         "dataset_type": "val",
         "batch_size": 4,
         "preprocessor_kwargs": {
-            "image_resize": [768, 1280],
+            "image_resize": [640, 640],
             "original_image_size": [720, 1280]
         }        
     }

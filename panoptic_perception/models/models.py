@@ -5,7 +5,7 @@ import torch
 import torch.nn as nn
 
 from panoptic_perception.models.common import (
-    ConvBlock, Focus, BottleneckCSP, SPP, Upsample, Detect, C2F, SPPF
+    ConvBlock, Focus, BottleneckCSP, SPP, Upsample, Detect, C2F, SPPF, DetectV8
 )
 from panoptic_perception.models.utils import parse_model_config, initialize_weights, PanopticModelOutputs
 from panoptic_perception.utils.detection_utils import DetectionLossCalculator
@@ -132,7 +132,13 @@ def create_modules(module_defs: list,
             channels = [output_channels[r] if r != -1 else output_channels[-1] for r in route]
 
             module = Detect(anchors, num_classes, channels)
-            
+        
+        elif mtype == "DetectV8":
+            num_classes = int(module_def.get("num_classes"))
+            channels = [output_channels[r] if r != -1 else output_channels[-1] for r in route]
+            reg_max = int(module_def.get("reg_max", 16))
+
+            module = DetectV8(num_classes, channels, reg_max=reg_max)
 
         module_list.append(module)
         routes.append(route)
@@ -332,6 +338,10 @@ class YOLOv8P(nn.Module):
             segmentation_head_idx=self.segmentation_head_idx,
             lane_segmentation_head_idx=self.lane_segmentation_head_idx
         )
+        
+        self.anchor_free = False        
+        if "DetectV8" in self.module_names:
+            self.anchor_free = True
 
         # Initialize model weights
         initialize_weights(self)
@@ -381,10 +391,33 @@ class YOLOv8P(nn.Module):
                         inputs.append(cache[r])
 
                     detection_outputs  = module(inputs, image_size=(height, width))
-                    model_outputs.detection_logits = detection_outputs
+                    model_outputs.detection_logits = detection_outputs #list
 
                     if not self.training:
-                        model_outputs.detection_predictions = module.activation(detection_outputs)
+                        model_outputs.detection_predictions = module.activation(detection_outputs) #list
+
+                elif self.module_names[i] == "DetectV8":
+                    inputs = []
+                    for r in route:
+                        if r == -1:
+                            continue
+                        assert r in cache, f"Output for layer {r} not found in cache."
+                        inputs.append(cache[r])
+
+                    bbox_outputs, cls_outputs, anchor_points, strides = module(inputs, image_size=(height, width))
+                    
+                    model_outputs.bbox_logits_raw = bbox_outputs
+                    model_outputs.cls_logits_raw = cls_outputs
+                    model_outputs.anchor_points = anchor_points
+                    model_outputs.strides = strides
+                    
+                    if not self.training:
+                        model_outputs.detection_predictions = module.activation(
+                                model_outputs.bbox_logits_raw,
+                                model_outputs.cls_logits_raw,
+                                model_outputs.anchor_points,
+                                model_outputs.strides
+                            ) #torch.Tensor (B, 8400, 4+C)
                 
                 else: #TODO, future modules
                     pass # concatenate multiple previous layers                
@@ -400,24 +433,39 @@ class YOLOv8P(nn.Module):
                 model_outputs.drivable_segmentation_logits = x
                 if not self.training:
                     model_outputs.drivable_segmentation_predictions = torch.softmax(x, dim=1)
-            
+
             if i in self._cache_layer_idx:
                 cache[i] = x            
 
         if targets is not None:
 
-            if model_outputs.detection_logits is not None and targets["detections"] is not None:
+            has_detection = (model_outputs.detection_logits is not None or
+                            model_outputs.bbox_logits_raw is not None)
+
+            if has_detection and targets["detections"] is not None:
                 output_name = "detections"
                 assert output_name in targets, f"Target for {output_name} not provided."
 
-                det_loss, det_loss_items = DetectionLossCalculator.compute_detection_loss_2(
-                    model_outputs.detection_logits,
-                    targets["detections"],
-                    self.module_list[self.detection_head_idx].num_layers,
-                    self.module_list[self.detection_head_idx].anchors,
-                    self.module_list[self.detection_head_idx].stride,
-                    cls_loss_type='focal'  # Use focal loss for better class imbalance handling
-                )
+                if self.anchor_free:
+                    det_loss, det_loss_items = DetectionLossCalculator.compute_detection_loss_v8(
+                        model_outputs.cls_logits_raw,
+                        model_outputs.bbox_logits_raw,
+                        model_outputs.anchor_points,
+                        model_outputs.strides,
+                        targets["detections"],
+                        image_size=(height, width)
+                    )
+                    print(det_loss_items)
+                    exit(1)
+                else:
+                    det_loss, det_loss_items = DetectionLossCalculator.compute_detection_loss_2(
+                        model_outputs.detection_logits,
+                        targets["detections"],
+                        self.module_list[self.detection_head_idx].num_layers,
+                        self.module_list[self.detection_head_idx].anchors,
+                        self.module_list[self.detection_head_idx].stride,
+                        cls_loss_type='focal'  # Use focal loss for better class imbalance handling
+                    )
 
                 # Apply multi-task loss weight
                 model_outputs.detection_loss = det_loss * self.loss_weights.get("detection", 1.0)
@@ -465,7 +513,6 @@ def get_model_param_groups(model:Optional[Union[YOLOP, YOLOv8P]], groups:dict, d
     - Sets requires_grad = True
     - Returns parameters in param_groups for optimizer
     """
-    import torch.nn as nn
 
     param_groups = []
     frozen_layers = []

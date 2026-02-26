@@ -72,7 +72,7 @@ def test_integration():
     # cfg_path = 'panoptic_perception/configs/models/yolop.cfg'
     # model = YOLOP(cfg_path)
 
-    cfg_path = 'panoptic_perception/configs/models/yolov8-detection.cfg'
+    cfg_path = 'panoptic_perception/configs/models/yolov8-detection-anchorFree.cfg'
     model = YOLOv8P(cfg_path)
     module_defs = model.module_defs
 
@@ -82,8 +82,7 @@ def test_integration():
     model.eval()
     
     batch = next(iter(dataloader))
-    
-    
+
     print(f"\nBatch keys: {batch.keys()}")
     print(f"Batch images shape: {batch['images'].shape}")
     if batch.get('detections') is not None:
@@ -137,7 +136,7 @@ def test_evaluation_helpers():
     dataloader = create_dataloader()
     # cfg_path = 'panoptic_perception/configs/models/yolop.cfg'
     # model = YOLOP(cfg_path)
-    cfg_path = 'panoptic_perception/configs/models/yolov8-detection.cfg'
+    cfg_path = 'panoptic_perception/configs/models/yolov8-detection-anchorFree.cfg'
     model = YOLOv8P(cfg_path)
     model.eval()
 
@@ -162,25 +161,37 @@ def test_evaluation_helpers():
     detection_preds = outputs.detection_predictions
     batch_size = batch["images"].shape[0]
 
-    # Concatenate predictions from all detection layers
-    all_predictions = []
-    for layer_pred in detection_preds:
-        # Reshape: (B, num_anchors, H, W, 5+C) -> (B, num_anchors*H*W, 5+C)
-        b, na, h, w, nc = layer_pred.shape
-        layer_pred_flat = layer_pred.view(b, na * h * w, nc)
-        all_predictions.append(layer_pred_flat)
+    if isinstance(detection_preds, torch.Tensor):
+        
+        print(f"  Detection predictions shape: {detection_preds.shape}")
+        
+        nms_results = DetectionHelper.non_max_suppression_v8(
+            detection_preds,
+            conf_threshold=0.25,
+            iou_threshold=0.45,
+            max_detections=100            
+        )
+    
+    else:
+        # Concatenate predictions from all detection layers
+        all_predictions = []
+        for layer_pred in detection_preds:
+            # Reshape: (B, num_anchors, H, W, 5+C) -> (B, num_anchors*H*W, 5+C)
+            b, na, h, w, nc = layer_pred.shape
+            layer_pred_flat = layer_pred.view(b, na * h * w, nc)
+            all_predictions.append(layer_pred_flat)
 
-    # Concatenate all layers: (B, total_boxes, 5+C)
-    concatenated_preds = torch.cat(all_predictions, dim=1)
+        # Concatenate all layers: (B, total_boxes, 5+C)
+        concatenated_preds = torch.cat(all_predictions, dim=1)
 
-    print(f"  Detection predictions shape: {concatenated_preds.shape}")
+        print(f"  Detection predictions shape: {concatenated_preds.shape}")
 
-    nms_results = DetectionHelper.non_max_suppression(
-        concatenated_preds,
-        conf_threshold=0.25,
-        iou_threshold=0.45,
-        max_detections=100
-    )
+        nms_results = DetectionHelper.non_max_suppression(
+            concatenated_preds,
+            conf_threshold=0.25,
+            iou_threshold=0.45,
+            max_detections=100
+        )
 
     print(f"✓ NMS completed")
     print(f"  Input batch size: {batch_size}")

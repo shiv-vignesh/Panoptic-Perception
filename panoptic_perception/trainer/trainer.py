@@ -13,6 +13,7 @@ import numpy as np
 
 from panoptic_perception.dataset.bdd100k_dataset import BDD100KDataset, BDDPreprocessor
 
+import gc
 
 class ModelEMA:
     """
@@ -658,8 +659,7 @@ class Trainer:
             self.logger.log_message('Using EMA weights for evaluation')
 
         self.model.eval()
-        import gc
-
+        
         # Collect detection predictions (smaller memory footprint)
         # all_detections = []
         # all_detection_targets = []
@@ -678,6 +678,10 @@ class Trainer:
         total_drivable_loss = 0.0
         total_lane_loss = 0.0
         global_image_idx = 0
+
+        conf_threshold=0.001,
+        iou_threshold=0.45,
+        max_detections=500
 
         self.logger.log_line()
         self.logger.log_message(f'Evaluating Epoch {self.cur_epoch}')
@@ -718,24 +722,33 @@ class Trainer:
                 if outputs.detection_predictions is not None:
                     detection_preds = outputs.detection_predictions
                     batch_size, _, image_h, image_w = data_items["images"].shape
+                    
+                    if isinstance(detection_preds, torch.Tensor):
+                        # yolov8 anchor-free postProcess
+                        nms_results = DetectionHelper.non_max_suppression_v8(
+                            detection_preds, 
+                            conf_threshold=conf_threshold,
+                            iou_threshold=iou_threshold,
+                            max_detections=max_detections                            
+                        )
 
-                    # Concatenate predictions from all detection layers
-                    batch_predictions = []
-                    for layer_pred in detection_preds:
-                        b, na, h, w, nc = layer_pred.shape
-                        layer_pred_flat = layer_pred.view(b, na * h * w, nc)
-                        batch_predictions.append(layer_pred_flat)
+                    else:
+                        # Concatenate predictions from all detection layers
+                        batch_predictions = []
+                        for layer_pred in detection_preds:
+                            b, na, h, w, nc = layer_pred.shape
+                            layer_pred_flat = layer_pred.view(b, na * h * w, nc)
+                            batch_predictions.append(layer_pred_flat)
 
-                    concatenated_preds = torch.cat(batch_predictions, dim=1)
+                        concatenated_preds = torch.cat(batch_predictions, dim=1)
 
-                    # Apply NMS
-                    nms_results = DetectionHelper.non_max_suppression(
-                        concatenated_preds,
-                        # conf_threshold=0.25,
-                        conf_threshold=0.001,
-                        iou_threshold=0.45,
-                        max_detections=500
-                    )
+                        # Apply NMS
+                        nms_results = DetectionHelper.non_max_suppression(
+                            concatenated_preds,
+                            conf_threshold=conf_threshold,
+                            iou_threshold=iou_threshold,
+                            max_detections=max_detections
+                        )
                     
                     image_paths = data_items.get("image_paths", [])
 

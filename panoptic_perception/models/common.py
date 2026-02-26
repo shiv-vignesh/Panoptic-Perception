@@ -3,6 +3,7 @@ import torch.nn as nn
 import torchvision.ops as ops
 
 from typing import List, Tuple
+from functools import lru_cache
 
 class ConvBlock(nn.Module):
     def __init__(self, in_channels:int, out_channels:int, kernel_size:int=1, stride:int=1, padding:int=None, 
@@ -302,3 +303,149 @@ class SPPF(nn.Module):
         y = torch.cat([y1, y2, y3, y4], dim=1)        
 
         return self.conv2(y)
+    
+class DetectV8(nn.Module):
+    def __init__(self, num_classes:int, in_channels:List[int], reg_max:int=16):
+        super(DetectV8, self).__init__()
+        
+        self.num_classes = num_classes
+        self.num_layers = len(in_channels)
+        
+        self.bbox_branch = nn.ModuleList()
+        self.cls_branch = nn.ModuleList()
+        
+        for i, in_ch in enumerate(in_channels):
+            c2 = max(reg_max, in_ch // 4, reg_max * 4)
+            c3 = max(in_ch, min(self.num_classes, 100))
+            
+            bbox_block = nn.Sequential(
+                ConvBlock(in_channels=in_ch, out_channels=c2, 
+                        kernel_size=3, stride=1, padding=1,
+                        activation=True, activation_func="silu"),
+                ConvBlock(in_channels=c2, out_channels=c2, 
+                        kernel_size=3, stride=1, padding=1,
+                        activation=True, activation_func="silu"),
+                nn.Conv2d(in_channels=c2, out_channels=reg_max*4, 
+                          kernel_size=1, stride=1, padding=0)
+            )
+            
+            cls_block = nn.Sequential(
+                ConvBlock(in_channels=in_ch, out_channels=c3,
+                        kernel_size=3, stride=1, padding=1,
+                        activation=True, activation_func="silu"),
+                ConvBlock(in_channels=c3, out_channels=c3,
+                        kernel_size=3, stride=1, padding=1,
+                        activation=True, activation_func="silu"),
+                nn.Conv2d(in_channels=c3, out_channels=self.num_classes, 
+                        kernel_size=1, stride=1, padding=0)
+            )
+            
+            self.bbox_branch.append(bbox_block)
+            self.cls_branch.append(cls_block)
+            
+    @lru_cache(maxsize=128)
+    def compute_anchors(self, h:int, w:int, stride:int):
+        
+        #create meshgrid
+        y, x = torch.meshgrid(
+            torch.arange(h),
+            torch.arange(w),
+            indexing='ij'
+        )
+        
+        #stack into (H*W, 2)
+        grid = torch.stack((x, y), dim=-1).reshape(-1, 2).float()
+
+        #Convert to pixel center coordinates
+        anchor_tensor = (grid + 0.5) * stride
+        stride_tensor = torch.full((h*w, 1), stride)
+
+        return anchor_tensor, stride_tensor
+
+    def forward(self, x:List[torch.Tensor], image_size:Tuple[int, int]):
+
+        bbox_outputs = []
+        cls_outputs = []
+        anchor_points = []
+        strides = []
+
+        for i in range(self.num_layers):
+            bs, _, ny, nx = x[i].shape
+            bbox_output = self.bbox_branch[i](x[i])
+            cls_output = self.cls_branch[i](x[i])            
+
+            stride = image_size[0] // x[i].shape[2]
+            anchor_tensor, stride_tensor = self.compute_anchors(
+                ny, nx, stride
+            )
+
+            bs, _, gy, gx = bbox_output.shape
+            bs, _, gy, gx = cls_output.shape
+
+            bbox_outputs.append(bbox_output.view(bs, gy*gx, -1))
+            cls_outputs.append(cls_output.view(bs, gy*gx, -1))
+            anchor_points.append(anchor_tensor)
+            strides.append(stride_tensor)
+
+        bbox_outputs = torch.cat(bbox_outputs, dim=1)
+        cls_outputs = torch.cat(cls_outputs, dim=1)
+        anchor_points = torch.cat(anchor_points, dim=0).to(bbox_outputs.device)
+        strides = torch.cat(strides, dim=0).to(bbox_outputs.device)
+
+        return bbox_outputs, cls_outputs, anchor_points, strides
+    
+    def activation(self, bbox_logits_raw:torch.Tensor, 
+                   cls_logits_raw:torch.Tensor,
+                   anchor_points:torch.Tensor,
+                   strides:torch.Tensor, 
+                   xyxy2xywh:bool=True):
+        """
+        Decode predictions to image-space boxes (pixels).
+
+        Args:
+            bbox_logits_raw: [B, 8400, 64] raw distribution logits
+            cls_logits_raw:  [B, 8400, C]  raw class logits
+            anchor_points:   [8400, 2]     pixel coords
+            strides:         [8400, 1]
+
+        Returns:
+            [B, 8400, 4+C]  → (x, y, w, h, cls1, cls2, ...) in pixel coords        
+        
+        """
+
+        device = bbox_logits_raw.device
+
+        bs, num_dets, _ = bbox_logits_raw.shape
+        reg_max = bbox_logits_raw.shape[-1] // 4
+        
+        pred_distri_logits = bbox_logits_raw.view(bs, num_dets, 4, reg_max)
+        pred_distri = torch.softmax(pred_distri_logits, dim=-1)
+        
+        project = torch.arange(pred_distri.shape[-1], dtype=pred_distri.dtype, device=device)
+        pred_ltrb = (pred_distri * project).sum(dim=-1)
+        
+        anchor = anchor_points.unsqueeze(0)
+        stride = strides.unsqueeze(0)
+        
+        x1 = anchor[..., 0] - pred_ltrb[..., 0] * stride.squeeze(-1)
+        y1 = anchor[..., 1] - pred_ltrb[..., 1] * stride.squeeze(-1)
+        x2 = anchor[..., 0] + pred_ltrb[..., 2] * stride.squeeze(-1)
+        y2 = anchor[..., 1] + pred_ltrb[..., 3] * stride.squeeze(-1)
+        
+        cls_scores = cls_logits_raw.sigmoid()
+        
+        if xyxy2xywh:
+            # xyxy → xywh (pixel coords, matching Detect.activation output format)
+            w = x2 - x1
+            h = y2 - y1
+            cx = x1 + w / 2
+            cy = y1 + h / 2
+
+            # Concat: [B, 8400, 4+C] → (cx, cy, w, h, cls1, cls2, ...)
+            return torch.cat([cx.unsqueeze(-1), cy.unsqueeze(-1),
+                            w.unsqueeze(-1), h.unsqueeze(-1),
+                            cls_scores], dim=-1)
+
+        return torch.cat([x1.unsqueeze(-1), y1.unsqueeze(-1),
+                          x2.unsqueeze(-1), y2.unsqueeze(-1),
+                          cls_scores], dim=-1)
