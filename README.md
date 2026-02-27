@@ -32,22 +32,17 @@ A PyTorch implementation of multi-task panoptic perception for autonomous drivin
 
 ## Results
 
-### Best Performing Model: YOLOP (Detection + Drivable Segmentation)
-
-**Model:** `yolo-detection-drivable-unet.cfg` @ 640×640
-**Checkpoint:** `yolop-detection-drivable-unet-5060Ti/best_model.pt` (Epoch 20)
-
 ### Object Detection (BDD100K Validation Set)
 
-| Class | AP@0.5 |
-|-------|--------|
-| Person | 0.501 |
-| Rider | 0.318 |
-| Vehicles | 0.713 |
-| Motor | 0.395 |
-| Traffic Light | 0.678 |
-| Traffic Sign | 0.568 |
-| **mAP@0.5** | **0.529** |
+| Class | YOLOv8P AP@0.5 | YOLOP AP@0.5 |
+|-------|:--------------:|:------------:|
+| Person | 0.771 | 0.733 |
+| Rider | 0.540 | 0.499 |
+| Vehicles | 0.912 | 0.899 |
+| Motor | 0.625 | 0.564 |
+| Traffic Light | 0.863 | 0.850 |
+| Traffic Sign | 0.796 | 0.775 |
+| **mAP@0.5** | **0.751** | **0.720** |
 
 ### Drivable Area Segmentation
 
@@ -57,8 +52,6 @@ A PyTorch implementation of multi-task panoptic perception for autonomous drivin
 | mDice | **0.955** |
 | IoU (Background) | 0.982 |
 | IoU (Drivable) | 0.851 |
-
-> **Note:** YOLOv8P experiments are in progress and will be added once results stabilize.
 
 ## Architectures
 
