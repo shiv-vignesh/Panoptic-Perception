@@ -196,7 +196,11 @@ class BDDPreprocessor:
                         bboxes.append([box["x1"], box["y1"], box["x2"], box["y2"]])
                         class_labels.append(label_id)
 
-        return bboxes, class_labels
+        attributes = data.get("attributes", None)
+        if attributes is not None:
+            assert type(attributes) == dict, f'Expected Attributes to be a dict, got: {type(attributes)}'
+
+        return bboxes, class_labels, attributes
                 
     def prepare_targets_2d(self, boxes, labels):
         if len(boxes) == 0:
@@ -347,15 +351,19 @@ class BDDPreprocessor:
         batch_segmentation_masks = []
         batch_drivable_masks = []
         batch_image_paths = []
+        batch_scene_attributes = []
         
         for batch_idx, batch_items in enumerate(batch):
             image = batch_items['image']
             image_path = batch_items["image_path"]
+            scene_attributes = batch_items["scene_attributes"]
+
             assert image is not None, f"Image tensor at batch index {batch_idx} is None."
             assert image.ndim == 3, "Image tensor must have 3 dimensions (C, H, W)."
             
             batch_images.append(image)
             batch_image_paths.append(image_path)
+            batch_scene_attributes.append(scene_attributes)
             
             if batch_items['detection_targets'] is not None and batch_items['detection_targets'].shape[0] > 0:
                 nt = batch_items['detection_targets'].shape[0]
@@ -393,7 +401,8 @@ class BDDPreprocessor:
             "detections": batch_targets_tensor,
             "segmentation_masks": batch_segmentation_masks_tensor,
             "drivable_area_seg": batch_drivable_masks_tensor,
-            "image_paths":batch_image_paths
+            "image_paths":batch_image_paths,
+            "scene_attributes":batch_scene_attributes
         }
     
     def prepare_inference(self, image_path=None):
@@ -479,9 +488,9 @@ class BDD100KDataset(Dataset):
         det_path = os.path.join(self.detection_annotations_dir, self.dataset_type, f"{image_id}.json")
         if self.mode != DatasetMode.INFER:
             assert os.path.exists(det_path), f"Detection path {det_path} does not exist."            
-            bboxes, class_labels = self.preprocessor.load_detection(det_path)
+            bboxes, class_labels, scene_attributes = self.preprocessor.load_detection(det_path)
 
-        return image, bboxes, class_labels, seg, drivable, image_path
+        return image, bboxes, class_labels, scene_attributes, seg, drivable, image_path
 
     def __getitem__(self, index):
         if self.mode == DatasetMode.INFER:
@@ -509,9 +518,9 @@ class BDD100KDataset(Dataset):
 
             for idx in indices:
                 if idx == index:
-                    image, bboxes, class_labels, seg, drivable, image_path = self._load_raw(idx)
+                    image, bboxes, class_labels, scene_attributes, seg, drivable, image_path = self._load_raw(idx)
                 else:
-                    image, bboxes, class_labels, seg, drivable, _ = self._load_raw(idx)
+                    image, bboxes, class_labels, scene_attributes, seg, drivable, _ = self._load_raw(idx)
                 
                 images_list.append(image)
                 class_labels_list.append(class_labels)
@@ -526,9 +535,9 @@ class BDD100KDataset(Dataset):
 
         elif use_mixup:
             # MixUp: blend 2 images
-            image1, bboxes1, class_labels1, seg1, drivable1, image_path = self._load_raw(index)
+            image1, bboxes1, class_labels1, scene_attributes, seg1, drivable1, image_path = self._load_raw(index)
             idx2 = random.randint(0, len(self) - 1)
-            image2, bboxes2, class_labels2, seg2, drivable2, _ = self._load_raw(idx2)
+            image2, bboxes2, class_labels2, _, seg2, drivable2, _ = self._load_raw(idx2)
 
             # Apply mixup
             image, labels_xywh, seg, drivable = self.preprocessor.mixup_augmentation(
@@ -546,14 +555,14 @@ class BDD100KDataset(Dataset):
 
         else:
             # Standard augmentation path
-            image, bboxes, class_labels, seg, drivable, image_path = self._load_raw(index)
+            image, bboxes, class_labels, scene_attributes, seg, drivable, image_path = self._load_raw(index)
 
             if self.perform_augmentation:
                 # Apply copy-paste for long-tail classes before other augmentations
                 #TODO, modify random -> sampling from known images containing long tail classes. 
                 if use_copy_paste:
                     source_idx = random.randint(0, len(self) - 1)
-                    source_img, source_bboxes, source_class_labels, _, _, _ = self._load_raw(source_idx)
+                    source_img, source_bboxes, source_class_labels, _, _, _, _ = self._load_raw(source_idx)
 
                     h, w = image.shape[:2]
                     if source_img.shape[:2] != image.shape[:2]:                        
@@ -579,7 +588,7 @@ class BDD100KDataset(Dataset):
                 )
 
             else:
-                image, bboxes, class_labels, seg, drivable, image_path = self._load_raw(index)
+                image, bboxes, class_labels, scene_attributes, seg, drivable, image_path = self._load_raw(index)
                 t = self.preprocessor.transformation(image=image, 
                                                     bboxes=bboxes, 
                                                     class_labels=class_labels)
@@ -603,6 +612,7 @@ class BDD100KDataset(Dataset):
             "segmentation_mask": seg_tensor,
             "drivable_mask": drivable_tensor,
             "detection_targets": targets,
-            "image_path": image_path
+            "image_path": image_path,
+            "scene_attributes": scene_attributes
         }
     

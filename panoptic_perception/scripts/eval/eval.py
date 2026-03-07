@@ -69,6 +69,63 @@ def create_dataloader(images_dir:str, detection_annotations_dir:str,
         collate_fn=BDDPreprocessor.collate_fn
     )
 
+def log_detection_ap_table(ap_results:dict, 
+                stats_per_class:dict, 
+                stats_iou_threshold):
+
+    num_classes = len(BDD100KClassesReduced)
+    
+    # Create AP table for logging with class names
+    ap_table_data = [["Class", "AP"]]
+    for cls in range(num_classes):
+        class_name = BDD100KClassesReduced(cls).name
+        ap_value = ap_results.get(f'AP_class_{cls}', 0.0)
+        ap_table_data.append([f"{cls}: {class_name}", f"{ap_value:.4f}"])
+    ap_table_data.append(["mAP@0.5", f"{ap_results['mAP']:.4f}"])
+
+    ap_table_string = AsciiTable(ap_table_data).table
+    print("\nDetection Metrics (AP@0.5):")
+    print(ap_table_string)
+    
+    #Create Stats (TP, FP, FN)
+    stats_table_data = [["Class", "total GT", f"TP", f"FP", f"FN"]]
+    for cls in range(num_classes):
+        class_name = BDD100KClassesReduced(cls).name            
+        class_stats = stats_per_class[cls]        
+
+        total_gt = class_stats.get("total_gt", 0.0)
+        true_positives = class_stats.get("true_positives", 0.0)
+        false_positives = class_stats.get("false_positives", 0.0)
+        false_negatives = class_stats.get("false_negatives", 0.0)
+        
+        stats_table_data.append([f'{cls}: {class_name}', total_gt, 
+                                true_positives, false_positives, false_negatives])
+        
+    stats_table_string = AsciiTable(stats_table_data).table
+    print(f"\nDetection Metrics @{stats_iou_threshold}:")
+    print(stats_table_string)
+
+def log_drivable_seg_confmat(drivable_confusion_matrix:torch.Tensor,
+                            num_drivable_classes:int):
+    if drivable_confusion_matrix is not None:
+        drivable_iou, drivable_dice = SegmentationUtils._compute_metrics_from_confusion_matrix(
+            drivable_confusion_matrix, num_drivable_classes
+        )
+    
+        drivable_metrics = {**drivable_iou, **drivable_dice}
+
+        # Create drivable metrics table
+        drivable_table_data = [["Metric", "Value"]]
+        drivable_table_data.append(["mIoU", f"{drivable_iou['mIoU']:.4f}"])
+        drivable_table_data.append(["mDice", f"{drivable_dice['mDice']:.4f}"])
+        for cls in range(num_drivable_classes):
+            drivable_table_data.append([f"IoU Class {cls}", f"{drivable_iou.get(f'IoU_class_{cls}', 0.0):.4f}"])
+
+        drivable_table_string = AsciiTable(drivable_table_data).table
+
+        print("\nDrivable Segmentation Metrics:")
+        print(drivable_table_string)    
+
 def initialize_eval_pipeline(model_kwargs:dict, dataset_kwargs:dict):
     
     def check_dir(path):
@@ -101,9 +158,11 @@ def initialize_eval_pipeline(model_kwargs:dict, dataset_kwargs:dict):
     return model, device, dataloader
 
 def process_detection_outputs(outputs: PanopticModelOutputs, images: torch.Tensor,
-                    target_detections: torch.Tensor, image_paths: List[str],
+                    target_detections: torch.Tensor, image_paths: List[str], 
+                    scene_attributes : List[dict], 
                     dets_by_image:defaultdict, gt_by_image:defaultdict,
-                    global_image_idx:int, output_dir: Optional[str] = None,
+                    global_image_idx:int, scene_attributes_by_image:defaultdict,
+                    output_dir: Optional[str] = None,
                     visualize: bool = True) -> int:
     """
     Process model outputs, convert to proper format, and optionally visualize.
@@ -195,6 +254,9 @@ def process_detection_outputs(outputs: PanopticModelOutputs, images: torch.Tenso
                 gt_by_image[global_image_idx] = None
         else:
             gt_by_image[global_image_idx] = None
+
+        if scene_attributes:
+            scene_attributes_by_image[global_image_idx] = scene_attributes[i]
 
         global_image_idx += 1
         # results.append((img_predictions, img_targets))
@@ -288,6 +350,8 @@ def run_eval_pipeline(model: torch.nn.Module,
                       device: torch.device,
                       output_dir: str = "eval_outputs",
                       visualize: bool = True,
+                      eval_weather_grouping:bool = True,
+                      early_stop:bool = True,
                       max_visualizations: int = 100):
     """
     Run evaluation pipeline on the dataloader.
@@ -298,6 +362,9 @@ def run_eval_pipeline(model: torch.nn.Module,
         device: Device to run on
         output_dir: Directory to save visualizations
         visualize: Whether to save visualizations
+        eval_weather_grouping : use Scene Attributes to Group & evaluate Weather X TimeOfDay 
+        early_stop : For Debugging purpose, stop inference after 5% of inference
+        
         max_visualizations: Maximum number of images to visualize (to avoid too many files)
     """
     val_iter = tqdm(dataloader, desc='Running Validation')
@@ -306,7 +373,9 @@ def run_eval_pipeline(model: torch.nn.Module,
     all_results = []
     vis_count = 0
     dets_by_image = defaultdict(None) #image_id -> (num_dets, 6)
-    gt_by_image = defaultdict(None) #image_id -> (num_gt, 5)    
+    gt_by_image = defaultdict(None) #image_id -> (num_gt, 5)
+    scene_attributes_by_image = defaultdict(None) #image_id -> {}
+    
     global_image_idx = 0
     drivable_confusion_matrix = None
     num_drivable_classes = 2
@@ -337,9 +406,11 @@ def run_eval_pipeline(model: torch.nn.Module,
             images=data_items["images"],
             target_detections=data_items.get("detections"),
             image_paths=data_items.get("image_paths", []),
+            scene_attributes=data_items.get("scene_attributes", []),
             dets_by_image=dets_by_image,
             gt_by_image=gt_by_image,
             global_image_idx=global_image_idx,
+            scene_attributes_by_image=scene_attributes_by_image,
             output_dir=f"{output_dir}/detections",
             visualize=should_visualize
         )
@@ -364,7 +435,7 @@ def run_eval_pipeline(model: torch.nn.Module,
         if should_visualize:
             vis_count = global_image_idx
         
-        if batch_idx > 5:
+        if early_stop and batch_idx > int(len(dataloader) * 0.05):
             break
 
     print(f"\nEvaluation complete. Processed {global_image_idx} images.")
@@ -385,62 +456,58 @@ def run_eval_pipeline(model: torch.nn.Module,
 
     detection_metrics = ap_results
 
-    # Create AP table for logging with class names
-    ap_table_data = [["Class", "AP"]]
-    for cls in range(num_classes):
-        class_name = BDD100KClassesReduced(cls).name
-        ap_value = ap_results.get(f'AP_class_{cls}', 0.0)
-        ap_table_data.append([f"{cls}: {class_name}", f"{ap_value:.4f}"])
-    ap_table_data.append(["mAP@0.5", f"{ap_results['mAP']:.4f}"])
-
-    ap_table_string = AsciiTable(ap_table_data).table
-    print("\nDetection Metrics (AP@0.5):")
-    print(ap_table_string)
+    print("\n" + "=" * 70)
+    print(f"OVERALL DETECTION METRICS  ({dataloader.dataset.dataset_type})")
+    print("\n" + "=" * 70)
     
-    #Create Stats (TP, FP, FN)
-    stats_table_data = [["Class", "total GT", f"TP", f"FP", f"FN"]]
-    for cls in range(num_classes):
-        class_name = BDD100KClassesReduced(cls).name            
-        class_stats = stats_per_class[cls]        
+    log_detection_ap_table(ap_results=ap_results,
+                stats_per_class=stats_per_class,
+                stats_iou_threshold=stats_iou_threshold)
 
-        total_gt = class_stats.get("total_gt", 0.0)
-        true_positives = class_stats.get("true_positives", 0.0)
-        false_positives = class_stats.get("false_positives", 0.0)
-        false_negatives = class_stats.get("false_negatives", 0.0)
-        
-        stats_table_data.append([f'{cls}: {class_name}', total_gt, 
-                                true_positives, false_positives, false_negatives])
-        
-    stats_table_string = AsciiTable(stats_table_data).table
-    print(f"\nDetection Metrics @{stats_iou_threshold}:")
-    print(stats_table_string)
     
     if drivable_confusion_matrix is not None:
-        drivable_iou, drivable_dice = SegmentationUtils._compute_metrics_from_confusion_matrix(
-            drivable_confusion_matrix, num_drivable_classes
-        )
+        log_drivable_seg_confmat(drivable_confusion_matrix=drivable_confusion_matrix, 
+                                num_drivable_classes=num_drivable_classes)
     
-        drivable_metrics = {**drivable_iou, **drivable_dice}
+    if eval_weather_grouping:
 
-        # Create drivable metrics table
-        drivable_table_data = [["Metric", "Value"]]
-        drivable_table_data.append(["mIoU", f"{drivable_iou['mIoU']:.4f}"])
-        drivable_table_data.append(["mDice", f"{drivable_dice['mDice']:.4f}"])
-        for cls in range(num_drivable_classes):
-            drivable_table_data.append([f"IoU Class {cls}", f"{drivable_iou.get(f'IoU_class_{cls}', 0.0):.4f}"])
+        groups = defaultdict(list)
+        for idx, attrs in scene_attributes_by_image.items():
+            if attrs is not None:
+                key = (attrs["weather"], attrs["timeofday"])
+                groups[key].append(idx)
 
-        drivable_table_string = AsciiTable(drivable_table_data).table
+        for conditions, image_indices in groups.items():
+            group_dets = {i:dets_by_image[i] for i, idx in enumerate(image_indices) if idx in dets_by_image}
+            group_gts = {i:gt_by_image[i] for i, idx in enumerate(image_indices) if idx in gt_by_image}
+            
+            ap_results, stats_per_class = DetectionMetrics.compute_stats(
+                group_dets,
+                group_gts,
+                iou_threshold=stats_iou_threshold,
+                num_classes=num_classes
+            )
+            
+            print("\n" + "=" * 70)
+            weather, timeofday = conditions
+            print(f"Weather={weather} x TimeOfDay={timeofday} -  DETECTION METRICS  ({dataloader.dataset.dataset_type})")
+            print("\n" + "=" * 70)
+            
+            log_detection_ap_table(ap_results=ap_results,
+                        stats_per_class=stats_per_class,
+                        stats_iou_threshold=stats_iou_threshold)
 
-        print("\nDrivable Segmentation Metrics:")
-        print(drivable_table_string)
-    
 if __name__ == "__main__":
 
     model_kwargs = {
         "model_type":"yolop",
-        "cfg_path": "panoptic_perception/configs/models/yolo-detection.cfg",
+        # "cfg_path": "panoptic_perception/configs/models/yolo-detection.cfg",
+        # "cfg_path": "panoptic_perception/configs/models/yolo-768-1280-detection.cfg",  
+        "cfg_path": "panoptic_perception/configs/models/yolov8-768-1280-detection.cfg",                
         "device": "cuda:0",
-        "model_path": "checkpoints/yolop-checkpoints/yolop-detection-640x640/best_model.pt"
+        # "model_path": "checkpoints/yolop-checkpoints/yolop-detection-640x640/best_model.pt"
+        # "model_path": "checkpoints/yolop-checkpoints/yolop-detection-768x1280-new-anchors/best_model.pt"
+        "model_path": "checkpoints/yolov8p-checkpoints/yolov8p-768x1280-detection/best_model.pt"        
     }
 
     dataset_kwargs = {
@@ -451,7 +518,7 @@ if __name__ == "__main__":
         "dataset_type": "val",
         "batch_size": 4,
         "preprocessor_kwargs": {
-            "image_resize": [640, 640],
+            "image_resize": [768, 1280],
             "original_image_size": [720, 1280]
         }        
     }
@@ -467,5 +534,7 @@ if __name__ == "__main__":
         device=device,
         output_dir="eval_outputs-detections-1",
         visualize=True,
+        eval_weather_grouping=True,
+        early_stop=False,
         max_visualizations=50  # Limit to 50 images to avoid too many files
     )

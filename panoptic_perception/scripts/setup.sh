@@ -1,7 +1,7 @@
 #!/bin/bash
 set -e
 
-WORKSPACE="/workspace"
+WORKSPACE="/workspace" #change to your project root
 DATA_DIR="${WORKSPACE}/data"
 
 IMAGES_URL="http://128.32.162.150/bdd100k/bdd100k_images_100k.zip"
