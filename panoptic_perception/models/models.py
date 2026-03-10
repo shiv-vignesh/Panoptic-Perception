@@ -8,6 +8,7 @@ from panoptic_perception.models.common import (
     ConvBlock, Focus, BottleneckCSP, SPP, Upsample, Detect, C2F, SPPF, DetectV8
 )
 from panoptic_perception.models.utils import parse_model_config, initialize_weights, PanopticModelOutputs
+from panoptic_perception.models.gdip import GDIP, MultiLevelGDIP, build_vision_encoder
 from panoptic_perception.utils.detection_utils import DetectionLossCalculator
 from panoptic_perception.utils.segmentation_utils import SegmentationLossCalculator
 
@@ -160,6 +161,7 @@ class YOLOP(nn.Module):
 
         module_defs = parse_model_config(cfg)
 
+        #TODO, unused vars: remove
         self.img_size = img_size
         self.num_classes = num_classes
 
@@ -339,7 +341,7 @@ class YOLOv8P(nn.Module):
             lane_segmentation_head_idx=self.lane_segmentation_head_idx
         )
         
-        self.anchor_free = False        
+        self.anchor_free = False
         if "DetectV8" in self.module_names:
             self.anchor_free = True
 
@@ -455,8 +457,7 @@ class YOLOv8P(nn.Module):
                         targets["detections"],
                         image_size=(height, width)
                     )
-                    print(det_loss_items)
-                    exit(1)
+
                 else:
                     det_loss, det_loss_items = DetectionLossCalculator.compute_detection_loss_2(
                         model_outputs.detection_logits,
@@ -495,6 +496,65 @@ class YOLOv8P(nn.Module):
                 # print(f'Lane Segmentation Loss: {lane_seg_loss}')
 
         return model_outputs
+
+class GDIPYolo(nn.Module):
+    def __init__(self, model_type:str, yolo_cfg:str, gdip_kwargs:dict, loss_weights:dict = None):
+        super(GDIPYolo, self).__init__()
+        
+        self.model_type = model_type        
+        if model_type == "yolop":
+            self.model = YOLOP(yolo_cfg, loss_weights)
+        elif model_type == "yolov8p":
+            self.model = YOLOv8P(yolo_cfg, loss_weights)
+
+        self.gdip_mode = gdip_kwargs["mode"]
+        
+        assert "encoder" in gdip_kwargs and bool(gdip_kwargs["encoder"]), f'Invalid Vision Encoder Kwargs: {gdip_kwargs["encoder"]}'
+        
+        vision_encoder_kwargs = gdip_kwargs["encoder"]
+        if self.gdip_mode == "gdip":            
+            self.vision_encoder = build_vision_encoder({
+                "type":vision_encoder_kwargs["type"],
+                "latent_dim":vision_encoder_kwargs.get("latent_dim", 256),
+                "pretrained":vision_encoder_kwargs.get("pretrained", True)
+            })
+
+            self.gdip_module = GDIP(
+                vision_encoder_kwargs.get("latent_dim", 256)
+            )
+        
+        elif self.gdip_mode == "mgdip":
+            assert bool(gdip_kwargs["encoder"]["tap_layers"]), f"For GDIP Mode: {self.gdip_mode} -- Tap Layers must not be empty: {len(gdip_kwargs['encoder']['tap_layers'])}"
+            self.tap_layers = gdip_kwargs["encoder"]["tap_layers"]
+            self.vision_encoder = build_vision_encoder({
+                "type":vision_encoder_kwargs["type"],
+                "latent_dim":vision_encoder_kwargs.get("latent_dim", 256),
+                "pretrained":vision_encoder_kwargs.get("pretrained", True),
+                "tap_layers":gdip_kwargs["encoder"]["tap_layers"]
+            })
+            
+            self.gdip_module = MultiLevelGDIP(
+                num_gdip_blocks=len(self.tap_layers),
+                latent_dim=vision_encoder_kwargs.get("latent_dim", 256)
+            )
+            
+        self.vis_intermediate = gdip_kwargs.get("visualize_intermediate", True)
+            
+    def forward(self, x:torch.Tensor, targets=None):
+        
+        if self.gdip_mode == "gdip":
+            latent = self.vision_encoder(x)
+            enhanced_image, gates = self.gdip_module(x, latent)
+            
+            #TODO, plot enhanced image (wandb)
+            
+        elif self.gdip_mode == "mgdip":
+            latent, features = self.vision_encoder(x)
+            enhanced_image, gates, intermediate_images = self.gdip_module(x, features, self.vis_intermediate)
+        
+            #TODO, plot intermediate_images images (wandb)
+
+        return self.model(enhanced_image, targets)
     
 def get_model_param_groups(model:Optional[Union[YOLOP, YOLOv8P]], groups:dict, dcn_lr_mult:float=0.1):
     """
