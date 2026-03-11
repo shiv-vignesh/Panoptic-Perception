@@ -99,7 +99,7 @@ class ModelEMA:
 
 from panoptic_perception.dataset.enums import BDD100KClassesReduced
 
-from panoptic_perception.models.models import YOLOP, YOLOv8P, get_model_param_groups
+from panoptic_perception.models.models import YOLOP, YOLOv8P, GDIPYolo, get_model_param_groups
 from panoptic_perception.models.utils import PanopticModelOutputs, WeightsManager
 
 from panoptic_perception.utils.logger import Logger
@@ -113,7 +113,7 @@ CLASS_NAMES = [cls.name for cls in BDD100KClassesReduced]
 
 class Trainer:
     
-    def __init__(self, model:Optional[Union[YOLOP, YOLOv8P]], device:torch.device,
+    def __init__(self, model:Optional[Union[YOLOP, YOLOv8P, GDIPYolo]], device:torch.device,
                  dataset_kwargs:dict, 
                  optimizer_kwargs:dict, lr_scheduler_kwargs:dict,
                  trainer_kwargs:dict):
@@ -266,32 +266,80 @@ class Trainer:
         
         self.groups = optimizer_kwargs.get("groups", {})
         self.dcn_lr_mult = optimizer_kwargs.get("dcn_lr_mult", 0.1)  # DCN offset LR = base_lr * 0.1
-
-        if not self.groups:
-            # No custom groups: train full model
-            param_groups = list(self.model.parameters())
-            self.logger.log_message('Full model training (all layers trainable)')
-            self.logger.log_new_line()
-        else:
-            # Custom groups: get param groups with DCN-aware differential LR
-            param_groups = get_model_param_groups(self.model, self.groups, self.dcn_lr_mult)
-            self.logger.log_message('Training with specified groups:')
-            for group_name in self.groups:
-                group_info = self.groups[group_name]
-                self.logger.log_message(
-                    f'  Group name: {group_name} - '
-                    f'trainable: {group_info["trainable"]} - '
-                    f'layer start/end: {group_info["group"]}'
-                )
-            # Log DCN-specific param groups
-            for pg in param_groups:
-                if pg.get("name", "").startswith("dcn"):
+        
+        if isinstance(self.model, GDIPYolo):
+            if not self.groups:
+                # No custom groups: train all task_network layers
+                param_groups = [{"params": list(self.model.task_network.parameters()), "name": "task_network", "lr_scale": 1.0}]
+                self.logger.log_message('Full task_network training (all layers trainable)')
+                self.logger.log_new_line()
+            else:
+                # Custom groups: get param groups with DCN-aware differential LR
+                param_groups = get_model_param_groups(self.model.task_network, self.groups, self.dcn_lr_mult)
+                self.logger.log_message('Training with specified groups:')
+                for group_name in self.groups:
+                    group_info = self.groups[group_name]
                     self.logger.log_message(
-                        f'  DCN Group: {pg["name"]} - '
-                        f'params: {len(pg["params"])} - '
-                        f'lr_scale: {pg["lr_scale"]}'
+                        f'  Group name: {group_name} - '
+                        f'trainable: {group_info["trainable"]} - '
+                        f'layer start/end: {group_info["group"]}'
                     )
-            self.logger.log_new_line()
+                # Log DCN-specific param groups
+                for pg in param_groups:
+                    if pg.get("name", "").startswith("dcn"):
+                        self.logger.log_message(
+                            f'  DCN Group: {pg["name"]} - '
+                            f'params: {len(pg["params"])} - '
+                            f'lr_scale: {pg["lr_scale"]}'
+                        )
+                self.logger.log_new_line()
+
+            gdip_groups = optimizer_kwargs.get("gdip_groups", {})
+            if not gdip_groups:
+                # Default: train both GDIP components with lr_scale=1.0
+                param_groups.append({"params": list(self.model.vision_encoder.parameters()), "name": "vision_encoder", "lr_scale": 1.0})
+                param_groups.append({"params": list(self.model.gdip_module.parameters()), "name": "gdip_module", "lr_scale": 1.0})
+            else:
+                for component_name, cfg in gdip_groups.items():
+                    component = getattr(self.model, component_name)
+                    trainable = cfg["trainable"]
+
+                    for p in component.parameters():
+                        p.requires_grad = trainable
+
+                    if trainable:
+                        param_groups.append({
+                            "params": list(component.parameters()),
+                            "name": component_name,
+                            "lr_scale": cfg.get("lr_scale", 1.0)
+                        })
+            
+        elif isinstance(self.model, YOLOP) or isinstance(self.model, YOLOv8P):            
+            if not self.groups:
+                # No custom groups: train full model
+                param_groups = list(self.model.parameters())
+                self.logger.log_message('Full model training (all layers trainable)')
+                self.logger.log_new_line()
+            else:
+                # Custom groups: get param groups with DCN-aware differential LR
+                param_groups = get_model_param_groups(self.model, self.groups, self.dcn_lr_mult)
+                self.logger.log_message('Training with specified groups:')
+                for group_name in self.groups:
+                    group_info = self.groups[group_name]
+                    self.logger.log_message(
+                        f'  Group name: {group_name} - '
+                        f'trainable: {group_info["trainable"]} - '
+                        f'layer start/end: {group_info["group"]}'
+                    )
+                # Log DCN-specific param groups
+                for pg in param_groups:
+                    if pg.get("name", "").startswith("dcn"):
+                        self.logger.log_message(
+                            f'  DCN Group: {pg["name"]} - '
+                            f'params: {len(pg["params"])} - '
+                            f'lr_scale: {pg["lr_scale"]}'
+                        )
+                self.logger.log_new_line()
 
         if optimizer_kwargs["_type"] == "SGD":
             self.lr0 = optimizer_kwargs.get("initial_lr", 3e-5)
@@ -396,15 +444,21 @@ class Trainer:
         
         tasks = []
         
-        if self.model.detection_head_idx != -1:
-            tasks.append("Detection, ")
-        
-        if self.model.segmentation_head_idx != -1:
-            tasks.append("Drivable Segmentation, ")
-            
-        if self.model.lane_segmentation_head_idx != -1:
-            tasks.append("Lane Segmentation")
-            
+        if isinstance(self.model, YOLOP) or isinstance(self.model, YOLOv8P):        
+            if self.model.detection_head_idx != -1:
+                tasks.append("Detection, ")
+            if self.model.segmentation_head_idx != -1:
+                tasks.append("Drivable Segmentation, ")
+            if self.model.lane_segmentation_head_idx != -1:
+                tasks.append("Lane Segmentation")
+        elif isinstance(self.model, GDIPYolo):
+            if self.model.task_network.detection_head_idx != -1:
+                tasks.append("Detection, ")
+            if self.model.task_network.segmentation_head_idx != -1:
+                tasks.append("Drivable Segmentation, ")
+            if self.model.task_network.lane_segmentation_head_idx != -1:
+                tasks.append("Lane Segmentation")            
+
         tasks = 'Tasks: '.join(tasks)
         
         self.logger.log_message(
@@ -493,9 +547,20 @@ class Trainer:
         train_iter = tqdm(self.train_dataloader, desc=f'Training Epoch: {self.cur_epoch}')
         for batch_idx, data_items in enumerate(train_iter):
             
-            step_begin_time = time.time()            
+            step_begin_time = time.time()
             loss, model_outputs = self.train_one_step(data_items)
             step_end_time = time.time()
+
+            # Log GDIP enhanced images periodically
+            if isinstance(self.model, GDIPYolo) and (batch_idx + 1) % 500 == 0:
+                if self.model.enhanced_image is not None:
+                    enhanced_imgs = (self.model.enhanced_image.clamp(0, 1) * 255).to(torch.uint8)
+                    self.wandb_logger.log_images(
+                        "train/enhanced_images",
+                        enhanced_imgs,
+                        step=self.cur_epoch * self.total_train_batch + batch_idx
+                    )
+                    self.model.enhanced_image = None
 
             if ((batch_idx + 1) % self.gradient_accumulation_steps == 0) or (batch_idx == self.train_dataloader.__len__() - 1):
 
@@ -704,6 +769,17 @@ class Trainer:
                         "detections": data_items["detections"]
                     }
                 )
+
+                # Log GDIP enhanced images for first val batch each epoch
+                if isinstance(self.model, GDIPYolo) and batch_idx == 0:
+                    if self.model.enhanced_image is not None:
+                        enhanced_imgs = (self.model.enhanced_image.clamp(0, 1) * 255).to(torch.uint8)
+                        self.wandb_logger.log_images(
+                            "val/enhanced_images",
+                            enhanced_imgs,
+                            step=self.cur_epoch
+                        )
+                        self.model.enhanced_image = None
 
                 # Accumulate losses
                 if outputs.detection_loss is not None:

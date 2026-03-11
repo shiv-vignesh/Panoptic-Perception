@@ -36,9 +36,9 @@ class WandBLogger:
                     tags=tags,
                     reinit=True
                 )
-                print(f" WandB initialized: {project_name}/{run_name}")
+                print(f"WandB initialized: {project_name}/{run_name}")
             except Exception as e:
-                print(f"� WandB initialization failed: {e}")
+                print(f"WandB initialization failed: {e}")
                 print(f"  Continuing without WandB logging")
                 self.enabled = False
 
@@ -57,7 +57,7 @@ class WandBLogger:
         try:
             wandb.log(metrics, step=step, commit=commit)
         except Exception as e:
-            print(f"� WandB logging failed: {e}")
+            print(f"WandB logging failed: {e}")
 
     def log_image(self, key: str, image, caption: Optional[str] = None, step: Optional[int] = None):
         """
@@ -75,7 +75,25 @@ class WandBLogger:
         try:
             wandb.log({key: wandb.Image(image, caption=caption)}, step=step)
         except Exception as e:
-            print(f"� WandB image logging failed: {e}")
+            print(f"WandB image logging failed: {e}")
+
+    def log_images(self, key: str, images: torch.Tensor, step: Optional[int] = None):
+        """
+        Log a batch of images to WandB.
+
+        Args:
+            key: Name/key for the images
+            images: Tensor of shape (B, C, H, W) in uint8 [0, 255]
+            step: Global step number
+        """
+        if not self.enabled:
+            return
+
+        try:
+            wandb_images = [wandb.Image(img.permute(1, 2, 0).cpu().numpy()) for img in images]
+            wandb.log({key: wandb_images}, step=step)
+        except Exception as e:
+            print(f"WandB image batch logging failed: {e}")
 
     def log_table(self, key: str, columns: list, data: list, step: Optional[int] = None):
         """
@@ -94,7 +112,7 @@ class WandBLogger:
             table = wandb.Table(columns=columns, data=data)
             wandb.log({key: table}, step=step)
         except Exception as e:
-            print(f"� WandB table logging failed: {e}")
+            print(f"WandB table logging failed: {e}")
 
     def log_histogram(self, key: str, values, step: Optional[int] = None):
         """
@@ -113,7 +131,7 @@ class WandBLogger:
                 values = values.detach().cpu().numpy()
             wandb.log({key: wandb.Histogram(values)}, step=step)
         except Exception as e:
-            print(f"� WandB histogram logging failed: {e}")
+            print(f"WandB histogram logging failed: {e}")
 
     def watch_model(self, model, log_freq: int = 100, log: str = "gradients"):
         """
@@ -149,7 +167,7 @@ class WandBLogger:
             artifact.add_file(artifact_path)
             wandb.log_artifact(artifact)
         except Exception as e:
-            print(f"� WandB artifact logging failed: {e}")
+            print(f"WandB artifact logging failed: {e}")
 
     def finish(self):
         """Finish the WandB run."""
@@ -159,4 +177,4 @@ class WandBLogger:
         try:
             wandb.finish()
         except Exception as e:
-            print(f"� WandB finish failed: {e}")
+            print(f"WandB finish failed: {e}")

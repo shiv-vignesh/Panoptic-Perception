@@ -498,16 +498,14 @@ class YOLOv8P(nn.Module):
         return model_outputs
 
 class GDIPYolo(nn.Module):
-    def __init__(self, model_type:str, yolo_cfg:str, gdip_kwargs:dict, loss_weights:dict = None):
+    def __init__(self, task_network:Union[YOLOP, YOLOv8P], gdip_kwargs:dict):
         super(GDIPYolo, self).__init__()
-        
-        self.model_type = model_type        
-        if model_type == "yolop":
-            self.model = YOLOP(yolo_cfg, loss_weights)
-        elif model_type == "yolov8p":
-            self.model = YOLOv8P(yolo_cfg, loss_weights)
 
+        self.task_network = task_network
         self.gdip_mode = gdip_kwargs["mode"]
+
+        self.enhanced_image = None
+        self.intermediate_images = None
         
         assert "encoder" in gdip_kwargs and bool(gdip_kwargs["encoder"]), f'Invalid Vision Encoder Kwargs: {gdip_kwargs["encoder"]}'
         
@@ -540,21 +538,24 @@ class GDIPYolo(nn.Module):
             
         self.vis_intermediate = gdip_kwargs.get("visualize_intermediate", True)
             
-    def forward(self, x:torch.Tensor, targets=None):
+    def forward(self, x:torch.Tensor, targets=None, store_enhanced_image:bool = True):
         
         if self.gdip_mode == "gdip":
             latent = self.vision_encoder(x)
             enhanced_image, gates = self.gdip_module(x, latent)
-            
-            #TODO, plot enhanced image (wandb)
+
+            if store_enhanced_image:
+                self.enhanced_image = enhanced_image.detach()
             
         elif self.gdip_mode == "mgdip":
             latent, features = self.vision_encoder(x)
             enhanced_image, gates, intermediate_images = self.gdip_module(x, features, self.vis_intermediate)
-        
-            #TODO, plot intermediate_images images (wandb)
 
-        return self.model(enhanced_image, targets)
+        if store_enhanced_image:
+            self.enhanced_image = enhanced_image.detach()
+            self.intermediate_images = [img.detach() for img in intermediate_images] if intermediate_images else []
+
+        return self.task_network(enhanced_image, targets)
     
 def get_model_param_groups(model:Optional[Union[YOLOP, YOLOv8P]], groups:dict, dcn_lr_mult:float=0.1):
     """

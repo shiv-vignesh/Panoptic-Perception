@@ -4,7 +4,7 @@ from torch.utils.data import DataLoader
 
 from panoptic_perception.models.gdip.gdip import GDIP, MultiLevelGDIP
 from panoptic_perception.models.gdip.vision_encoder import build_vision_encoder, TorchVisionEncoder
-from panoptic_perception.models.models import GDIPYolo
+from panoptic_perception.models.models import GDIPYolo, YOLOP, YOLOv8P
 
 # ─── Vision Encoder Tests ────────────────────────────────────────────
 
@@ -398,9 +398,9 @@ def test_gdipyolo_with_real_data():
         }
     }
     cfg_path = "panoptic_perception/configs/models/yolov8-detection-anchorFree.cfg"
+    task_network = YOLOv8P(cfg=cfg_path)
     model = GDIPYolo(
-        model_type="yolov8p",
-        yolo_cfg=cfg_path,
+        task_network=task_network,
         gdip_kwargs=gdip_kwargs
     )
     model.train()
@@ -436,7 +436,7 @@ def test_gdipyolo_with_real_data():
     gdip_has_grad = any(p.grad is not None and p.grad.abs().sum() > 0
                         for p in model.gdip_module.parameters())
     yolo_has_grad = any(p.grad is not None and p.grad.abs().sum() > 0
-                        for p in model.model.parameters())
+                        for p in model.task_network.parameters())
 
     assert encoder_has_grad, "No gradients in vision encoder"
     assert gdip_has_grad, "No gradients in GDIP module"
@@ -485,9 +485,9 @@ def test_mgdipyolo_with_real_data():
         "visualize_intermediate": False
     }
     cfg_path = "panoptic_perception/configs/models/yolov8-detection-anchorFree.cfg"
+    task_network = YOLOv8P(cfg=cfg_path)
     model = GDIPYolo(
-        model_type="yolov8p",
-        yolo_cfg=cfg_path,
+        task_network=task_network,
         gdip_kwargs=gdip_kwargs
     )
     model.train()
@@ -520,7 +520,7 @@ def test_mgdipyolo_with_real_data():
     mgdip_has_grad = any(p.grad is not None and p.grad.abs().sum() > 0
                          for p in model.gdip_module.parameters())
     yolo_has_grad = any(p.grad is not None and p.grad.abs().sum() > 0
-                        for p in model.model.parameters())
+                        for p in model.task_network.parameters())
 
     assert encoder_has_grad, "No gradients in vision encoder"
     assert mgdip_has_grad, "No gradients in MGDIP module"
@@ -571,12 +571,10 @@ def test_gdipyolo_inference_with_real_data():
             "pretrained": False
         }
     }
-    # cfg_path = "panoptic_perception/configs/models/yolov8-detection-anchorFree.cfg"
-    cfg_path = "panoptic_perception/configs/models/yolo-768-1280-detection.cfg"    
+    cfg_path = "panoptic_perception/configs/models/yolo-768-1280-detection.cfg"
+    task_network = YOLOP(cfg=cfg_path)
     model = GDIPYolo(
-        # model_type="yolov8p",
-        model_type="yolop",
-        yolo_cfg=cfg_path,
+        task_network=task_network,
         gdip_kwargs=gdip_kwargs
     )
     model.eval()

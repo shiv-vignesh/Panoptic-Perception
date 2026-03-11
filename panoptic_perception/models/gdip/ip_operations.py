@@ -114,17 +114,35 @@ class Defog(nn.Module):
         
         self.defog_linear = nn.Linear(latent_dim, 1, bias=True)
     
-    def atmospheric_light(self, x:torch.Tensor, topk:int = 1000):
-        # Per-channel: sort pixels descending, take top-k brightest, average
-        r, _ = torch.sort(x[:, 0, :, :].reshape(x.shape[0], -1), descending=True)
-        g, _ = torch.sort(x[:, 1, :, :].reshape(x.shape[0], -1), descending=True)
-        b, _ = torch.sort(x[:, 2, :, :].reshape(x.shape[0], -1), descending=True)
+    def atmospheric_light(self, x:torch.Tensor, dark:torch.Tensor=None, topk:int = 1000):
 
-        a = torch.cat([
-            r[:, :topk].mean(dim=1, keepdim=True),
-            g[:, :topk].mean(dim=1, keepdim=True),
-            b[:, :topk].mean(dim=1, keepdim=True)
-        ], dim=1).unsqueeze(2).unsqueeze(3)  # [B, 3, 1, 1]
+        if dark is not None:
+            # Dark-channel guided: find haziest pixels, sample RGB at those locations
+            dark_squeezed = dark.squeeze(1)           # [B, H, W]
+            B, H, W = dark_squeezed.shape
+            imsz = H * W
+            numpx = max(imsz // topk, 1)
+
+            dark_flat = dark_squeezed.reshape(B, imsz)
+            _, indices = dark_flat.topk(numpx, dim=1)             # [B, numpx] — top-k haziest
+
+            img_flat = x.reshape(B, 3, imsz)                      # [B, 3, H*W]
+            indices_3ch = indices.unsqueeze(1).expand(-1, 3, -1)   # [B, 3, numpx]
+            sampled = torch.gather(img_flat, 2, indices_3ch)       # [B, 3, numpx]
+
+            a = sampled.mean(dim=2).unsqueeze(2).unsqueeze(3)      # [B, 3, 1, 1]
+
+        else:
+            # Per-channel: sort pixels descending, take top-k brightest, average
+            r, _ = torch.sort(x[:, 0, :, :].reshape(x.shape[0], -1), descending=True)
+            g, _ = torch.sort(x[:, 1, :, :].reshape(x.shape[0], -1), descending=True)
+            b, _ = torch.sort(x[:, 2, :, :].reshape(x.shape[0], -1), descending=True)
+
+            a = torch.cat([
+                r[:, :topk].mean(dim=1, keepdim=True),
+                g[:, :topk].mean(dim=1, keepdim=True),
+                b[:, :topk].mean(dim=1, keepdim=True)
+            ], dim=1).unsqueeze(2).unsqueeze(3)  # [B, 3, 1, 1]
 
         return torch.maximum(a, torch.tensor(0.01, device=x.device))
 
@@ -153,9 +171,9 @@ class Defog(nn.Module):
         omega = tanh_range(omega, torch.tensor(0.1), torch.tensor(1.))
 
         #atmospheric light + dark channel
-        atmos_light = self.atmospheric_light(x)
+        dark_i = self.dark_channel(x)
+        atmos_light = self.atmospheric_light(x, dark=dark_i)
         i = x / atmos_light
-
         i = self.dark_channel(i)
         t = 1. - (omega * i)
         j = ((x - atmos_light)/(torch.maximum(t, torch.tensor(0.01)))) + atmos_light
