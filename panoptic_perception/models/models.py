@@ -555,7 +555,7 @@ class GDIPYolo(nn.Module):
 
         return self.task_network(enhanced_image, targets)
     
-def get_model_param_groups(model:Optional[Union[YOLOP, YOLOv8P]], groups:dict, dcn_lr_mult:float=0.1):
+def get_model_param_groups(model:Optional[Union[YOLOP, YOLOv8P]], groups:dict, dcn_lr_mult:float=0.1, allow_empty:bool=False):
     """
     Configure parameter groups for training with selective freezing.
 
@@ -670,7 +670,7 @@ def get_model_param_groups(model:Optional[Union[YOLOP, YOLOv8P]], groups:dict, d
     model.register_forward_pre_hook(freeze_bn_hook)
 
     # Safety: if nothing selected for training, raise
-    if len(param_groups) == 0:
+    if len(param_groups) == 0 and not allow_empty:
         raise ValueError("No trainable parameter groups selected by trainable_cfg!")
 
     return param_groups    

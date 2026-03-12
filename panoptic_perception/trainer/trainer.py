@@ -275,7 +275,7 @@ class Trainer:
                 self.logger.log_new_line()
             else:
                 # Custom groups: get param groups with DCN-aware differential LR
-                param_groups = get_model_param_groups(self.model.task_network, self.groups, self.dcn_lr_mult)
+                param_groups = get_model_param_groups(self.model.task_network, self.groups, self.dcn_lr_mult, allow_empty=True)
                 self.logger.log_message('Training with specified groups:')
                 for group_name in self.groups:
                     group_info = self.groups[group_name]
