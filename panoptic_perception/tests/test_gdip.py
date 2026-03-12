@@ -4,6 +4,9 @@ from torch.utils.data import DataLoader
 
 from panoptic_perception.models.gdip.gdip import GDIP, MultiLevelGDIP
 from panoptic_perception.models.gdip.vision_encoder import build_vision_encoder, TorchVisionEncoder
+from panoptic_perception.models.gdip.ip_operations import (
+    GateModule, WhiteBalance, GammaBalance, Sharpening, Defog, Contrast, Tone, identity
+)
 from panoptic_perception.models.models import GDIPYolo, YOLOP, YOLOv8P
 
 # ─── Vision Encoder Tests ────────────────────────────────────────────
@@ -594,6 +597,130 @@ def test_gdipyolo_inference_with_real_data():
     else:
         print(f"  Detection predictions: {len(outputs.detection_predictions)} layers")
 
+# ─── Device Consistency Tests ────────────────────────────────────────
+# These tests verify that all ip_operations modules produce outputs on
+# the same device as their inputs (no stray CPU tensors from torch.tensor()).
+# Uses CUDA if available, otherwise CPU-only validation.
+
+def _get_test_device():
+    """Return cuda device if available, else cpu."""
+    return torch.device("cuda:0") if torch.cuda.is_available() else torch.device("cpu")
+
+def _assert_device(tensor, device, name="tensor"):
+    assert tensor.device.type == device.type, \
+        f"{name} on {tensor.device}, expected {device}"
+
+def test_identity_device():
+    """identity() output stays on input device."""
+    device = _get_test_device()
+    x = torch.rand(2, 3, 32, 32, device=device)
+    out_x = torch.rand(2, 3, 32, 32, device=device)
+    gate = torch.rand(2, device=device)
+    result = identity(x, out_x, gate)
+    _assert_device(result, device, "identity output")
+
+def test_gate_module_device():
+    """GateModule output stays on input device."""
+    device = _get_test_device()
+    latent_dim = 64
+    module = GateModule(latent_dim, num_gates=7).to(device)
+    latent = torch.rand(2, latent_dim, device=device)
+    out = module(latent)
+    _assert_device(out, device, "GateModule output")
+
+def test_white_balance_device():
+    """WhiteBalance output stays on input device."""
+    device = _get_test_device()
+    latent_dim = 64
+    module = WhiteBalance(latent_dim).to(device)
+    x = torch.rand(2, 3, 32, 32, device=device)
+    latent = torch.rand(2, latent_dim, device=device)
+    gate = torch.rand(2, device=device)
+    out = module(x, latent, gate)
+    _assert_device(out, device, "WhiteBalance output")
+
+def test_gamma_balance_device():
+    """GammaBalance output stays on input device (log_gamma buffer moves with .to())."""
+    device = _get_test_device()
+    latent_dim = 64
+    module = GammaBalance(latent_dim).to(device)
+    x = torch.rand(2, 3, 32, 32, device=device)
+    latent = torch.rand(2, latent_dim, device=device)
+    gate = torch.rand(2, device=device)
+    out = module(x, latent, gate)
+    _assert_device(out, device, "GammaBalance output")
+    _assert_device(module.log_gamma, device, "GammaBalance.log_gamma buffer")
+
+def test_sharpening_device():
+    """Sharpening output stays on input device."""
+    device = _get_test_device()
+    latent_dim = 64
+    module = Sharpening(latent_dim).to(device)
+    x = torch.rand(2, 3, 32, 32, device=device)
+    latent = torch.rand(2, latent_dim, device=device)
+    gate = torch.rand(2, device=device)
+    out = module(x, latent, gate)
+    _assert_device(out, device, "Sharpening output")
+
+def test_defog_device():
+    """Defog output stays on input device."""
+    device = _get_test_device()
+    latent_dim = 64
+    module = Defog(latent_dim).to(device)
+    x = torch.rand(2, 3, 32, 32, device=device)
+    latent = torch.rand(2, latent_dim, device=device)
+    gate = torch.rand(2, device=device)
+    out = module(x, latent, gate)
+    _assert_device(out, device, "Defog output")
+
+def test_contrast_device():
+    """Contrast output stays on input device."""
+    device = _get_test_device()
+    latent_dim = 64
+    module = Contrast(latent_dim).to(device)
+    x = torch.rand(2, 3, 32, 32, device=device)
+    latent = torch.rand(2, latent_dim, device=device)
+    gate = torch.rand(2, device=device)
+    out = module(x, latent, gate)
+    _assert_device(out, device, "Contrast output")
+
+def test_tone_device():
+    """Tone output stays on input device."""
+    device = _get_test_device()
+    latent_dim = 64
+    module = Tone(latent_dim).to(device)
+    x = torch.rand(2, 3, 32, 32, device=device)
+    latent = torch.rand(2, latent_dim, device=device)
+    gate = torch.rand(2, device=device)
+    out = module(x, latent, gate)
+    _assert_device(out, device, "Tone output")
+
+def test_gdip_full_pipeline_device():
+    """Full GDIP pipeline output stays on input device."""
+    device = _get_test_device()
+    latent_dim = 64
+    gdip = GDIP(latent_dim=latent_dim, num_gates=7).to(device)
+    x = torch.rand(2, 3, 32, 32, device=device)
+    latent = torch.rand(2, latent_dim, device=device)
+    enhanced, gates = gdip(x, latent)
+    _assert_device(enhanced, device, "GDIP enhanced output")
+    _assert_device(gates, device, "GDIP gates output")
+
+def test_mgdip_full_pipeline_device():
+    """Full MultiLevelGDIP pipeline output stays on input device."""
+    device = _get_test_device()
+    latent_dim = 64
+    num_blocks = 3
+    mgdip = MultiLevelGDIP(num_gdip_blocks=num_blocks, latent_dim=latent_dim).to(device)
+    x = torch.rand(2, 3, 32, 32, device=device)
+    latent_features = [torch.rand(2, latent_dim, device=device) for _ in range(num_blocks)]
+    out, gates, intermediates = mgdip(x, latent_features, return_intermediates=True)
+    _assert_device(out, device, "MGDIP output")
+    for i, g in enumerate(gates):
+        _assert_device(g, device, f"MGDIP gate[{i}]")
+    for i, img in enumerate(intermediates):
+        _assert_device(img, device, f"MGDIP intermediate[{i}]")
+
 # ─── Run all tests ───────────────────────────────────────────────────
 
 if __name__ == "__main__":
@@ -673,6 +800,41 @@ if __name__ == "__main__":
 
     test_mgdip_encoder_end_to_end()
     print("PASSED: encoder + mgdip end-to-end")
+
+    # Device consistency tests
+    print("=" * 60)
+    print(f"Device Consistency Tests (device: {_get_test_device()})")
+    print("=" * 60)
+
+    test_identity_device()
+    print("PASSED: identity device consistency")
+
+    test_gate_module_device()
+    print("PASSED: GateModule device consistency")
+
+    test_white_balance_device()
+    print("PASSED: WhiteBalance device consistency")
+
+    test_gamma_balance_device()
+    print("PASSED: GammaBalance device consistency (register_buffer)")
+
+    test_sharpening_device()
+    print("PASSED: Sharpening device consistency")
+
+    test_defog_device()
+    print("PASSED: Defog device consistency")
+
+    test_contrast_device()
+    print("PASSED: Contrast device consistency")
+
+    test_tone_device()
+    print("PASSED: Tone device consistency")
+
+    test_gdip_full_pipeline_device()
+    print("PASSED: GDIP full pipeline device consistency")
+
+    test_mgdip_full_pipeline_device()
+    print("PASSED: MGDIP full pipeline device consistency")
 
     # GDIPYolo with real data
     print("=" * 60)

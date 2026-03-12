@@ -25,7 +25,7 @@ def normalize(x, per_image=True):
 def identity(x:torch.Tensor, out_x:torch.Tensor, identity_gate:torch.Tensor):
 
     g = identity_gate.unsqueeze(1).unsqueeze(2).unsqueeze(3)
-    x = (x*g) + ((torch.tensor(1.).to(x.device) - g) * out_x)
+    x = (x*g) + ((1. - g) * out_x)
     return x
 
 class GateModule(nn.Module):
@@ -76,14 +76,14 @@ class GammaBalance(nn.Module):
         super(GammaBalance, self).__init__()
         
         self.gamma_linear = nn.Linear(latent_dim, 1, bias=True)
-        self.log_gamma = torch.log(torch.tensor(2.5))
+        self.register_buffer('log_gamma', torch.log(torch.tensor(2.5)))
         
     def forward(self, x:torch.Tensor, latent_embed:torch.Tensor, gamma_gate:torch.Tensor):
         
         gamma = self.gamma_linear(latent_embed).unsqueeze(2).unsqueeze(3)
         gamma = torch.exp(tanh_range(gamma, -self.log_gamma, self.log_gamma))
         
-        g = torch.pow(torch.maximum(x, torch.tensor(1e-4)), gamma)
+        g = torch.pow(x.clamp(min=1e-4), gamma)
         g = normalize(g)
         g = g * gamma_gate.unsqueeze(1).unsqueeze(2).unsqueeze(3)
 
@@ -101,7 +101,7 @@ class Sharpening(nn.Module):
         out_x = self.blur(x)
 
         y = self.sharpen_linear(latent_embed).unsqueeze(2).unsqueeze(3)
-        y = tanh_range(y, torch.tensor(0.1), torch.tensor(1.))
+        y = tanh_range(y, 0.1, 1.0)
         s = x + (y*(x - out_x))
         s = normalize(s)
         s = s * (sharpning_gate.unsqueeze(1).unsqueeze(2).unsqueeze(3))
@@ -168,7 +168,7 @@ class Defog(nn.Module):
         """
 
         omega = self.defog_linear(latent_embed).unsqueeze(2).unsqueeze(3)
-        omega = tanh_range(omega, torch.tensor(0.1), torch.tensor(1.))
+        omega = tanh_range(omega, 0.1, 1.0)
 
         #atmospheric light + dark channel
         dark_i = self.dark_channel(x)
@@ -176,7 +176,7 @@ class Defog(nn.Module):
         i = x / atmos_light
         i = self.dark_channel(i)
         t = 1. - (omega * i)
-        j = ((x - atmos_light)/(torch.maximum(t, torch.tensor(0.01)))) + atmos_light
+        j = ((x - atmos_light)/(t.clamp(min=0.01))) + atmos_light
         j = normalize(j)
 
         j = j * fog_gate.unsqueeze(1).unsqueeze(2).unsqueeze(3)
@@ -198,7 +198,7 @@ class Contrast(nn.Module):
         
         alpha = torch.tanh(self.contrast_linear(latent_embed))
         
-        luminance = torch.minimum(torch.maximum(self.rgb2lum(x), torch.tensor(0.0)), torch.tensor(1.0)).unsqueeze(1)
+        luminance = self.rgb2lum(x).clamp(0.0, 1.0).unsqueeze(1)
         contrast_lum = -torch.cos(math.pi * luminance) * 0.5 + 0.5
         contrast_image = x / (luminance + 1e-6) * contrast_lum
         contrast_image = self.lerp(x, contrast_image, alpha)

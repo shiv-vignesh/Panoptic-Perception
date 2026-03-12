@@ -103,7 +103,8 @@ def build_vision_encoder(encoder_cfg: dict) -> nn.Module:
     tap_layers = encoder_cfg.get("tap_layers", None)
 
     if encoder_type in CUSTOM_ENCODERS:
-        return CUSTOM_ENCODERS[encoder_type](latent_dim=latent_dim)
+        # return CUSTOM_ENCODERS[encoder_type](latent_dim=latent_dim)
+        raise NotImplementedError("Custom Vision Encoders are not supported yet!")
 
     if encoder_type in torchvision.models.list_models():
         return TorchVisionEncoder(encoder_type, latent_dim, pretrained, tap_layers)
