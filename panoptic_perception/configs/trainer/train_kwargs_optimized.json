@@ -80,6 +80,10 @@
                 "group": [25, 33],
                 "trainable": true
             }
+        },
+        "gdip_groups": {
+            "vision_encoder": {"trainable": true, "lr_scale": 1.0},
+            "gdip_module": {"trainable": true, "lr_scale": 1.0}
         }
     },
 

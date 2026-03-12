@@ -80,7 +80,11 @@
                 "group": [25, 33],
                 "trainable": true
             }
-        }
+        },
+        "gdip_groups": {
+            "vision_encoder": {"trainable": true, "lr_scale": 1.0},
+            "gdip_module": {"trainable": true, "lr_scale": 1.0}
+        }        
     },
 
     "lr_scheduler_kwargs":{
@@ -95,7 +99,7 @@
     },
 
     "trainer_kwargs":{
-        "output_dir": "yolov8p-768x1280-detection-resumed",
+        "output_dir": "gdip-yolov8p-768-1280",
         "eval_visualize_outputs":false,
         "is_training": true,
         "first_val_epoch": 0,
@@ -108,11 +112,11 @@
         "checkpoint_idx": 2,
         "gradient_accumulation_steps": 6,
         "lr_scheduler_start_epoch": 1,
-        "checkpoint_path": "yolov8p-768x1280-detection/best_model.pt",
+        "checkpoint_path": "/workspace/yolov8p-768x1280-detection/best_model.pt",
         "reload_optimizer": false,
         "reload_optimizer_with_initial_lr": false,
 
-        "wandb_project": "yolop-768x1280-detection",
+        "wandb_project": "GDIP-YOLOP-detection",
         "wandb_enabled": true,
         "use_ema": false,                                                                               
         "ema_decay": 0.9999,                                                                           

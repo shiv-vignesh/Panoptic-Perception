@@ -413,11 +413,20 @@ class Trainer:
             self.logger.log_new_line()
     
     def resume_from_ckpt(self, ckpt_path:str):
-                
+
         if ckpt_path and os.path.exists(ckpt_path):
             ckpt = torch.load(ckpt_path, map_location=self.device, weights_only=False)
 
-            missing, unexpected, loaded_keys = WeightsManager().load(self.model, ckpt_path)            
+            # Detect if checkpoint was saved from a bare YOLOP/YOLOv8P but loading into GDIPYolo
+            # If so, remap keys with "task_network." prefix
+            key_prefix = None
+            if isinstance(self.model, GDIPYolo):
+                ckpt_state = ckpt.get("model_state", ckpt)
+                sample_key = next(iter(ckpt_state), "")
+                if not sample_key.startswith("task_network."):
+                    key_prefix = "task_network"
+
+            missing, unexpected, loaded_keys = WeightsManager().load(self.model, ckpt_path, key_prefix=key_prefix)            
             # self.model.load_state_dict(ckpt["model_state"])
             self.logger.log_message("=== Weights Loaded ===")
             self.logger.log_message(f"Loaded     : {len(loaded_keys)} keys")
