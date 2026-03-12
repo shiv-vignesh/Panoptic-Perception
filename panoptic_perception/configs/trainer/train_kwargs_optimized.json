@@ -3,9 +3,9 @@
 
     "model_kwargs":{
         "model_type":"yolop",
-        "cfg_path":"panoptic_perception/configs/models/yolo-detection.cfg",
+        "cfg_path":"panoptic_perception/configs/models/yolo-768-1280-detection.cfg",
         "device":"cuda:0",
-        "use_gdip":false,
+        "use_gdip":true,
         "gdip_kwargs":{
             "mode": "gdip",
             "encoder" : {
@@ -23,11 +23,11 @@
         "detection_annotations_dir": "/workspace/data/bdd100k_labels/100k",
         "segmentation_annotations_dir": "",
         "drivable_annotations_dir": "/workspace/data/drivable_maps/labels",
-        "train_batch_size": 16,
+        "train_batch_size": 8,
         "train_shuffle": true,
         "train_num_workers": 4,
         "train_preprocessor_kwargs":{
-            "image_resize": [640, 640],
+            "image_resize": [768, 1280],
             "original_image_size": [720, 1280],
             "perform_augmentation": true,
             "augment_params": {
@@ -41,7 +41,7 @@
                 "salt_prob": 0.005,
                 "pepper_prob": 0.005,
                 "flip_prob": 0.5,
-                "img_size": [640, 640]
+                "img_size": [768, 1280]
             },
             "advanced_aug": {
                 "mosaic_prob": 0.0,
@@ -49,11 +49,11 @@
                 "copy_paste_prob": 0.0
             }
         },
-        "val_batch_size": 16,
+        "val_batch_size": 8,
         "val_shuffle": false,
         "val_num_workers": 4,
         "val_preprocessor_kwargs":{
-            "image_resize": [640, 640],
+            "image_resize": [768, 1280],
             "original_image_size": [720, 1280]
         }
     },
@@ -70,15 +70,15 @@
         "groups": {
             "backbone": {
                 "group": [0, 23],
-                "trainable": true
+                "trainable": false
             },
             "detect": {
                 "group": [24],
-                "trainable": true
+                "trainable": false
             },
             "segmentation": {
                 "group": [25, 33],
-                "trainable": true
+                "trainable": false
             }
         },
         "gdip_groups": {
@@ -99,24 +99,24 @@
     },
 
     "trainer_kwargs":{
-        "output_dir": "yolop-detection",
+        "output_dir": "gdip-yolov8p-768-1280",
         "eval_visualize_outputs":true,
         "is_training": true,
         "first_val_epoch": 0,
         "metric_eval_mode": "strict",
         "metric_average_mode": "macro",
         "epochs": 100,
-        "monitor_train": true,
+        "monitor_train": false,
         "monitor_val": true,
         "gradient_clipping": 1.0,
         "checkpoint_idx": 2,
         "gradient_accumulation_steps": 2,
         "lr_scheduler_start_epoch": 1,
-        "checkpoint_path": null,
+        "checkpoint_path": "/workspace/Panoptic-Perception/gdip-yolov8p-768-1280/checkpoints/ckpt_1/ckpt-1.pt",
         "reload_optimizer": false,
         "reload_optimizer_with_initial_lr": false,
 
-        "wandb_project": "yolop-detection",
+        "wandb_project": "GDIP-YOLOP-detection",
         "wandb_enabled": true,
         "use_ema": false,                                                                               
         "ema_decay": 0.9999,                                                                           

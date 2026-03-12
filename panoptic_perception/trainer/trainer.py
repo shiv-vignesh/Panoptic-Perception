@@ -753,9 +753,9 @@ class Trainer:
         total_lane_loss = 0.0
         global_image_idx = 0
 
-        conf_threshold=0.001,
-        iou_threshold=0.45,
-        max_detections=500
+        conf_threshold = 0.001
+        iou_threshold = 0.45
+        max_detections = 500
 
         self.logger.log_line()
         self.logger.log_message(f'Evaluating Epoch {self.cur_epoch}')
