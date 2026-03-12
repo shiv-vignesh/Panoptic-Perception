@@ -34,7 +34,7 @@ class GDIP(nn.Module):
 
         # latent_out = torch.nn.functional.relu_(self.vision_encoder(x))
         latent_out = torch.nn.functional.relu(latent_out)
-        gate = tanh_range(self.gate_module(latent_out), 0.01, 1.0)
+        gate = self.gate_module(latent_out)
 
         wb_out = self.wb_module(x, latent_out, gate[:, 0])
         gamma_out = self.gamma_module(x, latent_out, gate[:, 1])
