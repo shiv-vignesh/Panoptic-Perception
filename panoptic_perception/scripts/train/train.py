@@ -13,7 +13,7 @@ def create_model(model_kwargs: dict, loss_weights: dict = None):
     model_type = model_kwargs["model_type"]
     cfg_path = model_kwargs["cfg_path"]
     device = model_kwargs["device"]
-    use_gdip = model_kwargs["use_gdip"]
+    use_gdip = model_kwargs.get("use_gdip", False)
 
     assert os.path.exists(cfg_path), f'{cfg_path} does not exists'
     if model_type == "yolop":

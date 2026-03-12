@@ -2,9 +2,20 @@
     "_description": "Optimized config for joint detection + drivable training with advanced augmentations",
 
     "model_kwargs":{
-        "model_type":"yolov8p",
+        "model_type":"yolop",
         "cfg_path":"panoptic_perception/configs/models/yolo-detection.cfg",
-        "device":"cuda:0"
+        "device":"cuda:0",
+        "use_gdip":false,
+        "gdip_kwargs":{
+            "mode": "gdip",
+            "encoder" : {
+                "type":"resnet18",
+                "latent_dim":256,
+                "pretrained":true,
+                "tap_layers":[]
+            },
+            "visualize_intermediate":true        
+        }        
     },
 
     "dataset_kwargs":{

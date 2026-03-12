@@ -539,21 +539,19 @@ class GDIPYolo(nn.Module):
         self.vis_intermediate = gdip_kwargs.get("visualize_intermediate", True)
             
     def forward(self, x:torch.Tensor, targets=None, store_enhanced_image:bool = True):
-        
+
         if self.gdip_mode == "gdip":
             latent = self.vision_encoder(x)
             enhanced_image, gates = self.gdip_module(x, latent)
 
-            if store_enhanced_image:
-                self.enhanced_image = enhanced_image.detach()
-            
         elif self.gdip_mode == "mgdip":
             latent, features = self.vision_encoder(x)
             enhanced_image, gates, intermediate_images = self.gdip_module(x, features, self.vis_intermediate)
 
         if store_enhanced_image:
             self.enhanced_image = enhanced_image.detach()
-            self.intermediate_images = [img.detach() for img in intermediate_images] if intermediate_images else []
+            if self.gdip_mode == "mgdip":
+                self.intermediate_images = [img.detach() for img in intermediate_images] if intermediate_images else []
 
         return self.task_network(enhanced_image, targets)
     
