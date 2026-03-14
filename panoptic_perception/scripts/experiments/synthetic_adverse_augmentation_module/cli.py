@@ -1,0 +1,117 @@
+from __future__ import annotations
+
+import argparse
+import json
+
+from .analysis import compute_distribution_features, summarize_feature_distributions
+from .augmentors import SyntheticFogGenerator, SyntheticLowLightGenerator
+from .config import load_config
+from .dataset_builder import build_paired_dataset_grid
+from .depth_estimators import (
+    DepthAnythingEstimator,
+    DepthEstimator,
+    HeuristicDepthEstimator,
+)
+
+
+def _build_depth_estimator(backend: str, cfg: dict) -> DepthEstimator:
+    if backend == "heuristic":
+        h, io_cfg = cfg["heuristic_depth"], cfg["io"]
+        return HeuristicDepthEstimator(
+            vertical_weight=h["vertical_weight"],
+            intensity_weight=h["intensity_weight"],
+            edge_weight=h["edge_weight"],
+            edge_epsilon=h["edge_epsilon"],
+            uint8_max=float(io_cfg["uint8_max"]),
+        )
+    if backend == "depth_anything":
+        d = cfg["depth_anything"]
+        return DepthAnythingEstimator(
+            model_name=d["model_name"],
+            device=d["device"],
+            normalization_epsilon=d["normalization_epsilon"],
+        )
+    raise ValueError(f"Unknown depth backend: {backend}")
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(
+        description="Synthetic adverse augmentation module (fog + low-light + compound)",
+    )
+    parser.add_argument(
+        "--config",
+        type=str,
+        default=None,
+        help="Path to JSON config. Default: module's default_config.json",
+    )
+    subparsers = parser.add_subparsers(dest="command", required=True)
+
+    build_parser = subparsers.add_parser("build-grid", help="Build paired 5x5 dataset grid")
+    build_parser.add_argument("--input-images-dir", required=True)
+    build_parser.add_argument("--output-dir", required=True)
+    build_parser.add_argument(
+        "--depth-backend",
+        choices=["heuristic", "depth_anything"],
+        default=None,
+        help="Override config. Default: heuristic",
+    )
+    build_parser.add_argument("--depth-model-name", default=None)
+    build_parser.add_argument("--device", default=None)
+    build_parser.add_argument("--compound-order", choices=["dark_then_fog", "fog_then_dark"], default=None)
+    build_parser.add_argument("--gamma-min", type=float, default=None)
+    build_parser.add_argument("--gamma-max", type=float, default=None)
+
+    analyze_parser = subparsers.add_parser("analyze", help="Compare synthetic vs real distributions")
+    analyze_parser.add_argument("--synthetic-dir", required=True)
+    analyze_parser.add_argument("--real-dir", required=True)
+
+    args = parser.parse_args()
+    cfg = load_config(args.config)
+
+    if args.command == "build-grid":
+        backend = args.depth_backend or "heuristic"
+        if args.depth_model_name is not None:
+            cfg = {**cfg, "depth_anything": {**cfg.get("depth_anything", {}), "model_name": args.depth_model_name}}
+        if args.device is not None:
+            cfg = {**cfg, "depth_anything": {**cfg.get("depth_anything", {}), "device": args.device}}
+
+        estimator = _build_depth_estimator(backend, cfg)
+        fog = SyntheticFogGenerator(depth_estimator=estimator, config=cfg)
+
+        ll = cfg["low_light"]
+        gamma_min = args.gamma_min if args.gamma_min is not None else ll["gamma_min"]
+        gamma_max = args.gamma_max if args.gamma_max is not None else ll["gamma_max"]
+        low_light = SyntheticLowLightGenerator(
+            gamma_min=gamma_min,
+            gamma_max=gamma_max,
+            gamma_min_threshold=ll["gamma_min_threshold"],
+            config=cfg,
+        )
+
+        ds = cfg["dataset"]
+        compound_order = args.compound_order or ds["compound_order"]
+
+        summary = build_paired_dataset_grid(
+            input_images_dir=args.input_images_dir,
+            output_dir=args.output_dir,
+            fog_generator=fog,
+            low_light_generator=low_light,
+            compound_order=compound_order,
+            config_path=args.config,
+        )
+        print(json.dumps(summary, indent=cfg["io"]["json_indent"]))
+    elif args.command == "analyze":
+        synthetic = compute_distribution_features(
+            args.synthetic_dir, config_path=args.config
+        )
+        real = compute_distribution_features(
+            args.real_dir, config_path=args.config
+        )
+        report = summarize_feature_distributions(
+            synthetic, real, config_path=args.config
+        )
+        print(json.dumps(report, indent=cfg["io"]["json_indent"]))
+
+
+if __name__ == "__main__":
+    main()

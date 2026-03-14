@@ -1,0 +1,45 @@
+{
+  "heuristic_depth": {
+    "vertical_weight": 0.7,
+    "intensity_weight": 0.2,
+    "edge_weight": 0.1,
+    "edge_epsilon": 1e-8
+  },
+  "depth_anything": {
+    "model_name": "LiheYoung/depth-anything-small-hf",
+    "device": "cuda",
+    "normalization_epsilon": 1e-8
+  },
+  "fog": {
+    "max_depth_meters": 120.0,
+    "betas": [0.008, 0.015, 0.025, 0.040, 0.060],
+    "atmospheric_light_quantile": 0.9,
+    "atmospheric_light_min_pixels": 16
+  },
+  "low_light": {
+    "gamma_min": 1.5,
+    "gamma_max": 3.0,
+    "gamma_min_threshold": 1.0,
+    "gammas": [1.5, 1.9, 2.3, 2.7, 3.0]
+  },
+  "dataset": {
+    "compound_order": "dark_then_fog",
+    "fog_betas": [0.008, 0.015, 0.025, 0.040, 0.060],
+    "darkness_gammas": [1.5, 1.9, 2.3, 2.7, 3.0]
+  },
+  "io": {
+    "uint8_max": 255.0,
+    "image_extensions": [".jpg", ".jpeg", ".png", ".bmp", ".webp"],
+    "json_indent": 2
+  },
+  "analysis": {
+    "num_samples": 8,
+    "seed": 42,
+    "dpi": 150,
+    "figsize_width": 10,
+    "figsize_height_per_sample": 4,
+    "luma_coefficients": [0.299, 0.587, 0.114],
+    "saturation_max": 255.0,
+    "epsilon": 1e-8
+  }
+}
