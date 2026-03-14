@@ -7,7 +7,9 @@ from collections.abc import Sequence
 from dataclasses import asdict, dataclass
 from pathlib import Path
 
-from ._io import iter_images, read_rgb, write_rgb
+from tqdm import tqdm
+
+from ._io import iter_images, read_rgb, write_rgb, write_npy
 from .augmentors import (
     ApplyOrder,
     FogParameters,
@@ -15,6 +17,13 @@ from .augmentors import (
     SyntheticLowLightGenerator,
     apply_nighttime_fog,
 )
+
+from panoptic_perception.dataset.adverse_weather.depth_estimators import (
+    DepthAnythingEstimator,
+    DepthEstimator,
+    HeuristicDepthEstimator,
+)
+
 from .config import DEFAULT_CONFIG_PATH, load_config
 
 logger = logging.getLogger(__name__)
@@ -39,6 +48,31 @@ class ManifestRecord:
     gamma: float
     condition: str
 
+def build_depth_dataset(
+    input_images_dir: str | Path,
+    output_dir: str | Path,
+    depth_estimator : DepthEstimator,
+    config_path: str | Path | None = None,
+):
+
+    cfg = load_config(config_path)
+
+    input_dir = Path(input_images_dir)
+    out = Path(output_dir)
+    
+    image_paths = list(iter_images(input_dir, config=cfg))
+    if not image_paths:
+        raise ValueError(f"No supported images found in {input_dir}")    
+    
+    _iter = tqdm(image_paths, desc=f'Creating Depth maps')
+    for img_idx, image_path in enumerate(_iter, 1):
+        image_id = image_path.stem
+        image_rgb = read_rgb(image_path)
+
+        depth = depth_estimator.estimate(image_rgb)
+        
+        depth_arr_path = out / f'{image_path.stem}.npy'
+        write_npy(depth_arr_path, depth)        
 
 def build_paired_dataset_grid(
     input_images_dir: str | Path,
@@ -81,8 +115,9 @@ def build_paired_dataset_grid(
     records: list[ManifestRecord] = []
     num_images = len(image_paths)
     max_depth_m = fog_cfg["max_depth_meters"]
-
-    for img_idx, image_path in enumerate(image_paths, 1):
+    
+    _iter = tqdm(image_paths, desc=f'Creating Paired Dataset Grid.')
+    for img_idx, image_path in enumerate(_iter, 1):
         image_id = image_path.stem
         image_rgb = read_rgb(image_path)
         clean_path = clean_dir / image_path.name

@@ -3,11 +3,11 @@ from __future__ import annotations
 import argparse
 import json
 
-from .analysis import compute_distribution_features, summarize_feature_distributions
-from .augmentors import SyntheticFogGenerator, SyntheticLowLightGenerator
-from .config import load_config
-from .dataset_builder import build_paired_dataset_grid
-from .depth_estimators import (
+from panoptic_perception.dataset.adverse_weather.analysis import compute_distribution_features, summarize_feature_distributions
+from panoptic_perception.dataset.adverse_weather.augmentors import SyntheticFogGenerator, SyntheticLowLightGenerator
+from panoptic_perception.dataset.adverse_weather.config import load_config
+from panoptic_perception.dataset.adverse_weather.dataset_builder import build_paired_dataset_grid, build_depth_dataset
+from panoptic_perception.dataset.adverse_weather.depth_estimators import (
     DepthAnythingEstimator,
     DepthEstimator,
     HeuristicDepthEstimator,
@@ -61,6 +61,17 @@ def main() -> None:
     build_parser.add_argument("--gamma-min", type=float, default=None)
     build_parser.add_argument("--gamma-max", type=float, default=None)
 
+    depth_parser = subparsers.add_parser("depth-only", help="Pre-compute and cache depth maps as .npy")
+    depth_parser.add_argument("--input-images-dir", required=True)
+    depth_parser.add_argument("--output-dir", required=True)
+    depth_parser.add_argument(
+        "--depth-backend",
+        choices=["heuristic", "depth_anything"],
+        default=None,
+    )
+    depth_parser.add_argument("--depth-model-name", default=None)
+    depth_parser.add_argument("--device", default=None)
+
     analyze_parser = subparsers.add_parser("analyze", help="Compare synthetic vs real distributions")
     analyze_parser.add_argument("--synthetic-dir", required=True)
     analyze_parser.add_argument("--real-dir", required=True)
@@ -100,6 +111,22 @@ def main() -> None:
             config_path=args.config,
         )
         print(json.dumps(summary, indent=cfg["io"]["json_indent"]))
+    
+    elif args.command == "depth-only":
+        backend = args.depth_backend or "heuristic"
+        if args.depth_model_name is not None:
+            cfg = {**cfg, "depth_anything": {**cfg.get("depth_anything", {}), "model_name": args.depth_model_name}}
+        if args.device is not None:
+            cfg = {**cfg, "depth_anything": {**cfg.get("depth_anything", {}), "device": args.device}}
+
+        estimator = _build_depth_estimator(backend, cfg)
+        build_depth_dataset(
+            input_images_dir=args.input_images_dir,
+            output_dir=args.output_dir,
+            depth_estimator=estimator,
+            config_path=args.config,
+        )
+    
     elif args.command == "analyze":
         synthetic = compute_distribution_features(
             args.synthetic_dir, config_path=args.config

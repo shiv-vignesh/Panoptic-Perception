@@ -43,3 +43,11 @@ def write_rgb(path: Path, image_rgb: np.ndarray) -> None:
     ok = cv2.imwrite(str(path), bgr)
     if not ok:
         raise OSError(f"Failed to write image: {path}")
+
+def write_npy(path: Path, np_arr: np.ndarray):
+    
+    path.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        np.save(str(path), np_arr)
+    except Exception as e:
+        raise OSError(f'Failed to write numpy arr: {str(path)} due to: {e}')
