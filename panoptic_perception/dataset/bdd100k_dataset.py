@@ -19,9 +19,8 @@ from panoptic_perception.dataset.mosaic_augmentation import mosaic_augmentation
 from panoptic_perception.dataset.adverse_weather import (
     apply_nighttime_fog,
     FogParameters, SyntheticFogGenerator, SyntheticLowLightGenerator,
-    HeuristicDepthEstimator,
+    HeuristicDepthEstimator, DepthAnythingEstimator, ONNXDepthEstimator,
 )
-from panoptic_perception.dataset.adverse_weather.depth_estimators import ONNXDepthEstimator
 
 from enum import Enum
 
@@ -669,7 +668,13 @@ class FoggyBDD100KDataset(BDD100KDataset):
         
         # Build depth estimator based on config
         depth_backend = self.adverse_params.get("depth_backend", "heuristic")
-        if depth_backend == "onnx":
+        if depth_backend == "depth_anything":
+            self.depth_estimator = DepthAnythingEstimator(
+                model_name=self.adverse_params.get("depth_model_name", "LiheYoung/depth-anything-small-hf"),
+                device=self.adverse_params.get("depth_device", "cuda"),
+                normalization_epsilon=1e-8,
+            )
+        elif depth_backend == "onnx":
             self.depth_estimator = ONNXDepthEstimator(
                 onnx_path=self.adverse_params["onnx_model_path"],
                 device=self.adverse_params.get("depth_device", "cuda"),
