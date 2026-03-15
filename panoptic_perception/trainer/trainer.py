@@ -241,7 +241,7 @@ class Trainer:
 
             if dataset_class == "foggy" and dataset_type == "train":
                 adverse_params = dataset_kwargs.get("adverse_params", {})
-                base_kwargs["depth_map_dir"] = dataset_kwargs["depth_map_dir"]
+                base_kwargs["depth_map_dir"] = dataset_kwargs.get("depth_map_dir", None)
                 base_kwargs["adverse_params"] = adverse_params
 
                 dataset = FoggyBDD100KDataset(
@@ -301,7 +301,7 @@ class Trainer:
                 dataset_kwargs["drivable_annotations_dir"],
                 dataset_kwargs["val_preprocessor_kwargs"]
             )
-            foggy_val_kwargs["depth_map_dir"] = dataset_kwargs["depth_map_dir"]
+            foggy_val_kwargs["depth_map_dir"] = dataset_kwargs.get("depth_map_dir", None)
             foggy_val_kwargs["adverse_params"] = adverse_params
 
             foggy_val_dataset = FoggyBDD100KDataset(

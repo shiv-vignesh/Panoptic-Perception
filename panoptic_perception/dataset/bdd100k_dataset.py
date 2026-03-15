@@ -629,31 +629,34 @@ class FoggyBDD100KDataset(BDD100KDataset):
                 strict_map:bool=True, apply_fog_prob:float=0.67):
 
         super().__init__(dataset_kwargs, dataset_type, perform_augmentation, mode)
-            
-        assert os.path.exists(dataset_kwargs["depth_map_dir"]), f"Depth Map directory {dataset_kwargs["depth_map_dir"]} does not exist."
-        self.depth_map_dir = dataset_kwargs["depth_map_dir"]
+
         self.adverse_params = dataset_kwargs["adverse_params"]
 
-        self.depth_map_ids = self.get_depth_map_ids()
-        
-        if strict_map:
-            image_set = set(self.image_ids)
-            depth_set = set(self.depth_map_ids)
+        self.depth_map_dir = dataset_kwargs.get("depth_map_dir", None)
+        if self.depth_map_dir and os.path.exists(os.path.join(self.depth_map_dir, self.dataset_type)):
+            self.depth_map_ids = self.get_depth_map_ids()
+            self._cached_depth_stems = set(self.depth_map_ids)
 
-            assert image_set == depth_set, (
-                f"Image-depth ID mismatch: "
-                f"{len(image_set - depth_set)} images missing depth, "
-                f"{len(depth_set - image_set)} depth maps missing images"
-            )
+            if strict_map:
+                image_set = set(self.image_ids)
+                depth_set = set(self.depth_map_ids)
 
+                assert image_set == depth_set, (
+                    f"Image-depth ID mismatch: "
+                    f"{len(image_set - depth_set)} images missing depth, "
+                    f"{len(depth_set - image_set)} depth maps missing images"
+                )
+            else:
+                common_ids = set(self.image_ids) & set(self.depth_map_ids)
+                self.image_ids = [id for id in self.image_ids if id in common_ids]
         else:
-            common_ids = set(self.image_ids) & set(self.depth_map_ids)
-            self.image_ids = [id for id in self.image_ids if id in common_ids]
-            
+            self.depth_map_ids = []
+            self._cached_depth_stems = set()
+
         self.apply_fog_prob = apply_fog_prob
         
-        self.fog_betas = self.adverse_params.get("fog_betas", [0.005, 0.010, 0.020])
-        self.darkness_gammas = self.adverse_params.get("darkness_gammas", [1.3, 1.6, 2.0])
+        self.fog_betas = self.adverse_params.get("fog_betas", [0.010, 0.020, 0.035])
+        self.darkness_gammas = self.adverse_params.get("darkness_gammas", [1.5, 2.0, 3.5])
         self.atmospheric_light_quantile = self.adverse_params.get("atmospheric_light_quantile", 0.9)
         self.atmospheric_light_min_pixels = self.adverse_params.get("atmospheric_light_min_pixels", 16)
         self.max_depth_meters = self.adverse_params.get("max_depth_meters", 120.0)
@@ -753,13 +756,19 @@ class FoggyBDD100KDataset(BDD100KDataset):
     def _load_raw(self, index):
         image, bboxes, class_labels, \
             scene_attributes, seg, drivable, image_path = super()._load_raw(index)
-            
-        depth_map_id = self.depth_map_ids[index]
 
-        depth_map_path = os.path.join(self.depth_map_dir, self.dataset_type, f"{depth_map_id}.npy")
-        assert os.path.exists(depth_map_path), f"Image path {depth_map_path} does not exist."
+        image_id = self.image_ids[index]
+        depth_map_arr = None
 
-        depth_map_arr = np.load(str(depth_map_path))
+        # Try cached .npy first
+        if image_id in self._cached_depth_stems:
+            depth_map_path = os.path.join(self.depth_map_dir, self.dataset_type, f"{image_id}.npy")
+            if os.path.exists(depth_map_path):
+                depth_map_arr = np.load(str(depth_map_path))
+
+        # Fall back to on-the-fly heuristic estimation
+        if depth_map_arr is None:
+            depth_map_arr = self.fog_generator.depth_estimator.estimate(image)
 
         return image, depth_map_arr, bboxes, class_labels, scene_attributes, seg, drivable, image_path
     

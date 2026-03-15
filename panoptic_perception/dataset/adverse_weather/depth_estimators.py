@@ -91,7 +91,7 @@ class DepthAnythingEstimator:
                 "DepthAnythingEstimator requires `transformers`."
             ) from exc
 
-        self._processor = AutoImageProcessor.from_pretrained(self.model_name)
+        self._processor = AutoImageProcessor.from_pretrained(self.model_name, use_fast=True)
         self._model = AutoModelForDepthEstimation.from_pretrained(self.model_name)
         self._model.to(self._torch_device).eval()
 
