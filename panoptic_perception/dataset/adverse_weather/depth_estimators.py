@@ -120,3 +120,36 @@ class DepthAnythingEstimator:
         dmin, dmax = depth.min(), depth.max()
         depth = 1.0 - (depth - dmin) / (dmax - dmin + self._normalization_epsilon)
         return np.clip(depth, 0.0, 1.0)
+
+    def estimate_batch(self, images_rgb: list[np.ndarray]) -> list[np.ndarray]:
+        """Batched depth estimation. Returns list of float32 arrays in [0, 1], shape (H, W)."""
+        self._ensure_loaded()
+
+        target_sizes = [(img.shape[0], img.shape[1]) for img in images_rgb]
+
+        inputs = self._processor(images=images_rgb, return_tensors="pt")
+        inputs = {k: v.to(self._torch_device) for k, v in inputs.items()}
+
+        use_amp = self._torch_device.type == "cuda"
+        with torch.inference_mode(), torch.amp.autocast(
+            device_type=self._torch_device.type, enabled=use_amp
+        ):
+            outputs = self._model(**inputs)
+
+        post = self._processor.post_process_depth_estimation(
+            outputs, target_sizes=target_sizes
+        )
+
+        del inputs, outputs
+        if use_amp:
+            torch.cuda.empty_cache()
+
+        depths = []
+        for item in post:
+            depth = item["predicted_depth"].detach().cpu().numpy().astype(np.float32)
+            dmin, dmax = depth.min(), depth.max()
+            depth = 1.0 - (depth - dmin) / (dmax - dmin + self._normalization_epsilon)
+            depths.append(np.clip(depth, 0.0, 1.0))
+
+        del post
+        return depths

@@ -22,6 +22,9 @@ from .augmentors import (
 )
 from .config import DEFAULT_CONFIG_PATH, load_config
 from .dataset_builder import (
+    ImagePathDataset,
+    build_depth_dataset,
+    build_depth_dataset_batch,
     build_paired_dataset_grid,
     default_darkness_gammas,
     default_fog_betas,
@@ -42,7 +45,10 @@ __all__ = [
     "HeuristicDepthEstimator",
     "SyntheticFogGenerator",
     "SyntheticLowLightGenerator",
+    "ImagePathDataset",
     "apply_nighttime_fog",
+    "build_depth_dataset",
+    "build_depth_dataset_batch",
     "build_paired_dataset_grid",
     "compute_distribution_features",
     "default_darkness_gammas",

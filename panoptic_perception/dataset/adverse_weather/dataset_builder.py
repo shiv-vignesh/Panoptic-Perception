@@ -4,9 +4,12 @@ import csv
 import json
 import logging
 from collections.abc import Sequence
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import asdict, dataclass
 from pathlib import Path
 
+import numpy as np
+from torch.utils.data import Dataset, DataLoader
 from tqdm import tqdm
 
 from ._io import iter_images, read_rgb, write_rgb, write_npy
@@ -27,6 +30,21 @@ from panoptic_perception.dataset.adverse_weather.depth_estimators import (
 from .config import DEFAULT_CONFIG_PATH, load_config
 
 logger = logging.getLogger(__name__)
+
+
+class ImagePathDataset(Dataset):
+    """Simple dataset that loads images by path for DataLoader prefetching."""
+
+    def __init__(self, paths: list[Path]):
+        self.paths = paths
+
+    def __len__(self):
+        return len(self.paths)
+
+    def __getitem__(self, idx):
+        path = self.paths[idx]
+        image_rgb = read_rgb(path)  # uint8 (H, W, 3)
+        return path.stem, image_rgb
 
 
 def default_fog_betas(config_path: str | Path | None = None) -> list[float]:
@@ -72,7 +90,73 @@ def build_depth_dataset(
         depth = depth_estimator.estimate(image_rgb)
         
         depth_arr_path = out / f'{image_path.stem}.npy'
-        write_npy(depth_arr_path, depth)        
+        write_npy(depth_arr_path, depth)
+
+
+def build_depth_dataset_batch(
+    input_images_dir: str | Path,
+    output_dir: str | Path,
+    depth_estimator: DepthAnythingEstimator,
+    config_path: str | Path | None = None,
+    batch_size: int = 16,
+    num_workers: int = 4,
+    write_threads: int = 4,
+):
+    """Batched depth dataset builder with DataLoader prefetching and async writes.
+
+    Skips images whose .npy files already exist in output_dir.
+    """
+    cfg = load_config(config_path)
+
+    input_dir = Path(input_images_dir)
+    out = Path(output_dir)
+    out.mkdir(parents=True, exist_ok=True)
+
+    image_paths = list(iter_images(input_dir, config=cfg))
+    if not image_paths:
+        raise ValueError(f"No supported images found in {input_dir}")
+
+    # Skip images that already have depth maps
+    existing = {p.stem for p in out.glob("*.npy")}
+    remaining = [p for p in image_paths if p.stem not in existing]
+
+    if not remaining:
+        logger.info("All %d depth maps already exist, nothing to do.", len(image_paths))
+        return
+
+    logger.info(
+        "Found %d existing depth maps, %d remaining to generate.",
+        len(existing), len(remaining),
+    )
+
+    dataset = ImagePathDataset(remaining)
+    loader = DataLoader(
+        dataset,
+        batch_size=batch_size,
+        num_workers=num_workers,
+        shuffle=False,
+        pin_memory=True,
+    )
+
+    write_pool = ThreadPoolExecutor(max_workers=write_threads)
+    futures = []
+
+    for stems, images in tqdm(loader, desc="Creating Depth maps (batched)"):
+        # images: (B, H, W, 3) uint8 tensor from default collate
+        images_np = [images[i].numpy() for i in range(images.shape[0])]
+        depths = depth_estimator.estimate_batch(images_np)
+
+        for stem, depth in zip(stems, depths):
+            f = write_pool.submit(write_npy, out / f"{stem}.npy", depth)
+            futures.append(f)
+
+    # Wait for all writes to finish
+    for f in futures:
+        f.result()
+    write_pool.shutdown()
+
+    logger.info("Done. Generated %d depth maps in %s", len(remaining), out)
+
 
 def build_paired_dataset_grid(
     input_images_dir: str | Path,
