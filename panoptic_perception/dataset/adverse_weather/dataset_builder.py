@@ -113,6 +113,7 @@ def build_depth_dataset_batch(
     out.mkdir(parents=True, exist_ok=True)
 
     image_paths = list(iter_images(input_dir, config=cfg))
+    print(f"Found {len(image_paths)} images in {input_dir}")
     if not image_paths:
         raise ValueError(f"No supported images found in {input_dir}")
 
@@ -121,13 +122,10 @@ def build_depth_dataset_batch(
     remaining = [p for p in image_paths if p.stem not in existing]
 
     if not remaining:
-        logger.info("All %d depth maps already exist, nothing to do.", len(image_paths))
+        print(f"All {len(image_paths)} depth maps already exist in {out}, nothing to do.")
         return
 
-    logger.info(
-        "Found %d existing depth maps, %d remaining to generate.",
-        len(existing), len(remaining),
-    )
+    print(f"Found {len(existing)} existing depth maps, {len(remaining)} remaining to generate.")
 
     dataset = ImagePathDataset(remaining)
     loader = DataLoader(
@@ -155,7 +153,7 @@ def build_depth_dataset_batch(
         f.result()
     write_pool.shutdown()
 
-    logger.info("Done. Generated %d depth maps in %s", len(remaining), out)
+    print(f"Done. Generated {len(remaining)} depth maps in {out}")
 
 
 def build_paired_dataset_grid(
