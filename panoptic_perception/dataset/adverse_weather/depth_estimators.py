@@ -57,6 +57,89 @@ class HeuristicDepthEstimator:
         return np.clip(depth, 0.0, 1.0).astype(np.float32)
 
 
+class ONNXDepthEstimator:
+    """Depth estimation via ONNX Runtime. Supports CUDA, TensorRT, and CPU providers.
+
+    Expects an ONNX model exported from Depth Anything (input: pixel_values NCHW float32,
+    output: predicted_depth NHW float32). Preprocessing replicates the HF image processor
+    using numpy/cv2 — no transformers dependency at inference time.
+    """
+
+    # ImageNet normalization (same as Depth Anything's HF processor)
+    _MEAN = np.array([0.485, 0.456, 0.406], dtype=np.float32)
+    _STD = np.array([0.229, 0.224, 0.225], dtype=np.float32)
+
+    def __init__(
+        self,
+        onnx_path: str,
+        device: str = "cuda",
+        input_size: int = 518,
+        normalization_epsilon: float = 1e-8,
+    ) -> None:
+        self.onnx_path = onnx_path
+        self._input_size = input_size
+        self._normalization_epsilon = normalization_epsilon
+        self._device = device
+        self._session = None
+
+    def _ensure_loaded(self) -> None:
+        if self._session is not None:
+            return
+
+        try:
+            import onnxruntime as ort
+        except ImportError as exc:
+            raise ImportError(
+                "ONNXDepthEstimator requires `onnxruntime-gpu` or `onnxruntime`."
+            ) from exc
+
+        providers = []
+        if self._device == "cuda":
+            available = ort.get_available_providers()
+            if "TensorrtExecutionProvider" in available:
+                providers.append("TensorrtExecutionProvider")
+            if "CUDAExecutionProvider" in available:
+                providers.append("CUDAExecutionProvider")
+        providers.append("CPUExecutionProvider")
+
+        sess_opts = ort.SessionOptions()
+        sess_opts.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_ALL
+
+        self._session = ort.InferenceSession(
+            self.onnx_path, sess_options=sess_opts, providers=providers
+        )
+        active = self._session.get_providers()
+        print(f"[ONNXDepthEstimator] Loaded {self.onnx_path} | providers: {active}")
+
+    def _preprocess(self, image_rgb: np.ndarray) -> np.ndarray:
+        """Resize, normalize, NCHW float32 — replicates HF DPT image processor."""
+        img = cv2.resize(
+            image_rgb, (self._input_size, self._input_size),
+            interpolation=cv2.INTER_CUBIC,
+        )
+        img = img.astype(np.float32) / 255.0
+        img = (img - self._MEAN) / self._STD
+        img = np.transpose(img, (2, 0, 1))  # HWC → CHW
+        return np.expand_dims(img, 0).astype(np.float32)  # (1, 3, H, W)
+
+    def estimate(self, image_rgb: np.ndarray) -> np.ndarray:
+        self._ensure_loaded()
+
+        h, w = image_rgb.shape[:2]
+        input_tensor = self._preprocess(image_rgb)
+
+        outputs = self._session.run(None, {"pixel_values": input_tensor})
+        depth = outputs[0].squeeze()  # (input_size, input_size)
+
+        # Resize back to original image dimensions
+        depth = cv2.resize(depth, (w, h), interpolation=cv2.INTER_LINEAR)
+
+        # Normalize to [0, 1], invert: far=1, near=0
+        dmin, dmax = depth.min(), depth.max()
+        depth = 1.0 - (depth - dmin) / (dmax - dmin + self._normalization_epsilon)
+        return np.clip(depth, 0.0, 1.0).astype(np.float32)
+
+
 class DepthAnythingEstimator:
     """Depth backend powered by Depth Anything (HF transformers).
 

@@ -33,6 +33,7 @@ from .depth_estimators import (
     DepthAnythingEstimator,
     DepthEstimator,
     HeuristicDepthEstimator,
+    ONNXDepthEstimator,
 )
 
 __all__ = [
@@ -43,6 +44,7 @@ __all__ = [
     "DepthAnythingEstimator",
     "FogParameters",
     "HeuristicDepthEstimator",
+    "ONNXDepthEstimator",
     "SyntheticFogGenerator",
     "SyntheticLowLightGenerator",
     "ImagePathDataset",

@@ -17,10 +17,11 @@ from panoptic_perception.dataset.augmentations import (
 )
 from panoptic_perception.dataset.mosaic_augmentation import mosaic_augmentation
 from panoptic_perception.dataset.adverse_weather import (
-    apply_nighttime_fog, 
+    apply_nighttime_fog,
     FogParameters, SyntheticFogGenerator, SyntheticLowLightGenerator,
-    HeuristicDepthEstimator
+    HeuristicDepthEstimator,
 )
+from panoptic_perception.dataset.adverse_weather.depth_estimators import ONNXDepthEstimator
 
 from enum import Enum
 
@@ -666,14 +667,25 @@ class FoggyBDD100KDataset(BDD100KDataset):
 
         self._served = defaultdict(set)
         
-        self.fog_generator = SyntheticFogGenerator(
-            depth_estimator=HeuristicDepthEstimator(
+        # Build depth estimator based on config
+        depth_backend = self.adverse_params.get("depth_backend", "heuristic")
+        if depth_backend == "onnx":
+            self.depth_estimator = ONNXDepthEstimator(
+                onnx_path=self.adverse_params["onnx_model_path"],
+                device=self.adverse_params.get("depth_device", "cuda"),
+                input_size=self.adverse_params.get("depth_input_size", 518),
+            )
+        else:
+            self.depth_estimator = HeuristicDepthEstimator(
                 vertical_weight=0.7,
                 intensity_weight=0.2,
                 edge_weight=0.1,
                 edge_epsilon=1e-8,
                 uint8_max=255.0,
             )
+
+        self.fog_generator = SyntheticFogGenerator(
+            depth_estimator=self.depth_estimator
         )
         self.lowlight_generator = SyntheticLowLightGenerator(
             gamma_min=min(self.darkness_gammas),
@@ -766,9 +778,9 @@ class FoggyBDD100KDataset(BDD100KDataset):
             if os.path.exists(depth_map_path):
                 depth_map_arr = np.load(str(depth_map_path))
 
-        # Fall back to on-the-fly heuristic estimation
+        # Fall back to on-the-fly depth estimation
         if depth_map_arr is None:
-            depth_map_arr = self.fog_generator.depth_estimator.estimate(image)
+            depth_map_arr = self.depth_estimator.estimate(image)
 
         return image, depth_map_arr, bboxes, class_labels, scene_attributes, seg, drivable, image_path
     
