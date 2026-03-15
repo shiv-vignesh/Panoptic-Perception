@@ -7,6 +7,7 @@ import json
 import cv2
 import random
 import albumentations as A
+from collections import defaultdict
 
 from panoptic_perception.dataset.enums import BDD100KClasses, BDD100KClassesReduced
 from panoptic_perception.dataset.augmentations import (
@@ -15,6 +16,12 @@ from panoptic_perception.dataset.augmentations import (
     letterbox_with_masks
 )
 from panoptic_perception.dataset.mosaic_augmentation import mosaic_augmentation
+from panoptic_perception.dataset.adverse_weather import (
+    apply_nighttime_fog, 
+    FogParameters, SyntheticFogGenerator, SyntheticLowLightGenerator,
+    HeuristicDepthEstimator
+)
+
 from enum import Enum
 
 def visualize_batch(images, seg, drivable, targets, save_dir, batch_index=0):
@@ -616,3 +623,236 @@ class BDD100KDataset(Dataset):
             "scene_attributes": scene_attributes
         }
     
+class FoggyBDD100KDataset(BDD100KDataset):
+    def __init__(self, dataset_kwargs, dataset_type = 'train', 
+                perform_augmentation = False, mode = DatasetMode.TRAIN,
+                strict_map:bool=True, apply_fog_prob:float=0.67):
+
+        super().__init__(dataset_kwargs, dataset_type, perform_augmentation, mode)
+            
+        assert os.path.exists(dataset_kwargs["depth_map_dir"]), f"Depth Map directory {dataset_kwargs["depth_map_dir"]} does not exist."
+        self.depth_map_dir = dataset_kwargs["depth_map_dir"]
+        self.adverse_params = dataset_kwargs["adverse_params"]
+
+        self.depth_map_ids = self.get_depth_map_ids()
+        
+        if strict_map:
+            image_set = set(self.image_ids)
+            depth_set = set(self.depth_map_ids)
+
+            assert image_set == depth_set, (
+                f"Image-depth ID mismatch: "
+                f"{len(image_set - depth_set)} images missing depth, "
+                f"{len(depth_set - image_set)} depth maps missing images"
+            )
+
+        else:
+            common_ids = set(self.image_ids) & set(self.depth_map_ids)
+            self.image_ids = [id for id in self.image_ids if id in common_ids]
+            
+        self.apply_fog_prob = apply_fog_prob
+        
+        self.fog_betas = self.adverse_params.get("fog_betas", [0.005, 0.010, 0.020])
+        self.darkness_gammas = self.adverse_params.get("darkness_gammas", [1.3, 1.6, 2.0])
+        self.atmospheric_light_quantile = self.adverse_params.get("atmospheric_light_quantile", 0.9)
+        self.atmospheric_light_min_pixels = self.adverse_params.get("atmospheric_light_min_pixels", 16)
+        self.max_depth_meters = self.adverse_params.get("max_depth_meters", 120.0)
+        
+        # All (beta, gamma) combinations
+        self.variants = self._build_variants()
+
+        self._served = defaultdict(set)
+        
+        self.fog_generator = SyntheticFogGenerator(
+            depth_estimator=HeuristicDepthEstimator(
+                vertical_weight=0.7,
+                intensity_weight=0.2,
+                edge_weight=0.1,
+                edge_epsilon=1e-8,
+                uint8_max=255.0,
+            )
+        )
+        self.lowlight_generator = SyntheticLowLightGenerator(
+            gamma_min=min(self.darkness_gammas),
+            gamma_max=max(self.darkness_gammas),
+            gamma_min_threshold=1.0,
+        )
+
+    def get_depth_map_ids(self):
+        return [f.split('.')[0] for f in os.listdir(os.path.join(self.depth_map_dir, self.dataset_type))]
+
+    def _build_variants(self):
+        """
+        Builds variant list with three categories:
+        - Fog only:      (beta, None)  — no darkness applied
+        - Darkness only: (None, gamma) — no fog applied
+        - Compound:      (beta, gamma) — both applied
+
+        Controlled by adverse_params keys:
+            "enable_fog_only": True (default)
+            "enable_darkness_only": True (default)
+            "enable_compound": True (default)
+        """
+        variants = []
+
+        if self.adverse_params.get("enable_fog_only", True):
+            variants += [(b, None) for b in self.fog_betas]
+
+        if self.adverse_params.get("enable_darkness_only", True):
+            variants += [(None, g) for g in self.darkness_gammas]
+
+        if self.adverse_params.get("enable_compound", True):
+            variants += [(b, g) for b in self.fog_betas for g in self.darkness_gammas]
+
+        assert len(variants) > 0, "At least one variant type must be enabled"
+        return variants
+
+    def _select_degradation(self, scene_attributes, beta, gamma):
+        """Adjust or skip degradation based on scene context."""
+        """
+        ┌───────────────────┬───────────────────────┬─────────────────────┐
+        │       Scene       │     Fog applied?      │  Darkness applied?  │
+        ├───────────────────┼───────────────────────┼─────────────────────┤
+        │ clear × daytime   │ Yes (any beta)        │ Yes (any gamma)     │
+        ├───────────────────┼───────────────────────┼─────────────────────┤
+        │ clear × dawn/dusk │ Yes (any beta)        │ Yes (capped at 1.5) │
+        ├───────────────────┼───────────────────────┼─────────────────────┤
+        │ clear × night     │ Yes (any beta)        │ No                  │
+        ├───────────────────┼───────────────────────┼─────────────────────┤
+        │ rainy × daytime   │ Yes (capped at 0.010) │ Yes (any gamma)     │
+        ├───────────────────┼───────────────────────┼─────────────────────┤
+        │ foggy × daytime   │ No                    │ Yes (any gamma)     │
+        ├───────────────────┼───────────────────────┼─────────────────────┤
+        │ foggy × night     │ No                    │ No → serve clean    │
+        ├───────────────────┼───────────────────────┼─────────────────────┤
+        │ snowy × night     │ Yes (capped at 0.010) │ No                  │
+        └───────────────────┴───────────────────────┴─────────────────────┘        
+        """
+
+        weather = scene_attributes.get("weather", "undefined") if scene_attributes else "undefined"
+        tod = scene_attributes.get("timeofday", "undefined") if scene_attributes else "undefined"
+
+        # Already foggy — don't add more fog
+        if weather == "foggy":
+            beta = None
+
+        # Already night — skip or reduce darkness
+        if tod == "night":
+            gamma = None
+
+        # Dawn/dusk — cap darkness to mild only
+        if tod == "dawn/dusk" and gamma is not None:
+            gamma = min(gamma, 1.5)
+
+        # Rainy/snowy — reduce fog intensity (rain already reduces visibility)
+        if weather in ("rainy", "snowy") and beta is not None:
+            beta = min(beta, 0.010)
+
+        return beta, gamma
+
+    def _load_raw(self, index):
+        image, bboxes, class_labels, \
+            scene_attributes, seg, drivable, image_path = super()._load_raw(index)
+            
+        depth_map_id = self.depth_map_ids[index]
+
+        depth_map_path = os.path.join(self.depth_map_dir, self.dataset_type, f"{depth_map_id}.npy")
+        assert os.path.exists(depth_map_path), f"Image path {depth_map_path} does not exist."
+
+        depth_map_arr = np.load(str(depth_map_path))
+
+        return image, depth_map_arr, bboxes, class_labels, scene_attributes, seg, drivable, image_path
+    
+    def _next_variant(self, image_id: str):
+        
+        served = self._served[image_id]
+    
+        if len(served) >= len(self.variants):
+            served.clear()
+
+        remaining = [i for i in range(len(self.variants)) if i not in served]
+        chosen_idx = random.choice(remaining)
+        served.add(chosen_idx)
+
+        return self.variants[chosen_idx]        
+    
+    def _apply_degradation(self, image, depth_map_arr, beta, gamma):
+        """Apply fog and/or darkness to the raw image. Returns degraded uint8 RGB."""
+        if beta is not None and gamma is not None:
+            params = FogParameters(
+                beta=beta,
+                max_depth_meters=self.max_depth_meters,
+                atmospheric_light_quantile=self.atmospheric_light_quantile,
+                atmospheric_light_min_pixels=self.atmospheric_light_min_pixels,
+            )
+            image, _, _ = apply_nighttime_fog(
+                image_rgb=image,
+                fog_generator=self.fog_generator,
+                fog_params=params,
+                gamma_generator=self.lowlight_generator,
+                gamma=gamma,
+                apply_order="dark_then_fog",
+                precomputed_depth=depth_map_arr,
+            )
+        elif beta is not None:
+            params = FogParameters(
+                beta=beta,
+                max_depth_meters=self.max_depth_meters,
+                atmospheric_light_quantile=self.atmospheric_light_quantile,
+                atmospheric_light_min_pixels=self.atmospheric_light_min_pixels,
+            )
+            image, _, _ = self.fog_generator.generate(
+                image_rgb=image,
+                params=params,
+                precomputed_depth=depth_map_arr,
+            )
+        elif gamma is not None:
+            image = self.lowlight_generator.apply(image, gamma)
+
+        return image
+
+    def prepare_training_sample(self, index):
+        image, depth_map_arr, bboxes, class_labels, \
+            scene_attributes, seg, drivable, image_path = self._load_raw(index)
+
+        # Step 1: Decide foggy or clean
+        apply_fog = random.random() < self.apply_fog_prob
+
+        # Step 2: Apply degradation BEFORE augmentations (depth aligned to raw image)
+        if apply_fog:
+            image_id = self.image_ids[index]
+            beta, gamma = self._next_variant(image_id)
+            beta, gamma = self._select_degradation(scene_attributes, beta, gamma)
+            image = self._apply_degradation(image, depth_map_arr, beta, gamma)
+
+        # Step 3: Standard augmentations only (no mosaic, mixup, copy-paste)
+        if self.perform_augmentation:
+            image, seg, drivable, labels_xywh = self.preprocessor.standard_augmentations(
+                image=image, seg=seg, drivable=drivable,
+                bboxes=bboxes, class_labels=class_labels
+            )
+        else:
+            t = self.preprocessor.transformation(
+                image=image, bboxes=bboxes, class_labels=class_labels
+            )
+            image, bboxes, class_labels = t['image'], t['bboxes'], t['class_labels']
+            if seg is not None:
+                seg = self.preprocessor.mask_only_transformation(image=seg)['image']
+            if drivable is not None:
+                drivable = self.preprocessor.mask_only_transformation(image=drivable)['image']
+            labels_xywh = self.preprocessor.prepare_targets_2d(bboxes, class_labels)
+
+        # Step 4: Convert to tensors (same output format as parent)
+        image_tensor = self.preprocessor.normalize_tensor(torch.from_numpy(image).permute(2, 0, 1))
+        targets = torch.from_numpy(labels_xywh).float()
+        seg_tensor = torch.from_numpy(seg).long() if seg is not None else None
+        drivable_tensor = torch.from_numpy(drivable).long() if drivable is not None else None
+
+        return {
+            "image": image_tensor,
+            "segmentation_mask": seg_tensor,
+            "drivable_mask": drivable_tensor,
+            "detection_targets": targets,
+            "image_path": image_path,
+            "scene_attributes": scene_attributes
+        }

@@ -19,6 +19,17 @@
     },
 
     "dataset_kwargs":{
+        "dataset_class": "foggy",
+        "depth_map_dir": "/workspace/data/depth_maps",
+        "strict_map": true,
+        "apply_fog_prob": 0.67,
+        "adverse_params": {
+            "fog_betas": [0.005, 0.010, 0.020],
+            "darkness_gammas": [1.3, 1.6, 2.0],
+            "enable_fog_only": true,
+            "enable_darkness_only": true,
+            "enable_compound": true
+        },
         "images_dir": "/workspace/data/100k/100k",
         "detection_annotations_dir": "/workspace/data/bdd100k_labels/100k",
         "segmentation_annotations_dir": "",
