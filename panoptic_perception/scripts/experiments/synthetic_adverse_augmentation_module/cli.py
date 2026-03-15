@@ -6,7 +6,7 @@ import json
 from panoptic_perception.dataset.adverse_weather.analysis import compute_distribution_features, summarize_feature_distributions
 from panoptic_perception.dataset.adverse_weather.augmentors import SyntheticFogGenerator, SyntheticLowLightGenerator
 from panoptic_perception.dataset.adverse_weather.config import load_config
-from panoptic_perception.dataset.adverse_weather.dataset_builder import build_paired_dataset_grid, build_depth_dataset
+from panoptic_perception.dataset.adverse_weather.dataset_builder import build_paired_dataset_grid, build_depth_dataset, build_depth_dataset_batch
 from panoptic_perception.dataset.adverse_weather.depth_estimators import (
     DepthAnythingEstimator,
     DepthEstimator,
@@ -72,6 +72,15 @@ def main() -> None:
     depth_parser.add_argument("--depth-model-name", default=None)
     depth_parser.add_argument("--device", default=None)
 
+    batch_parser = subparsers.add_parser("depth-only-batch", help="Batched depth map generation (faster, requires depth_anything)")
+    batch_parser.add_argument("--input-images-dir", required=True)
+    batch_parser.add_argument("--output-dir", required=True)
+    batch_parser.add_argument("--depth-model-name", default=None)
+    batch_parser.add_argument("--device", default=None)
+    batch_parser.add_argument("--batch-size", type=int, default=16)
+    batch_parser.add_argument("--num-workers", type=int, default=4)
+    batch_parser.add_argument("--write-threads", type=int, default=4)
+
     analyze_parser = subparsers.add_parser("analyze", help="Compare synthetic vs real distributions")
     analyze_parser.add_argument("--synthetic-dir", required=True)
     analyze_parser.add_argument("--real-dir", required=True)
@@ -127,6 +136,23 @@ def main() -> None:
             config_path=args.config,
         )
     
+    elif args.command == "depth-only-batch":
+        if args.depth_model_name is not None:
+            cfg = {**cfg, "depth_anything": {**cfg.get("depth_anything", {}), "model_name": args.depth_model_name}}
+        if args.device is not None:
+            cfg = {**cfg, "depth_anything": {**cfg.get("depth_anything", {}), "device": args.device}}
+
+        estimator = _build_depth_estimator("depth_anything", cfg)
+        build_depth_dataset_batch(
+            input_images_dir=args.input_images_dir,
+            output_dir=args.output_dir,
+            depth_estimator=estimator,
+            config_path=args.config,
+            batch_size=args.batch_size,
+            num_workers=args.num_workers,
+            write_threads=args.write_threads,
+        )
+
     elif args.command == "analyze":
         synthetic = compute_distribution_features(
             args.synthetic_dir, config_path=args.config
