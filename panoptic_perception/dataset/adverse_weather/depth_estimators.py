@@ -236,3 +236,132 @@ class DepthAnythingEstimator:
 
         del post
         return depths
+
+
+class TorchCompiledDepthEstimator:
+    """Wraps DepthAnythingEstimator with torch.compile for faster inference.
+
+    Compilation happens lazily on first call. The first inference is slow
+    (compilation overhead), subsequent calls benefit from compiled kernels.
+    """
+
+    def __init__(
+        self,
+        model_name: str,
+        device: str,
+        normalization_epsilon: float,
+        compile_mode: str = "reduce-overhead",
+    ) -> None:
+        self._inner = DepthAnythingEstimator(model_name, device, normalization_epsilon)
+        self._compile_mode = compile_mode
+        self._compiled = False
+
+    def _ensure_compiled(self) -> None:
+        self._inner._ensure_loaded()
+        if self._compiled:
+            return
+        self._inner._model = torch.compile(
+            self._inner._model, mode=self._compile_mode
+        )
+        self._compiled = True
+        print(
+            f"[TorchCompiledDepthEstimator] Compiled with mode={self._compile_mode}"
+        )
+
+    def estimate(self, image_rgb: np.ndarray) -> np.ndarray:
+        self._ensure_compiled()
+        return self._inner.estimate(image_rgb)
+
+    def estimate_batch(self, images_rgb: list[np.ndarray]) -> list[np.ndarray]:
+        self._ensure_compiled()
+        return self._inner.estimate_batch(images_rgb)
+
+
+class TensorRTDepthEstimator:
+    """Depth estimation via a pre-compiled TensorRT engine.
+
+    Expects an engine built from the Depth Anything ONNX export.
+    Input: pixel_values (1, 3, input_size, input_size) float32.
+    Output: predicted_depth (1, input_size, input_size) float32.
+
+    Requires: tensorrt, pycuda.
+    """
+
+    _MEAN = np.array([0.485, 0.456, 0.406], dtype=np.float32)
+    _STD = np.array([0.229, 0.224, 0.225], dtype=np.float32)
+
+    def __init__(
+        self,
+        engine_path: str,
+        input_size: int = 518,
+        normalization_epsilon: float = 1e-8,
+    ) -> None:
+        self.engine_path = engine_path
+        self._input_size = input_size
+        self._normalization_epsilon = normalization_epsilon
+        self._context = None
+        self._d_input = None
+        self._d_output = None
+        self._stream = None
+
+    def _ensure_loaded(self) -> None:
+        if self._context is not None:
+            return
+
+        try:
+            import tensorrt as trt
+            import pycuda.driver as cuda
+            import pycuda.autoinit  # noqa: F401
+        except ImportError as exc:
+            raise ImportError(
+                "TensorRTDepthEstimator requires `tensorrt` and `pycuda`."
+            ) from exc
+
+        logger = trt.Logger(trt.Logger.WARNING)
+        with open(self.engine_path, "rb") as f, trt.Runtime(logger) as runtime:
+            engine = runtime.deserialize_cuda_engine(f.read())
+
+        self._context = engine.create_execution_context()
+
+        s = self._input_size
+        input_nbytes = 1 * 3 * s * s * np.dtype(np.float32).itemsize
+        output_nbytes = 1 * s * s * np.dtype(np.float32).itemsize
+
+        self._d_input = cuda.mem_alloc(input_nbytes)
+        self._d_output = cuda.mem_alloc(output_nbytes)
+        self._stream = cuda.Stream()
+        self._cuda = cuda
+
+        print(f"[TensorRTDepthEstimator] Loaded {self.engine_path}")
+
+    def _preprocess(self, image_rgb: np.ndarray) -> np.ndarray:
+        img = cv2.resize(
+            image_rgb, (self._input_size, self._input_size),
+            interpolation=cv2.INTER_CUBIC,
+        )
+        img = img.astype(np.float32) / 255.0
+        img = (img - self._MEAN) / self._STD
+        img = np.transpose(img, (2, 0, 1))  # HWC → CHW
+        return np.expand_dims(img, 0).astype(np.float32)  # (1, 3, H, W)
+
+    def estimate(self, image_rgb: np.ndarray) -> np.ndarray:
+        self._ensure_loaded()
+
+        h, w = image_rgb.shape[:2]
+        input_tensor = np.ascontiguousarray(self._preprocess(image_rgb))
+
+        self._cuda.memcpy_htod_async(self._d_input, input_tensor, self._stream)
+        self._context.execute_async_v2(
+            bindings=[int(self._d_input), int(self._d_output)],
+            stream_handle=self._stream.handle,
+        )
+        output = np.empty((1, self._input_size, self._input_size), dtype=np.float32)
+        self._cuda.memcpy_dtoh_async(output, self._d_output, self._stream)
+        self._stream.synchronize()
+
+        depth = output.squeeze()
+        depth = cv2.resize(depth, (w, h), interpolation=cv2.INTER_LINEAR)
+
+        dmin, dmax = depth.min(), depth.max()
+        depth = 1.0 - (depth - dmin) / (dmax - dmin + self._normalization_epsilon)
+        return np.clip(depth, 0.0, 1.0).astype(np.float32)

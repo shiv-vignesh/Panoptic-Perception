@@ -624,9 +624,10 @@ class BDD100KDataset(Dataset):
         }
     
 class FoggyBDD100KDataset(BDD100KDataset):
-    def __init__(self, dataset_kwargs, dataset_type = 'train', 
+    def __init__(self, dataset_kwargs, dataset_type = 'train',
                 perform_augmentation = False, mode = DatasetMode.TRAIN,
-                strict_map:bool=True, apply_fog_prob:float=0.67):
+                strict_map:bool=True, apply_fog_prob:float=0.67,
+                depth_estimator=None):
 
         super().__init__(dataset_kwargs, dataset_type, perform_augmentation, mode)
 
@@ -666,20 +667,8 @@ class FoggyBDD100KDataset(BDD100KDataset):
 
         self._served = defaultdict(set)
         
-        # Build depth estimator based on config
-        depth_backend = self.adverse_params.get("depth_backend", "heuristic")
-        if depth_backend == "depth_anything":
-            self.depth_estimator = DepthAnythingEstimator(
-                model_name=self.adverse_params.get("depth_model_name", "LiheYoung/depth-anything-small-hf"),
-                device=self.adverse_params.get("depth_device", "cuda"),
-                normalization_epsilon=1e-8,
-            )
-        elif depth_backend == "onnx":
-            self.depth_estimator = ONNXDepthEstimator(
-                onnx_path=self.adverse_params["onnx_model_path"],
-                device=self.adverse_params.get("depth_device", "cuda"),
-                input_size=self.adverse_params.get("depth_input_size", 518),
-            )
+        if depth_estimator is not None:
+            self.depth_estimator = depth_estimator
         else:
             self.depth_estimator = HeuristicDepthEstimator(
                 vertical_weight=0.7,

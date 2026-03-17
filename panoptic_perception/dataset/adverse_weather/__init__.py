@@ -34,6 +34,8 @@ from .depth_estimators import (
     DepthEstimator,
     HeuristicDepthEstimator,
     ONNXDepthEstimator,
+    TensorRTDepthEstimator,
+    TorchCompiledDepthEstimator,
 )
 
 __all__ = [
@@ -45,6 +47,8 @@ __all__ = [
     "FogParameters",
     "HeuristicDepthEstimator",
     "ONNXDepthEstimator",
+    "TensorRTDepthEstimator",
+    "TorchCompiledDepthEstimator",
     "SyntheticFogGenerator",
     "SyntheticLowLightGenerator",
     "ImagePathDataset",

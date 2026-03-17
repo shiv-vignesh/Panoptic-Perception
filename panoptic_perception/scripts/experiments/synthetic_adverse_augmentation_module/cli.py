@@ -11,6 +11,9 @@ from panoptic_perception.dataset.adverse_weather.depth_estimators import (
     DepthAnythingEstimator,
     DepthEstimator,
     HeuristicDepthEstimator,
+    ONNXDepthEstimator,
+    TensorRTDepthEstimator,
+    TorchCompiledDepthEstimator,
 )
 
 
@@ -30,6 +33,27 @@ def _build_depth_estimator(backend: str, cfg: dict) -> DepthEstimator:
             model_name=d["model_name"],
             device=d["device"],
             normalization_epsilon=d["normalization_epsilon"],
+        )
+    if backend == "torch_compile":
+        d = cfg["depth_anything"]
+        return TorchCompiledDepthEstimator(
+            model_name=d["model_name"],
+            device=d["device"],
+            normalization_epsilon=d["normalization_epsilon"],
+            compile_mode=d.get("compile_mode", "reduce-overhead"),
+        )
+    if backend == "onnx":
+        return ONNXDepthEstimator(
+            onnx_path=cfg["onnx"]["model_path"],
+            device=cfg["onnx"].get("device", "cuda"),
+            input_size=cfg["onnx"].get("input_size", 518),
+            normalization_epsilon=cfg["onnx"].get("normalization_epsilon", 1e-8),
+        )
+    if backend == "tensorrt":
+        return TensorRTDepthEstimator(
+            engine_path=cfg["tensorrt"]["engine_path"],
+            input_size=cfg["tensorrt"].get("input_size", 518),
+            normalization_epsilon=cfg["tensorrt"].get("normalization_epsilon", 1e-8),
         )
     raise ValueError(f"Unknown depth backend: {backend}")
 
@@ -51,7 +75,7 @@ def main() -> None:
     build_parser.add_argument("--output-dir", required=True)
     build_parser.add_argument(
         "--depth-backend",
-        choices=["heuristic", "depth_anything"],
+        choices=["heuristic", "depth_anything", "torch_compile", "onnx", "tensorrt"],
         default=None,
         help="Override config. Default: heuristic",
     )
@@ -66,7 +90,7 @@ def main() -> None:
     depth_parser.add_argument("--output-dir", required=True)
     depth_parser.add_argument(
         "--depth-backend",
-        choices=["heuristic", "depth_anything"],
+        choices=["heuristic", "depth_anything", "torch_compile", "onnx", "tensorrt"],
         default=None,
     )
     depth_parser.add_argument("--depth-model-name", default=None)
