@@ -94,19 +94,28 @@ class ONNXDepthEstimator:
             ) from exc
 
         providers = []
-        if self._device == "cuda":
+        provider_options = []
+        if self._device.startswith("cuda"):
+            device_id = 0
+            if ":" in self._device:
+                device_id = int(self._device.split(":")[1])
+
             available = ort.get_available_providers()
             if "TensorrtExecutionProvider" in available:
                 providers.append("TensorrtExecutionProvider")
+                provider_options.append({"device_id": str(device_id)})
             if "CUDAExecutionProvider" in available:
                 providers.append("CUDAExecutionProvider")
+                provider_options.append({"device_id": str(device_id)})
         providers.append("CPUExecutionProvider")
+        provider_options.append({})
 
         sess_opts = ort.SessionOptions()
         sess_opts.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_ALL
 
         self._session = ort.InferenceSession(
-            self.onnx_path, sess_options=sess_opts, providers=providers
+            self.onnx_path, sess_options=sess_opts,
+            providers=providers, provider_options=provider_options,
         )
         active = self._session.get_providers()
         print(f"[ONNXDepthEstimator] Loaded {self.onnx_path} | providers: {active}")
