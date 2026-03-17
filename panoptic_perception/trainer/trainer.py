@@ -232,19 +232,19 @@ class Trainer:
                 from panoptic_perception.dataset.adverse_weather.depth_estimators import ONNXDepthEstimator
                 depth_estimator = ONNXDepthEstimator(
                     onnx_path=adverse_params["onnx_backend_path"],
-                    device="cuda", input_size=518, normalization_epsilon=1e-8,
+                    device=str(self.device), input_size=518, normalization_epsilon=1e-8,
                 )
             elif depth_backend == "depth_anything":
                 from panoptic_perception.dataset.adverse_weather.depth_estimators import DepthAnythingEstimator
                 depth_estimator = DepthAnythingEstimator(
                     model_name="LiheYoung/depth-anything-small-hf",
-                    device="cuda", normalization_epsilon=1e-8,
+                    device=str(self.device), normalization_epsilon=1e-8,
                 )
             elif depth_backend == "torch_compile":
                 from panoptic_perception.dataset.adverse_weather.depth_estimators import TorchCompiledDepthEstimator
                 depth_estimator = TorchCompiledDepthEstimator(
                     model_name="LiheYoung/depth-anything-small-hf",
-                    device="cuda", normalization_epsilon=1e-8,
+                    device=str(self.device), normalization_epsilon=1e-8,
                 )
             # else: None → FoggyBDD100KDataset defaults to heuristic
 
