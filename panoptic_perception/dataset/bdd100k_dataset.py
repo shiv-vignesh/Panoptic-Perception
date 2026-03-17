@@ -5,6 +5,7 @@ import numpy as np
 import os
 import json
 import cv2
+import hashlib
 import random
 import albumentations as A
 from collections import defaultdict
@@ -660,7 +661,7 @@ class FoggyBDD100KDataset(BDD100KDataset):
         self.darkness_gammas = self.adverse_params.get("darkness_gammas", [1.5, 2.0, 3.5])
         self.atmospheric_light_quantile = self.adverse_params.get("atmospheric_light_quantile", 0.9)
         self.atmospheric_light_min_pixels = self.adverse_params.get("atmospheric_light_min_pixels", 16)
-        self.max_depth_meters = self.adverse_params.get("max_depth_meters", 120.0)
+        self.max_depth_meters = self.adverse_params.get("max_depth_meters", 150.0)
         
         # All (beta, gamma) combinations
         self.variants = self._build_variants()
@@ -831,12 +832,19 @@ class FoggyBDD100KDataset(BDD100KDataset):
             scene_attributes, seg, drivable, image_path = self._load_raw(index)
 
         # Step 1: Decide foggy or clean
-        apply_fog = random.random() < self.apply_fog_prob
+        if self.mode == DatasetMode.TRAIN:
+            apply_fog = random.random() < self.apply_fog_prob
+        else:
+            apply_fog = True
 
         # Step 2: Apply degradation BEFORE augmentations (depth aligned to raw image)
         if apply_fog:
             image_id = self.image_ids[index]
-            beta, gamma = self._next_variant(image_id)
+            if self.mode == DatasetMode.TRAIN:
+                beta, gamma = self._next_variant(image_id)
+            else:
+                variant_idx = int(hashlib.md5(image_id.encode()).hexdigest(), 16) % len(self.variants)
+                beta, gamma = self.variants[variant_idx]
             beta, gamma = self._select_degradation(scene_attributes, beta, gamma)
             image = self._apply_degradation(image, depth_map_arr, beta, gamma)
 

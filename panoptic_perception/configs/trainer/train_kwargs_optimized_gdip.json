@@ -1,0 +1,155 @@
+{
+    "_description": "Optimized config for joint detection + drivable training with advanced augmentations",
+
+    "model_kwargs":{
+        "model_type":"yolop",
+        "cfg_path":"panoptic_perception/configs/models/yolo-768-1280-detection.cfg",
+        "device":"cuda:0",
+        "use_gdip":true,
+        "gdip_kwargs":{
+            "mode": "gdip",
+            "encoder" : {
+                "type":"resnet18",
+                "latent_dim":256,
+                "pretrained":true,
+                "tap_layers":[]
+            },
+            "visualize_intermediate":true
+        }        
+    },
+
+    "dataset_kwargs":{
+        "dataset_class": "foggy",
+        "depth_map_dir": "",
+        "strict_map": false,
+        "apply_fog_prob": 0.67,
+        "adverse_params": {
+            "fog_betas": [0.015, 0.025, 0.040, 0.060],
+            "darkness_gammas": [1.5, 2.0, 3.5],
+            "enable_fog_only": true,
+            "enable_darkness_only": true,
+            "enable_compound": true,
+            "depth_backend": "heuristic",
+            "onnx_backend_path": "",
+            "max_depth_meters": 150.0
+        },
+        "images_dir": "/workspace/data/100k/100k",
+        "detection_annotations_dir": "/workspace/data/bdd100k_labels/100k",
+        "segmentation_annotations_dir": "",
+        "drivable_annotations_dir": "/workspace/data/drivable_maps/labels",
+        "train_batch_size": 8,
+        "train_shuffle": true,
+        "train_num_workers": 4,
+        "train_preprocessor_kwargs":{
+            "image_resize": [768, 1280],
+            "original_image_size": [720, 1280],
+            "perform_augmentation": true,
+            "augment_params": {
+                "degrees": 10,
+                "translate": 0.1,
+                "scale": 0.25,
+                "shear": 5,
+                "hsv_h": 0.015,
+                "hsv_s": 0.7,
+                "hsv_v": 0.4,
+                "salt_prob": 0.005,
+                "pepper_prob": 0.005,
+                "flip_prob": 0.5,
+                "img_size": [768, 1280]
+            },
+            "advanced_aug": {
+                "mosaic_prob": 0.0,
+                "mixup_prob": 0.0,
+                "copy_paste_prob": 0.0
+            }
+        },
+        "val_batch_size": 8,
+        "val_shuffle": false,
+        "val_num_workers": 4,
+        "val_preprocessor_kwargs":{
+            "image_resize": [768, 1280],
+            "original_image_size": [720, 1280]
+        }
+    },
+
+    "optimizer_kwargs":{
+        "_description": "AdamW optimizer - all layers trainable for joint training",
+        "_type": "AdamW",
+        "initial_lr": 1e-3,
+        "weight_decay": 0.01,
+        "momentum": 0.937,
+        "warmup_bias_lr": 0.1,
+        "warmup_momentum": 0.8,
+        "warmup_epochs": 3,
+        "groups": {
+            "backbone": {
+                "group": [0, 23],
+                "trainable": true
+            },
+            "detect": {
+                "group": [24],
+                "trainable": true
+            },
+            "segmentation": {
+                "group": [25, 33],
+                "trainable": false
+            }
+        },
+        "gdip_groups": {
+            "vision_encoder": {"trainable": true, "lr_scale": 1.0},
+            "gdip_module": {"trainable": true, "lr_scale": 1.0}
+        }
+    },
+
+    "lr_scheduler_kwargs":{
+        "_type": "cosine",
+        "linear_lr_kwargs":{
+            "start_factor": 1.0,
+            "end_factor": 0.01
+        },
+        "cosine_annealing_lr_kwargs":{
+            "eta_min": 1e-6
+        }
+    },
+
+    "trainer_kwargs":{
+        "output_dir": "gdip-yolov5p-768-1280-backbone-Tuned",
+        "eval_visualize_outputs":true,
+        "is_training": true,
+        "first_val_epoch": 0,
+        "metric_eval_mode": "strict",
+        "metric_average_mode": "macro",
+        "epochs": 100,
+        "monitor_train": true,
+        "monitor_val": true,
+        "gradient_clipping": 1.0,
+        "checkpoint_idx": 2,
+        "gradient_accumulation_steps": 2,
+        "lr_scheduler_start_epoch": 1,
+        "checkpoint_path": "/workspace/yolop-detection-768x1280-new-anchors/best_model.pt",
+        "reload_optimizer": false,
+        "reload_optimizer_with_initial_lr": false,
+
+        "wandb_project": "GDIP-YOLOP-detection",
+        "wandb_enabled": true,
+        "use_ema": false,
+        "ema_decay": 0.9999,
+        "ema_warmup_steps": 2000,
+
+        "staged_training": {
+            "enabled": false,
+            "stages": [
+                {"start_epoch": 1,  "end_epoch": 10, "trainable": ["gdip"], "lr_scales": {"gdip": 1.0}},
+                {"start_epoch": 11, "end_epoch": 20, "trainable": ["gdip", "backbone"], "lr_scales": {"gdip": 1.0, "backbone": 0.1}},
+                {"start_epoch": 21, "end_epoch": -1, "trainable": ["gdip", "backbone", "detect"], "lr_scales": {"gdip": 1.0, "backbone": 0.1, "detect": 0.01}}
+            ]
+        }
+    },
+
+    "loss_weights": {
+        "_description": "Multi-task loss weights - detection prioritized",
+        "detection": 1.0,
+        "drivable_segmentation": 1.0,
+        "lane_segmentation": 0.0
+    }
+}

@@ -11,7 +11,7 @@ from torch.utils.data.dataloader import DataLoader
 
 import numpy as np
 
-from panoptic_perception.dataset.bdd100k_dataset import BDD100KDataset, FoggyBDD100KDataset, BDDPreprocessor
+from panoptic_perception.dataset.bdd100k_dataset import BDD100KDataset, FoggyBDD100KDataset, BDDPreprocessor, DatasetMode
 
 import gc
 
@@ -143,6 +143,11 @@ class Trainer:
         self.ema_warmup_steps = trainer_kwargs.get('ema_warmup_steps', 2000)
         self.ema = None  # Initialized in train()
 
+        # Staged training (progressive unfreezing)
+        staged = trainer_kwargs.get("staged_training", {})
+        self.staged_training_enabled = staged.get("enabled", False)
+        self.staged_training_stages = staged.get("stages", [])
+
         # Best model tracking
         self.best_map = 0.0
         self.best_epoch = 0
@@ -217,6 +222,40 @@ class Trainer:
 
         dataset_class = dataset_kwargs.get("dataset_class", "default")
 
+        # Build depth estimator for foggy datasets
+        depth_estimator = None
+        if dataset_class == "foggy":
+            adverse_params = dataset_kwargs.get("adverse_params", {})
+            depth_backend = adverse_params.get("depth_backend", "heuristic")
+
+            if depth_backend == "onnx":
+                from panoptic_perception.dataset.adverse_weather.depth_estimators import ONNXDepthEstimator
+                depth_estimator = ONNXDepthEstimator(
+                    onnx_path=adverse_params["onnx_backend_path"],
+                    device="cuda", input_size=518, normalization_epsilon=1e-8,
+                )
+            elif depth_backend == "depth_anything":
+                from panoptic_perception.dataset.adverse_weather.depth_estimators import DepthAnythingEstimator
+                depth_estimator = DepthAnythingEstimator(
+                    model_name="LiheYoung/depth-anything-small-hf",
+                    device="cuda", normalization_epsilon=1e-8,
+                )
+            elif depth_backend == "torch_compile":
+                from panoptic_perception.dataset.adverse_weather.depth_estimators import TorchCompiledDepthEstimator
+                depth_estimator = TorchCompiledDepthEstimator(
+                    model_name="LiheYoung/depth-anything-small-hf",
+                    device="cuda", normalization_epsilon=1e-8,
+                )
+            # else: None → FoggyBDD100KDataset defaults to heuristic
+
+            if depth_backend != "heuristic":
+                self.logger.log_message(
+                    f"[Dataloader] depth_backend={depth_backend} requires CUDA "
+                    f"-> overriding num_workers to 0 (CUDA unavailable in forked workers)"
+                )
+                dataset_kwargs["train_num_workers"] = 0
+                dataset_kwargs["val_num_workers"] = 0
+
         def create_base_dataset_kwargs(images_dir, detection_annotations_dir,
                                         segmentation_annotations_dir, drivable_annotations_dir,
                                         preprocessor_kwargs):
@@ -250,6 +289,7 @@ class Trainer:
                     perform_augmentation=perform_augmentation,
                     strict_map=dataset_kwargs.get("strict_map", True),
                     apply_fog_prob=dataset_kwargs.get("apply_fog_prob", 0.67),
+                    depth_estimator=depth_estimator,
                 )
             else:
                 dataset = BDD100KDataset(
@@ -308,8 +348,10 @@ class Trainer:
                 foggy_val_kwargs,
                 dataset_type="val",
                 perform_augmentation=False,
+                mode=DatasetMode.EVAL,
                 strict_map=dataset_kwargs.get("strict_map", True),
                 apply_fog_prob=1.0,
+                depth_estimator=depth_estimator,
             )
 
             self.val_foggy_dataloader = DataLoader(
@@ -511,6 +553,45 @@ class Trainer:
                 self.start_epoch = ckpt.get("epoch", 1)
                 self.logger.log_message(f"Resuming from epoch {self.start_epoch}")
     
+    def _apply_stage(self, epoch):
+        """Progressive unfreezing: adjust trainability and LR per param group based on epoch."""
+        if not self.staged_training_enabled:
+            return
+
+        current_stage = None
+        for stage in self.staged_training_stages:
+            end = stage["end_epoch"] if stage["end_epoch"] != -1 else float("inf")
+            if stage["start_epoch"] <= epoch <= end:
+                current_stage = stage
+                break
+
+        if current_stage is None:
+            return
+
+        trainable_set = set(current_stage["trainable"])
+        lr_scales = current_stage["lr_scales"]
+
+        for pg in self.optimizer.param_groups:
+            name = pg.get("name", "")
+            if name in ("vision_encoder", "gdip_module"):
+                component = "gdip"
+            elif name == "backbone":
+                component = "backbone"
+            elif name == "detect":
+                component = "detect"
+            else:
+                continue
+
+            is_trainable = component in trainable_set
+            for p in pg["params"]:
+                p.requires_grad = is_trainable
+            pg["lr"] = self.lr0 * lr_scales.get(component, 0.0) if is_trainable else 0.0
+
+        if epoch == current_stage["start_epoch"]:
+            self.logger.log_message(
+                f"[Stage] epoch {epoch}: trainable={list(trainable_set)}, lr_scales={lr_scales}"
+            )
+
     def train(self, checkpoint_path:str=None):
         self.logger.log_line()
         
@@ -568,6 +649,7 @@ class Trainer:
 
         for epoch in range(self.start_epoch, self.epochs + 1):
             self.cur_epoch = epoch
+            self._apply_stage(epoch)
             self.logger.log_line()
 
             if self.monitor_train:

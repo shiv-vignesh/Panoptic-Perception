@@ -54,6 +54,7 @@ class SyntheticFogGenerator:
         image_rgb: np.ndarray,
         params: FogParameters,
         precomputed_depth: np.ndarray | None = None,
+        use_spatial_beta: bool = True,
     ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
         image = _to_float01(image_rgb, self._uint8_max)
 
@@ -64,8 +65,14 @@ class SyntheticFogGenerator:
             depth = self.depth_estimator.estimate(img_u8)
         depth = np.clip(depth, 0.0, 1.0)
 
+        beta = params.beta
+        if use_spatial_beta:
+            H = depth.shape[0]
+            y = np.linspace(0.0, 1.0, H, dtype=np.float32).reshape(H, 1)
+            beta = beta * (1.0 + 0.5 * (1.0 - y))  # 1.5x at top, 1.0x at bottom
+
         transmission = np.exp(
-            -params.beta * depth * params.max_depth_meters
+            -beta * depth * params.max_depth_meters
         ).astype(np.float32)
         t = np.clip(transmission, 0.0, 1.0)[..., None]
 
