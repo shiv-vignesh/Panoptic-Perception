@@ -750,13 +750,13 @@ class FoggyBDD100KDataset(BDD100KDataset):
         if tod == "night":
             gamma = None
 
-        # Dawn/dusk — cap darkness to mild only
-        if tod == "dawn/dusk" and gamma is not None:
-            gamma = min(gamma, 1.5)
+        # # Dawn/dusk — cap darkness to mild only
+        # if tod == "dawn/dusk" and gamma is not None:
+        #     gamma = min(gamma, 1.5)
 
-        # Rainy/snowy — reduce fog intensity (rain already reduces visibility)
-        if weather in ("rainy", "snowy") and beta is not None:
-            beta = min(beta, 0.010)
+        # # Rainy/snowy — reduce fog intensity (rain already reduces visibility)
+        # if weather in ("rainy", "snowy") and beta is not None:
+        #     beta = min(beta, 0.010)
 
         return beta, gamma
 
