@@ -756,7 +756,10 @@ class Trainer:
                     warmup_factor = min(1.0, warmup_factor)
 
                     # LR warmup per param group (bias gets special warmup LR)
+                    # Skip groups frozen by staged training (lr == 0)
                     for pg in self.optimizer.param_groups:
+                        if self.staged_training_enabled and pg['lr'] == 0.0:
+                            continue
                         scale = pg.get('lr_scale', 1.0)
                         if 'bias' in pg.get('name',''):
                             pg['lr'] = (self.warmup_bias_lr + warmup_factor * (self.lr0 - self.warmup_bias_lr)) * scale
@@ -795,6 +798,8 @@ class Trainer:
         if hasattr(self, 'lr_scheduler'):
             if self.lr_scheduler_start_epoch != -1 and self.cur_epoch > self.lr_scheduler_start_epoch:
                 self.lr_scheduler.step()
+                if self.staged_training_enabled:
+                    self._apply_stage(self.cur_epoch)
                 current_lr = self.optimizer.param_groups[0]['lr']
 
         # Log epoch-level metrics to WandB
