@@ -719,7 +719,7 @@ class Trainer:
             step_end_time = time.time()
 
             # Log GDIP enhanced images periodically
-            if isinstance(self.model, GDIPYolo) and (batch_idx + 1) % 500 == 0:
+            if isinstance(self.model, GDIPYolo) and (batch_idx + 1) % 200 == 0:
                 if self.model.enhanced_image is not None:
                     
                     enhanced_imgs = self.model.enhanced_image.clamp(0, 1)
