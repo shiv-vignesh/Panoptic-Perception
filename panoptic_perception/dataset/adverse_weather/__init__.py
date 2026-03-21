@@ -33,6 +33,7 @@ from .depth_estimators import (
     DepthAnythingEstimator,
     DepthEstimator,
     HeuristicDepthEstimator,
+    RadialDistance,
     ONNXDepthEstimator,
     TensorRTDepthEstimator,
     TorchCompiledDepthEstimator,

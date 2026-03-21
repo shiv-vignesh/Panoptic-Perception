@@ -75,11 +75,13 @@ class ONNXDepthEstimator:
         device: str = "cuda",
         input_size: int = 518,
         normalization_epsilon: float = 1e-8,
+        quantized: bool = False,
     ) -> None:
         self.onnx_path = onnx_path
         self._input_size = input_size
         self._normalization_epsilon = normalization_epsilon
         self._device = device
+        self._quantized = quantized
         self._session = None
 
     def _ensure_loaded(self) -> None:
@@ -138,7 +140,7 @@ class ONNXDepthEstimator:
         input_tensor = self._preprocess(image_rgb)
 
         outputs = self._session.run(None, {"pixel_values": input_tensor})
-        depth = outputs[0].squeeze()  # (input_size, input_size)
+        depth = outputs[0].squeeze().astype(np.float32)
 
         # Resize back to original image dimensions
         depth = cv2.resize(depth, (w, h), interpolation=cv2.INTER_LINEAR)
@@ -374,3 +376,25 @@ class TensorRTDepthEstimator:
         dmin, dmax = depth.min(), depth.max()
         depth = 1.0 - (depth - dmin) / (dmax - dmin + self._normalization_epsilon)
         return np.clip(depth, 0.0, 1.0).astype(np.float32)
+
+@dataclass
+class RadialDistance:
+
+    radial_depth_decay_rate: float = -0.04
+
+    def estimate(self, image_rgb: np.ndarray):
+        h, w = image_rgb.shape[:2]
+
+        x = np.linspace(0, w-1, w)
+        y = np.linspace(0, h-1, h)
+        xx, yy = np.meshgrid(x, y)
+        x_c, y_c = w // 2, h // 2
+
+        d = RadialDistance.radial_depth_decay_rate * \
+                np.sqrt((yy - y_c)**2 + (xx - x_c)**2) + \
+                    np.sqrt(np.maximum(h, w))
+
+        d_min, d_max = d.min(), d.max()
+        d = ((d - d_min) / (d_max - d_min + 1e-8)).astype(np.float32)
+
+        return d

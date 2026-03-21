@@ -77,7 +77,7 @@ class WandBLogger:
         except Exception as e:
             print(f"WandB image logging failed: {e}")
 
-    def log_images(self, key: str, images: torch.Tensor, step: Optional[int] = None):
+    def log_images(self, key: str, images: torch.Tensor, step: Optional[int] = None, caption = None):
         """
         Log a batch of images to WandB.
 
@@ -90,7 +90,8 @@ class WandBLogger:
             return
 
         try:
-            wandb_images = [wandb.Image(img.permute(1, 2, 0).cpu().numpy()) for img in images]
+            caption=f"Sample {caption}: Original (left) | Enhanced (right)"
+            wandb_images = [wandb.Image(img.permute(1, 2, 0).cpu().numpy(), caption=caption) for img in images]
             wandb.log({key: wandb_images}, step=step)
         except Exception as e:
             print(f"WandB image batch logging failed: {e}")

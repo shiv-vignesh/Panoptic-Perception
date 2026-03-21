@@ -24,13 +24,14 @@
         "strict_map": false,
         "apply_fog_prob": 0.67,
         "adverse_params": {
-            "fog_betas": [0.015, 0.025, 0.040, 0.060],
-            "darkness_gammas": [1.5, 2.0, 3.5],
+            "fog_betas": [0.008, 0.015, 0.025, 0.040],
+            "darkness_gammas": [1.3, 1.5, 2.0],
             "enable_fog_only": true,
             "enable_darkness_only": true,
             "enable_compound": true,
-            "depth_backend": "heuristic",
-            "onnx_backend_path": "",
+            "depth_backend": "onnx",
+            "depth_device": "cuda",
+            "onnx_backend_path": "/workspace/depth_anything_small.onnx",
             "max_depth_meters": 150.0
         },
         "images_dir": "/workspace/data/100k/100k",
@@ -113,24 +114,25 @@
     },
 
     "trainer_kwargs":{
-        "output_dir": "gdip-yolov5p-768-1280-backbone-Tuned",
+        "output_dir": "gdip-yolov5p-768-1280-backbone-Tuned-ONNX-DepthAnything-3",
         "eval_visualize_outputs":true,
         "is_training": true,
         "first_val_epoch": 0,
         "metric_eval_mode": "strict",
         "metric_average_mode": "macro",
         "epochs": 100,
-        "monitor_train": true,
+        "monitor_train": false,
         "monitor_val": true,
         "gradient_clipping": 1.0,
         "checkpoint_idx": 2,
         "gradient_accumulation_steps": 2,
         "lr_scheduler_start_epoch": 1,
-        "checkpoint_path": "/workspace/yolop-detection-768x1280-new-anchors/best_model.pt",
+        "checkpoint_path": "/workspace/Panoptic-Perception/gdip-yolov5p-768-1280-backbone-Tuned-ONNX-DepthAnything-2/checkpoints/ckpt_1/ckpt-1.pt",
         "reload_optimizer": false,
         "reload_optimizer_with_initial_lr": false,
+        "compute_ssim": true,
 
-        "wandb_project": "GDIP-YOLOP-detection",
+        "wandb_project": "GDIP-YOLOP-detection-2",
         "wandb_enabled": true,
         "use_ema": false,
         "ema_decay": 0.9999,
@@ -139,9 +141,7 @@
         "staged_training": {
             "enabled": false,
             "stages": [
-                {"start_epoch": 1,  "end_epoch": 10, "trainable": ["gdip"], "lr_scales": {"gdip": 1.0}},
-                {"start_epoch": 11, "end_epoch": 20, "trainable": ["gdip", "backbone"], "lr_scales": {"gdip": 1.0, "backbone": 0.1}},
-                {"start_epoch": 21, "end_epoch": -1, "trainable": ["gdip", "backbone", "detect"], "lr_scales": {"gdip": 1.0, "backbone": 0.1, "detect": 0.01}}
+                {"start_epoch": 10, "end_epoch": -1, "trainable": ["gdip", "backbone", "detect"], "lr_scales": {"gdip": 1.0, "backbone": 0.1, "detect": 1.0}}
             ]
         }
     },

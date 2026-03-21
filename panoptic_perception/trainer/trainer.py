@@ -147,6 +147,9 @@ class Trainer:
         staged = trainer_kwargs.get("staged_training", {})
         self.staged_training_enabled = staged.get("enabled", False)
         self.staged_training_stages = staged.get("stages", [])
+        
+        self.compute_ssim = trainer_kwargs.get("compute_ssim", True) #GDIP-YOLO 
+        self.lambda_defog = trainer_kwargs.get("lambda_defog", 0.2) #GDIP-YOLO 
 
         # Best model tracking
         self.best_map = 0.0
@@ -718,13 +721,40 @@ class Trainer:
             # Log GDIP enhanced images periodically
             if isinstance(self.model, GDIPYolo) and (batch_idx + 1) % 500 == 0:
                 if self.model.enhanced_image is not None:
-                    enhanced_imgs = (self.model.enhanced_image.clamp(0, 1) * 255).to(torch.uint8)
+                    
+                    enhanced_imgs = self.model.enhanced_image.clamp(0, 1)
+                    original_images = data_items["images"].clamp(0, 1)
+                    
+                    combined = torch.cat([original_images, enhanced_imgs], dim=3)
+                    combined = (combined * 255).to(torch.uint8)
+                    
+                    # enhanced_imgs = (self.model.enhanced_image.clamp(0, 1) * 255).to(torch.uint8)
                     self.wandb_logger.log_images(
                         "train/enhanced_images",
                         enhanced_imgs,
-                        step=self.cur_epoch * self.total_train_batch + batch_idx
+                        step=self.cur_epoch * self.total_train_batch + batch_idx,
+                        caption=f'train_{self.cur_epoch}'
                     )
                     self.model.enhanced_image = None
+
+                # Log GDIP gate firing pattern
+                if self.model.gates is not None:
+                    gate_names = ["white_balance", "gamma", "identity", "sharpening", "defog", "contrast", "tone"]
+                    step = self.cur_epoch * self.total_train_batch + batch_idx
+
+                    if isinstance(self.model.gates, torch.Tensor):
+                        # Single-level GDIP: gates shape (batch_size, 7)
+                        gate_means = self.model.gates.mean(dim=0)
+                        gate_metrics = {f"train/gates/{name}": gate_means[i].item() for i, name in enumerate(gate_names)}
+                        self.wandb_logger.log_metrics(gate_metrics, step=step)
+                    elif isinstance(self.model.gates, list):
+                        # Multi-level GDIP: list of (batch_size, 7) tensors
+                        for block_idx, block_gates in enumerate(self.model.gates):
+                            gate_means = block_gates.mean(dim=0)
+                            gate_metrics = {f"train/gates/block{block_idx}/{name}": gate_means[i].item() for i, name in enumerate(gate_names)}
+                            self.wandb_logger.log_metrics(gate_metrics, step=step)
+
+                    self.model.gates = None
 
             if ((batch_idx + 1) % self.gradient_accumulation_steps == 0) or (batch_idx == self.train_dataloader.__len__() - 1):
 
@@ -822,7 +852,8 @@ class Trainer:
             targets={
                 "drivable_area_seg": data_items.get("drivable_area_seg"),
                 "lane_seg": data_items.get("segmentation_masks"),
-                "detections": data_items["detections"]
+                "detections": data_items["detections"],
+                "clean_images": data_items.get("clean_images")
             }            
         )        
         
@@ -836,6 +867,10 @@ class Trainer:
             
         if outputs.lane_segmentation_loss is not None:
             loss += outputs.lane_segmentation_loss
+            
+        if isinstance(self.model, GDIPYolo):
+            if hasattr(outputs, "defogging_loss") and outputs.defogging_loss is not None:
+                loss += self.lambda_defog * outputs.defogging_loss
 
         loss.backward()
 
@@ -932,20 +967,45 @@ class Trainer:
                     targets={
                         "drivable_area_seg": data_items.get("drivable_area_seg"),
                         "lane_seg": data_items.get("segmentation_masks"),
-                        "detections": data_items["detections"]
+                        "detections": data_items["detections"],
+                        "clean_images": data_items.get("clean_images")
                     }
                 )
 
                 # Log GDIP enhanced images for first val batch each epoch
                 if isinstance(self.model, GDIPYolo) and batch_idx == 0:
                     if self.model.enhanced_image is not None:
-                        enhanced_imgs = (self.model.enhanced_image.clamp(0, 1) * 255).to(torch.uint8)
+                        # enhanced_imgs = (self.model.enhanced_image.clamp(0, 1) * 255).to(torch.uint8)
+
+                        enhanced_imgs = self.model.enhanced_image.clamp(0, 1)
+                        original_images = data_items["images"].clamp(0, 1)
+
+                        combined = torch.cat([original_images, enhanced_imgs], dim=3)
+                        combined = (combined * 255).to(torch.uint8)                        
+
                         self.wandb_logger.log_images(
                             f"{metric_prefix}/enhanced_images",
                             enhanced_imgs,
-                            step=self.cur_epoch
+                            step=self.cur_epoch,
+                            caption=f'eval_{self.cur_epoch}'
                         )
                         self.model.enhanced_image = None
+
+                    # Log GDIP gate firing pattern for first val batch
+                    if self.model.gates is not None:
+                        gate_names = ["white_balance", "gamma", "identity", "sharpening", "defog", "contrast", "tone"]
+
+                        if isinstance(self.model.gates, torch.Tensor):
+                            gate_means = self.model.gates.mean(dim=0)
+                            gate_metrics = {f"{metric_prefix}/gates/{name}": gate_means[i].item() for i, name in enumerate(gate_names)}
+                            self.wandb_logger.log_metrics(gate_metrics, step=self.cur_epoch)
+                        elif isinstance(self.model.gates, list):
+                            for block_idx, block_gates in enumerate(self.model.gates):
+                                gate_means = block_gates.mean(dim=0)
+                                gate_metrics = {f"{metric_prefix}/gates/block{block_idx}/{name}": gate_means[i].item() for i, name in enumerate(gate_names)}
+                                self.wandb_logger.log_metrics(gate_metrics, step=self.cur_epoch)
+
+                        self.model.gates = None
 
                 # Accumulate losses
                 if outputs.detection_loss is not None:

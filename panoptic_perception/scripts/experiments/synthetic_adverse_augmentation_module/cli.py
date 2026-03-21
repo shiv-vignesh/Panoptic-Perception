@@ -14,6 +14,7 @@ from panoptic_perception.dataset.adverse_weather.depth_estimators import (
     ONNXDepthEstimator,
     TensorRTDepthEstimator,
     TorchCompiledDepthEstimator,
+    RadialDistance
 )
 
 
@@ -55,6 +56,13 @@ def _build_depth_estimator(backend: str, cfg: dict) -> DepthEstimator:
             input_size=cfg["tensorrt"].get("input_size", 518),
             normalization_epsilon=cfg["tensorrt"].get("normalization_epsilon", 1e-8),
         )
+
+    if backend == "radial_distance":
+        radial_distance = cfg.get("radial_distance", {}).get("radial_decay_rate", -0.04)
+        return RadialDistance(
+            radial_distance
+        )
+
     raise ValueError(f"Unknown depth backend: {backend}")
 
 

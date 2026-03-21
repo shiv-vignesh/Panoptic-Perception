@@ -4,6 +4,8 @@ from typing import Tuple, Optional, Union
 import torch
 import torch.nn as nn
 
+from torchmetrics.image import StructuralSimilarityIndexMeasure
+
 from panoptic_perception.models.common import (
     ConvBlock, Focus, BottleneckCSP, SPP, Upsample, Detect, C2F, SPPF, DetectV8
 )
@@ -506,6 +508,7 @@ class GDIPYolo(nn.Module):
 
         self.enhanced_image = None
         self.intermediate_images = None
+        self.gates = None
         
         assert "encoder" in gdip_kwargs and bool(gdip_kwargs["encoder"]), f'Invalid Vision Encoder Kwargs: {gdip_kwargs["encoder"]}'
         
@@ -537,8 +540,10 @@ class GDIPYolo(nn.Module):
             )
             
         self.vis_intermediate = gdip_kwargs.get("visualize_intermediate", True)
+        
+        self.ssim = StructuralSimilarityIndexMeasure(data_range=1.0)
             
-    def forward(self, x:torch.Tensor, targets=None, store_enhanced_image:bool = True):
+    def forward(self, x:torch.Tensor, targets=None, store_enhanced_image:bool = True, compute_ssim:bool = True):
 
         if self.gdip_mode == "gdip":
             latent = self.vision_encoder(x)
@@ -550,10 +555,23 @@ class GDIPYolo(nn.Module):
 
         if store_enhanced_image:
             self.enhanced_image = enhanced_image.detach()
-            if self.gdip_mode == "mgdip":
+            if self.gdip_mode == "gdip":
+                self.gates = gates.detach()
+            elif self.gdip_mode == "mgdip":
                 self.intermediate_images = [img.detach() for img in intermediate_images] if intermediate_images else []
+                self.gates = [g.detach() for g in gates]
 
-        return self.task_network(enhanced_image, targets)
+        defogging_loss = None
+        if compute_ssim and targets is not None and targets.get("clean_images") is not None:
+            ssim_val = self.ssim(enhanced_image, targets["clean_images"])
+            defogging_loss = 1. - ssim_val
+
+        outputs = self.task_network(enhanced_image, targets)
+
+        if defogging_loss is not None:
+            outputs.defogging_loss = defogging_loss
+
+        return outputs
     
 def get_model_param_groups(model:Optional[Union[YOLOP, YOLOv8P]], groups:dict, dcn_lr_mult:float=0.1, allow_empty:bool=False):
     """

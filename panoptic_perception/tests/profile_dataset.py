@@ -3,6 +3,8 @@ import cProfile
 import pstats
 from pathlib import Path
 import pytest
+import torch
+import cv2
 
 from torch.utils.data.dataloader import DataLoader
 
@@ -15,6 +17,7 @@ from panoptic_perception.dataset.adverse_weather.depth_estimators import (
     TorchCompiledDepthEstimator,
     ONNXDepthEstimator,
     TensorRTDepthEstimator,
+    RadialDistance
 )
 
 
@@ -25,8 +28,10 @@ DEV_IMAGES_DIR = str(BDD_ROOT / "100k" / "dev_set")
 DETECTION_DIR = str(BDD_ROOT / "bdd100k_labels" / "100k")
 DRIVABLE_DIR = str(BDD_ROOT / "bdd100k_drivable_maps" / "labels")
 
+VISUALIZE_DIR = 'visualizations/foggy_variations_test-noAug-3'
+
 # Set these on the vast.ai instance before running
-ONNX_MODEL_PATH = "/workspace/depth_anything_small.onnx"
+ONNX_MODEL_PATH = "depth_anything_small_fp16.onnx"
 TRT_ENGINE_PATH = "/workspace/depth_anything_small.engine"
 
 PREPROCESSOR_KWARGS = {
@@ -49,15 +54,16 @@ PREPROCESSOR_KWARGS = {
 }
 
 ADVERSE_PARAMS = {
-    "fog_betas": [0.015, 0.025, 0.040, 0.060],
-    "darkness_gammas": [1.5, 2.0, 3.5],
+    "fog_betas": [0.008, 0.015, 0.025, 0.040],
+    "darkness_gammas": [1.3, 1.5, 2.0],
     "enable_fog_only": True,
     "enable_darkness_only": True,
     "enable_compound": True,
+    "max_depth_meters": 70.0
 }
 
 BATCH_SIZE = 4
-SHUFFLE = True
+SHUFFLE = False
 NUM_WORKERS = 0
 
 
@@ -96,6 +102,10 @@ def _make_tensorrt():
         normalization_epsilon=1e-8,
     )
 
+def _make_radial_distance():
+    return RadialDistance(
+        radial_depth_decay_rate=-0.04
+    )
 
 # ---------------------------------------------------------------------------
 # Fixtures
@@ -125,7 +135,7 @@ def clean_dataset(base_dataset_kwargs):
     return BDD100KDataset(
         dataset_kwargs=base_dataset_kwargs,
         dataset_type="train",
-        perform_augmentation=True,
+        perform_augmentation=base_dataset_kwargs.get("perform_augmentation", True),
         mode=DatasetMode.TRAIN,
     )
 
@@ -134,9 +144,9 @@ def _make_foggy_dataset(base_dataset_kwargs, depth_estimator):
     return FoggyBDD100KDataset(
         dataset_kwargs=kwargs,
         dataset_type="train",
-        perform_augmentation=True,
+        perform_augmentation=base_dataset_kwargs.get("perform_augmentation", True),
         mode=DatasetMode.TRAIN,
-        apply_fog_prob=0.67,
+        apply_fog_prob=1.0,
         depth_estimator=depth_estimator,
     )
 
@@ -160,6 +170,9 @@ def foggy_onnx(base_dataset_kwargs):
 def foggy_tensorrt(base_dataset_kwargs):
     return _make_foggy_dataset(base_dataset_kwargs, _make_tensorrt())
 
+@pytest.fixture(scope="session")
+def foggy_radial_distance(base_dataset_kwargs):
+    return _make_foggy_dataset(base_dataset_kwargs, _make_radial_distance())
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -179,7 +192,7 @@ def profile_loader(loader, name, n_batches=50, warmup: bool = True):
 
     profiler = cProfile.Profile()
 
-    if warmup:
+    if not warmup:
         profiler.enable()
         for i, batch in enumerate(loader):
             if i >= n_batches:
@@ -206,6 +219,36 @@ def profile_loader(loader, name, n_batches=50, warmup: bool = True):
     print(f"\n--- PROFILE: {name} ---")
     print(s.getvalue())
 
+def test_visualize_foggy_samples(loader, save_dir, n_batches=5):
+    
+    import os
+    if not os.path.exists(save_dir):
+        os.makedirs(save_dir)
+    
+    for i, data_items in enumerate(loader):
+        if isinstance(data_items, dict):                
+            assert isinstance(data_items["images"], torch.Tensor), f'Expected data type: {torch.Tensor} got {type(data_items["images"])}'
+            foggy_images = (data_items["images"].clamp(0, 1) * 255).to(torch.uint8)
+            image_paths = data_items.get("image_paths")
+
+            for idx, image in enumerate(foggy_images):
+                image = image.detach().cpu().permute(1, 2, 0).numpy()
+
+                if image_paths:
+                    filename = Path(image_paths[idx]).name
+                    save_path = f'{save_dir}/{filename}'
+                else:
+                    save_path = f'{save_dir}/image_{i}_{idx}.png'
+                cv2.imwrite(save_path, cv2.cvtColor(image, cv2.COLOR_RGB2BGR))
+            
+            if i > n_batches:
+                break
+            
+        else:
+            raise TypeError(f'Expected data type: {dict} got {type(data_items)}')
+        
+        
+        
 
 # ---------------------------------------------------------------------------
 # Tests
@@ -215,13 +258,19 @@ def test_profile_clean(clean_dataset, dataloader_kwargs):
     loader = _make_loader(clean_dataset, dataloader_kwargs)
     profile_loader(loader, "CLEAN")
 
+    test_visualize_foggy_samples(loader, f'{VISUALIZE_DIR}/CLEAN')
+
 def test_profile_heuristic(foggy_heuristic, dataloader_kwargs):
     loader = _make_loader(foggy_heuristic, dataloader_kwargs)
     profile_loader(loader, "FOGGY (heuristic)")
+    
+    test_visualize_foggy_samples(loader, f'{VISUALIZE_DIR}/heuristic')
 
 def test_profile_depth_anything(foggy_depth_anything, dataloader_kwargs):
     loader = _make_loader(foggy_depth_anything, dataloader_kwargs)
     profile_loader(loader, "FOGGY (depth_anything)")
+    
+    test_visualize_foggy_samples(loader, f'{VISUALIZE_DIR}/DepthAnything')
 
 def test_profile_torch_compile(foggy_torch_compile, dataloader_kwargs):
     loader = _make_loader(foggy_torch_compile, dataloader_kwargs)
@@ -230,7 +279,16 @@ def test_profile_torch_compile(foggy_torch_compile, dataloader_kwargs):
 def test_profile_onnx(foggy_onnx, dataloader_kwargs):
     loader = _make_loader(foggy_onnx, dataloader_kwargs)
     profile_loader(loader, "FOGGY (onnx)")
+    
+    test_visualize_foggy_samples(loader, f'{VISUALIZE_DIR}/DepthAnything-ONNX')
 
 def test_profile_tensorrt(foggy_tensorrt, dataloader_kwargs):
     loader = _make_loader(foggy_tensorrt, dataloader_kwargs)
     profile_loader(loader, "FOGGY (tensorrt)")
+
+def test_profile_radial_distance(foggy_radial_distance, dataloader_kwargs):
+    loader = _make_loader(foggy_radial_distance, dataloader_kwargs)
+    profile_loader(loader, "FOGGY (radial distance)")
+    
+    test_visualize_foggy_samples(loader, f'{VISUALIZE_DIR}/RadialDistance')
+    

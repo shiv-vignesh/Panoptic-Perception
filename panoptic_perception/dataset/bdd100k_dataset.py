@@ -21,6 +21,7 @@ from panoptic_perception.dataset.adverse_weather import (
     apply_nighttime_fog,
     FogParameters, SyntheticFogGenerator, SyntheticLowLightGenerator,
     HeuristicDepthEstimator, DepthAnythingEstimator, ONNXDepthEstimator,
+    RadialDistance
 )
 
 from enum import Enum
@@ -355,6 +356,7 @@ class BDDPreprocessor:
     def collate_fn(batch:dict):
         
         batch_images = []
+        batch_clean_images = []
         batch_targets = []
         batch_segmentation_masks = []
         batch_drivable_masks = []
@@ -365,6 +367,7 @@ class BDDPreprocessor:
             image = batch_items['image']
             image_path = batch_items["image_path"]
             scene_attributes = batch_items["scene_attributes"]
+            clean_image = batch_items.get("clean_image")
 
             assert image is not None, f"Image tensor at batch index {batch_idx} is None."
             assert image.ndim == 3, "Image tensor must have 3 dimensions (C, H, W)."
@@ -372,6 +375,9 @@ class BDDPreprocessor:
             batch_images.append(image)
             batch_image_paths.append(image_path)
             batch_scene_attributes.append(scene_attributes)
+            
+            if clean_image is not None:
+                batch_clean_images.append(clean_image)
             
             if batch_items['detection_targets'] is not None and batch_items['detection_targets'].shape[0] > 0:
                 nt = batch_items['detection_targets'].shape[0]
@@ -393,6 +399,7 @@ class BDDPreprocessor:
                 batch_drivable_masks.append(batch_items['drivable_mask'])
                 
         batch_images_tensor = torch.stack(batch_images, dim=0)
+        batch_clean_images = torch.stack(batch_clean_images, dim=0) if batch_clean_images else None
         batch_targets_tensor = torch.cat(batch_targets, dim=0) if batch_targets else None
 
         # Sanitize detection targets — all paths (augment, mosaic, mixup, non-augment)
@@ -406,6 +413,7 @@ class BDDPreprocessor:
         
         return {
             "images": batch_images_tensor,
+            "clean_images": batch_clean_images,
             "detections": batch_targets_tensor,
             "segmentation_masks": batch_segmentation_masks_tensor,
             "drivable_area_seg": batch_drivable_masks_tensor,
@@ -625,6 +633,24 @@ class BDD100KDataset(Dataset):
         }
     
 class FoggyBDD100KDataset(BDD100KDataset):
+    
+    class FogLevels(Enum):
+        LIGHT = 500
+        MODERATE = 200
+        DENSE = 100
+        HEAVY = 50
+
+        @classmethod
+        def from_level(cls, fog_level: int):
+            try:
+                return cls(fog_level).name.lower()
+            except ValueError:
+                return None
+
+        @classmethod
+        def from_label(cls, label: str):
+            return cls[label.upper()].value    
+    
     def __init__(self, dataset_kwargs, dataset_type = 'train',
                 perform_augmentation = False, mode = DatasetMode.TRAIN,
                 strict_map:bool=True, apply_fog_prob:float=0.67,
@@ -657,10 +683,14 @@ class FoggyBDD100KDataset(BDD100KDataset):
 
         self.apply_fog_prob = apply_fog_prob
         
+        self.min_haze_level = self.FogLevels.LIGHT
+        self.max_haze_level = self.FogLevels.DENSE
+        
+        #TODO, remove this attribute, replace with FogLevels : str = ["light", "Heavy"]
         self.fog_betas = self.adverse_params.get("fog_betas", [0.010, 0.020, 0.035])
         self.darkness_gammas = self.adverse_params.get("darkness_gammas", [1.5, 2.0, 3.5])
         self.atmospheric_light_quantile = self.adverse_params.get("atmospheric_light_quantile", 0.9)
-        self.atmospheric_light_min_pixels = self.adverse_params.get("atmospheric_light_min_pixels", 16)
+        self.atmospheric_light_min_pixels = self.adverse_params.get("atmospheric_light_min_pixels", 10)
         self.max_depth_meters = self.adverse_params.get("max_depth_meters", 150.0)
         
         # All (beta, gamma) combinations
@@ -717,7 +747,7 @@ class FoggyBDD100KDataset(BDD100KDataset):
         assert len(variants) > 0, "At least one variant type must be enabled"
         return variants
 
-    def _select_degradation(self, scene_attributes, beta, gamma):
+    def _select_degradation(self, scene_attributes, beta=None, gamma=None):
         """Adjust or skip degradation based on scene context."""
         """
         ┌───────────────────┬───────────────────────┬─────────────────────┐
@@ -738,23 +768,35 @@ class FoggyBDD100KDataset(BDD100KDataset):
         │ snowy × night     │ Yes (capped at 0.010) │ No                  │
         └───────────────────┴───────────────────────┴─────────────────────┘        
         """
+        
+        def sample_beta():
+            visibility = np.random.uniform(self.min_haze_level.value, self.max_haze_level.value)
+            beta = 3.912 / visibility
+            return beta
+        
+        def sample_gamma():
+            return np.random.uniform(self.lowlight_generator.gamma_min, self.lowlight_generator.gamma_max)
 
         weather = scene_attributes.get("weather", "undefined") if scene_attributes else "undefined"
         tod = scene_attributes.get("timeofday", "undefined") if scene_attributes else "undefined"
+
+        # Default: sample both
+        beta = sample_beta()
+        gamma = sample_gamma()
 
         # Already foggy — don't add more fog
         if weather == "foggy":
             beta = None
 
-        # Already night — skip or reduce darkness
+        # Already night — skip darkness
         if tod == "night":
             gamma = None
 
-        # Dawn/dusk — cap darkness to mild only
+        # Dawn/dusk — cap darkness to mild
         if tod == "dawn/dusk" and gamma is not None:
-            gamma = min(gamma, 1.5)
+            gamma = min(gamma, 1.3)
 
-        # Rainy/snowy — reduce fog intensity (rain already reduces visibility)
+        # Rainy/snowy — reduce fog intensity
         if weather in ("rainy", "snowy") and beta is not None:
             beta = min(beta, 0.010)
 
@@ -767,15 +809,15 @@ class FoggyBDD100KDataset(BDD100KDataset):
         image_id = self.image_ids[index]
         depth_map_arr = None
 
-        # Try cached .npy first
-        if image_id in self._cached_depth_stems:
-            depth_map_path = os.path.join(self.depth_map_dir, self.dataset_type, f"{image_id}.npy")
-            if os.path.exists(depth_map_path):
-                depth_map_arr = np.load(str(depth_map_path))
+        # # Try cached .npy first
+        # if image_id in self._cached_depth_stems:
+        #     depth_map_path = os.path.join(self.depth_map_dir, self.dataset_type, f"{image_id}.npy")
+        #     if os.path.exists(depth_map_path):
+        #         depth_map_arr = np.load(str(depth_map_path))
 
         # Fall back to on-the-fly depth estimation
-        if depth_map_arr is None:
-            depth_map_arr = self.depth_estimator.estimate(image)
+        # if depth_map_arr is None:
+        #     depth_map_arr = self.depth_estimator.estimate(image)
 
         return image, depth_map_arr, bboxes, class_labels, scene_attributes, seg, drivable, image_path
     
@@ -792,7 +834,7 @@ class FoggyBDD100KDataset(BDD100KDataset):
 
         return self.variants[chosen_idx]        
     
-    def _apply_degradation(self, image, depth_map_arr, beta, gamma):
+    def _apply_degradation(self, image:np.ndarray, depth_map_arr:np.ndarray, beta, gamma):
         """Apply fog and/or darkness to the raw image. Returns degraded uint8 RGB."""
         if beta is not None and gamma is not None:
             params = FogParameters(
@@ -838,15 +880,16 @@ class FoggyBDD100KDataset(BDD100KDataset):
             apply_fog = True
 
         # Step 2: Apply degradation BEFORE augmentations (depth aligned to raw image)
-        if apply_fog:
-            image_id = self.image_ids[index]
-            if self.mode == DatasetMode.TRAIN:
-                beta, gamma = self._next_variant(image_id)
-            else:
-                variant_idx = int(hashlib.md5(image_id.encode()).hexdigest(), 16) % len(self.variants)
-                beta, gamma = self.variants[variant_idx]
-            beta, gamma = self._select_degradation(scene_attributes, beta, gamma)
-            image = self._apply_degradation(image, depth_map_arr, beta, gamma)
+        # if apply_fog:
+        #     image_id = self.image_ids[index]
+        #     # if self.mode == DatasetMode.TRAIN:
+        #     #     beta, gamma = self._next_variant(image_id)
+        #     # else:
+        #     #     variant_idx = int(hashlib.md5(image_id.encode()).hexdigest(), 16) % len(self.variants)
+        #     #     beta, gamma = self.variants[variant_idx]
+        #     # beta, gamma = self._select_degradation(scene_attributes, beta, gamma)
+        #     beta, gamma = self._select_degradation(scene_attributes)
+        #     image = self._apply_degradation(image, depth_map_arr, beta, gamma)
 
         # Step 3: Standard augmentations only (no mosaic, mixup, copy-paste)
         if self.perform_augmentation:
@@ -865,14 +908,30 @@ class FoggyBDD100KDataset(BDD100KDataset):
                 drivable = self.preprocessor.mask_only_transformation(image=drivable)['image']
             labels_xywh = self.preprocessor.prepare_targets_2d(bboxes, class_labels)
 
+        clean_image = image.copy()
+        
+        if apply_fog:
+            image_id = self.image_ids[index]
+            # if self.mode == DatasetMode.TRAIN:
+            #     beta, gamma = self._next_variant(image_id)
+            # else:
+            #     variant_idx = int(hashlib.md5(image_id.encode()).hexdigest(), 16) % len(self.variants)
+            #     beta, gamma = self.variants[variant_idx]
+            # beta, gamma = self._select_degradation(scene_attributes, beta, gamma)
+            depth_map_arr = self.depth_estimator.estimate(image)
+            beta, gamma = self._select_degradation(scene_attributes)
+            image = self._apply_degradation(image, depth_map_arr, beta, gamma)        
+
         # Step 4: Convert to tensors (same output format as parent)
         image_tensor = self.preprocessor.normalize_tensor(torch.from_numpy(image).permute(2, 0, 1))
+        clean_tensor = self.preprocessor.normalize_tensor(torch.from_numpy(clean_image).permute(2, 0, 1))
         targets = torch.from_numpy(labels_xywh).float()
         seg_tensor = torch.from_numpy(seg).long() if seg is not None else None
         drivable_tensor = torch.from_numpy(drivable).long() if drivable is not None else None
 
         return {
             "image": image_tensor,
+            "clean_image":clean_tensor,
             "segmentation_mask": seg_tensor,
             "drivable_mask": drivable_tensor,
             "detection_targets": targets,
