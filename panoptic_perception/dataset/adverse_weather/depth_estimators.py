@@ -208,8 +208,6 @@ class DepthAnythingEstimator:
         depth = post[0]["predicted_depth"].detach().cpu().numpy().astype(np.float32)
 
         del inputs, outputs, post
-        if use_amp:
-            torch.cuda.empty_cache()
 
         dmin, dmax = depth.min(), depth.max()
         depth = 1.0 - (depth - dmin) / (dmax - dmin + self._normalization_epsilon)
