@@ -730,10 +730,10 @@ class Trainer:
                     
                     # enhanced_imgs = (self.model.enhanced_image.clamp(0, 1) * 255).to(torch.uint8)
                     self.wandb_logger.log_images(
-                        "train/enhanced_images",
-                        enhanced_imgs,
+                        "train/original_vs_enhanced",
+                        combined,
                         step=self.cur_epoch * self.total_train_batch + batch_idx,
-                        caption=f'train_{self.cur_epoch}'
+                        caption=f'train_{self.cur_epoch}_batch_{batch_idx}'
                     )
                     self.model.enhanced_image = None
 
