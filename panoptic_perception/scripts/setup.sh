@@ -121,7 +121,11 @@ pip install \
     terminaltables==3.1.10 \
     PyYAML==6.0.2 \
     pydantic==2.12.4 \
-    Pillow==11.0.0
+    Pillow==11.0.0 \
+    transformers \
+    onnxruntime-gpu \
+    tensorrt \
+    pycuda
 
 echo ""
 echo "Verifying installations..."

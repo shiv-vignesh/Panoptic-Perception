@@ -4,10 +4,13 @@ from typing import Tuple, Optional, Union
 import torch
 import torch.nn as nn
 
+from torchmetrics.image import StructuralSimilarityIndexMeasure
+
 from panoptic_perception.models.common import (
     ConvBlock, Focus, BottleneckCSP, SPP, Upsample, Detect, C2F, SPPF, DetectV8
 )
 from panoptic_perception.models.utils import parse_model_config, initialize_weights, PanopticModelOutputs
+from panoptic_perception.models.gdip import GDIP, MultiLevelGDIP, build_vision_encoder
 from panoptic_perception.utils.detection_utils import DetectionLossCalculator
 from panoptic_perception.utils.segmentation_utils import SegmentationLossCalculator
 
@@ -160,6 +163,7 @@ class YOLOP(nn.Module):
 
         module_defs = parse_model_config(cfg)
 
+        #TODO, unused vars: remove
         self.img_size = img_size
         self.num_classes = num_classes
 
@@ -339,7 +343,7 @@ class YOLOv8P(nn.Module):
             lane_segmentation_head_idx=self.lane_segmentation_head_idx
         )
         
-        self.anchor_free = False        
+        self.anchor_free = False
         if "DetectV8" in self.module_names:
             self.anchor_free = True
 
@@ -455,8 +459,7 @@ class YOLOv8P(nn.Module):
                         targets["detections"],
                         image_size=(height, width)
                     )
-                    print(det_loss_items)
-                    exit(1)
+
                 else:
                     det_loss, det_loss_items = DetectionLossCalculator.compute_detection_loss_2(
                         model_outputs.detection_logits,
@@ -495,8 +498,82 @@ class YOLOv8P(nn.Module):
                 # print(f'Lane Segmentation Loss: {lane_seg_loss}')
 
         return model_outputs
+
+class GDIPYolo(nn.Module):
+    def __init__(self, task_network:Union[YOLOP, YOLOv8P], gdip_kwargs:dict):
+        super(GDIPYolo, self).__init__()
+
+        self.task_network = task_network
+        self.gdip_mode = gdip_kwargs["mode"]
+
+        self.enhanced_image = None
+        self.intermediate_images = None
+        self.gates = None
+        
+        assert "encoder" in gdip_kwargs and bool(gdip_kwargs["encoder"]), f'Invalid Vision Encoder Kwargs: {gdip_kwargs["encoder"]}'
+        
+        vision_encoder_kwargs = gdip_kwargs["encoder"]
+        if self.gdip_mode == "gdip":            
+            self.vision_encoder = build_vision_encoder({
+                "type":vision_encoder_kwargs["type"],
+                "latent_dim":vision_encoder_kwargs.get("latent_dim", 256),
+                "pretrained":vision_encoder_kwargs.get("pretrained", True)
+            })
+
+            self.gdip_module = GDIP(
+                vision_encoder_kwargs.get("latent_dim", 256)
+            )
+        
+        elif self.gdip_mode == "mgdip":
+            assert bool(gdip_kwargs["encoder"]["tap_layers"]), f"For GDIP Mode: {self.gdip_mode} -- Tap Layers must not be empty: {len(gdip_kwargs['encoder']['tap_layers'])}"
+            self.tap_layers = gdip_kwargs["encoder"]["tap_layers"]
+            self.vision_encoder = build_vision_encoder({
+                "type":vision_encoder_kwargs["type"],
+                "latent_dim":vision_encoder_kwargs.get("latent_dim", 256),
+                "pretrained":vision_encoder_kwargs.get("pretrained", True),
+                "tap_layers":gdip_kwargs["encoder"]["tap_layers"]
+            })
+            
+            self.gdip_module = MultiLevelGDIP(
+                num_gdip_blocks=len(self.tap_layers),
+                latent_dim=vision_encoder_kwargs.get("latent_dim", 256)
+            )
+            
+        self.vis_intermediate = gdip_kwargs.get("visualize_intermediate", True)
+        
+        self.ssim = StructuralSimilarityIndexMeasure(data_range=1.0)
+            
+    def forward(self, x:torch.Tensor, targets=None, store_enhanced_image:bool = True, compute_ssim:bool = True):
+
+        if self.gdip_mode == "gdip":
+            latent = self.vision_encoder(x)
+            enhanced_image, gates = self.gdip_module(x, latent)
+
+        elif self.gdip_mode == "mgdip":
+            latent, features = self.vision_encoder(x)
+            enhanced_image, gates, intermediate_images = self.gdip_module(x, features, self.vis_intermediate)
+
+        if store_enhanced_image:
+            self.enhanced_image = enhanced_image.detach()
+            if self.gdip_mode == "gdip":
+                self.gates = gates.detach()
+            elif self.gdip_mode == "mgdip":
+                self.intermediate_images = [img.detach() for img in intermediate_images] if intermediate_images else []
+                self.gates = [g.detach() for g in gates]
+
+        defogging_loss = None
+        if compute_ssim and targets is not None and targets.get("clean_images") is not None:
+            ssim_val = self.ssim(enhanced_image, targets["clean_images"])
+            defogging_loss = 1. - ssim_val
+
+        outputs = self.task_network(enhanced_image, targets)
+
+        if defogging_loss is not None:
+            outputs.defogging_loss = defogging_loss
+
+        return outputs
     
-def get_model_param_groups(model:Optional[Union[YOLOP, YOLOv8P]], groups:dict, dcn_lr_mult:float=0.1):
+def get_model_param_groups(model:Optional[Union[YOLOP, YOLOv8P]], groups:dict, dcn_lr_mult:float=0.1, allow_empty:bool=False):
     """
     Configure parameter groups for training with selective freezing.
 
@@ -611,7 +688,7 @@ def get_model_param_groups(model:Optional[Union[YOLOP, YOLOv8P]], groups:dict, d
     model.register_forward_pre_hook(freeze_bn_hook)
 
     # Safety: if nothing selected for training, raise
-    if len(param_groups) == 0:
+    if len(param_groups) == 0 and not allow_empty:
         raise ValueError("No trainable parameter groups selected by trainable_cfg!")
 
     return param_groups    

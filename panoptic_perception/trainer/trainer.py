@@ -11,7 +11,7 @@ from torch.utils.data.dataloader import DataLoader
 
 import numpy as np
 
-from panoptic_perception.dataset.bdd100k_dataset import BDD100KDataset, BDDPreprocessor
+from panoptic_perception.dataset.bdd100k_dataset import BDD100KDataset, FoggyBDD100KDataset, BDDPreprocessor, DatasetMode
 
 import gc
 
@@ -99,7 +99,7 @@ class ModelEMA:
 
 from panoptic_perception.dataset.enums import BDD100KClassesReduced
 
-from panoptic_perception.models.models import YOLOP, YOLOv8P, get_model_param_groups
+from panoptic_perception.models.models import YOLOP, YOLOv8P, GDIPYolo, get_model_param_groups
 from panoptic_perception.models.utils import PanopticModelOutputs, WeightsManager
 
 from panoptic_perception.utils.logger import Logger
@@ -113,7 +113,7 @@ CLASS_NAMES = [cls.name for cls in BDD100KClassesReduced]
 
 class Trainer:
     
-    def __init__(self, model:Optional[Union[YOLOP, YOLOv8P]], device:torch.device,
+    def __init__(self, model:Optional[Union[YOLOP, YOLOv8P, GDIPYolo]], device:torch.device,
                  dataset_kwargs:dict, 
                  optimizer_kwargs:dict, lr_scheduler_kwargs:dict,
                  trainer_kwargs:dict):
@@ -142,6 +142,14 @@ class Trainer:
         self.ema_decay = trainer_kwargs.get('ema_decay', 0.9999)
         self.ema_warmup_steps = trainer_kwargs.get('ema_warmup_steps', 2000)
         self.ema = None  # Initialized in train()
+
+        # Staged training (progressive unfreezing)
+        staged = trainer_kwargs.get("staged_training", {})
+        self.staged_training_enabled = staged.get("enabled", False)
+        self.staged_training_stages = staged.get("stages", [])
+        
+        self.compute_ssim = trainer_kwargs.get("compute_ssim", True) #GDIP-YOLO 
+        self.lambda_defog = trainer_kwargs.get("lambda_defog", 0.2) #GDIP-YOLO 
 
         # Best model tracking
         self.best_map = 0.0
@@ -195,7 +203,12 @@ class Trainer:
         
         self.logger.log_message(f'Number of Val Images: {self.val_dataloader.dataset.__len__()}')
         self.logger.log_message(f'Val Batch Size: {self.val_dataloader.batch_size}')
-                
+
+        if self.val_foggy_dataloader is not None:
+            self.logger.log_new_line()
+            self.logger.log_message(f'Number of Foggy Val Images: {self.val_foggy_dataloader.dataset.__len__()}')
+            self.logger.log_message(f'Foggy Val Batch Size: {self.val_foggy_dataloader.batch_size}')
+
         self.logger.log_line()
 
         self.logger.log_line()
@@ -209,29 +222,94 @@ class Trainer:
             self._init_lr_scheduler(lr_scheduler_kwargs)          
     
     def _init_dataloader(self, dataset_kwargs:dict):
-        
-        def create_dataloader(images_dir:str, detection_annotations_dir:dict, 
+
+        dataset_class = dataset_kwargs.get("dataset_class", "default")
+
+        # Build depth estimator for foggy datasets
+        depth_estimator = None
+        if dataset_class == "foggy":
+            adverse_params = dataset_kwargs.get("adverse_params", {})
+            depth_backend = adverse_params.get("depth_backend", "heuristic")
+            depth_device = adverse_params.get("depth_device", str(self.device))
+
+            if depth_backend == "onnx":
+                from panoptic_perception.dataset.adverse_weather.depth_estimators import ONNXDepthEstimator
+                depth_estimator = ONNXDepthEstimator(
+                    onnx_path=adverse_params["onnx_backend_path"],
+                    device=depth_device, input_size=518, normalization_epsilon=1e-8,
+                )
+            elif depth_backend == "depth_anything":
+                from panoptic_perception.dataset.adverse_weather.depth_estimators import DepthAnythingEstimator
+                depth_estimator = DepthAnythingEstimator(
+                    model_name="LiheYoung/depth-anything-small-hf",
+                    device=depth_device, normalization_epsilon=1e-8,
+                )
+            elif depth_backend == "torch_compile":
+                from panoptic_perception.dataset.adverse_weather.depth_estimators import TorchCompiledDepthEstimator
+                depth_estimator = TorchCompiledDepthEstimator(
+                    model_name="LiheYoung/depth-anything-small-hf",
+                    device=depth_device, normalization_epsilon=1e-8,
+                )
+            # else: None → FoggyBDD100KDataset defaults to heuristic
+
+            if depth_backend != "heuristic":
+                self.logger.log_message(
+                    f"[Dataloader] depth_backend={depth_backend} requires CUDA "
+                    f"-> overriding num_workers to 0 (CUDA unavailable in forked workers)"
+                )
+                dataset_kwargs["train_num_workers"] = 0
+                dataset_kwargs["val_num_workers"] = 0
+
+        def create_base_dataset_kwargs(images_dir, detection_annotations_dir,
+                                        segmentation_annotations_dir, drivable_annotations_dir,
+                                        preprocessor_kwargs):
+            return {
+                "images_dir": images_dir,
+                "detection_annotations_dir": detection_annotations_dir,
+                "segmentation_annotations_dir": segmentation_annotations_dir,
+                "drivable_annotations_dir": drivable_annotations_dir,
+                "preprocessor_kwargs": preprocessor_kwargs
+            }
+
+        def create_dataloader(images_dir:str, detection_annotations_dir:dict,
                             segmentation_annotations_dir:dict, drivable_annotations_dir:dict,
-                            preprocessor_kwargs:dict, dataset_type:str, batch_size:int, 
+                            preprocessor_kwargs:dict, dataset_type:str, batch_size:int,
                             perform_augmentation:bool=False, shuffle:bool=False, num_workers:int=1):
-            
-            dataset = BDD100KDataset({
-                "images_dir":images_dir, 
-                "detection_annotations_dir":detection_annotations_dir,
-                "segmentation_annotations_dir":segmentation_annotations_dir,
-                "drivable_annotations_dir":drivable_annotations_dir,
-                "preprocessor_kwargs":preprocessor_kwargs
-            }, dataset_type=dataset_type, 
-            perform_augmentation=perform_augmentation)
-            
+
+            base_kwargs = create_base_dataset_kwargs(
+                images_dir, detection_annotations_dir,
+                segmentation_annotations_dir, drivable_annotations_dir,
+                preprocessor_kwargs
+            )
+
+            if dataset_class == "foggy" and dataset_type == "train":
+                adverse_params = dataset_kwargs.get("adverse_params", {})
+                base_kwargs["depth_map_dir"] = dataset_kwargs.get("depth_map_dir", None)
+                base_kwargs["adverse_params"] = adverse_params
+
+                dataset = FoggyBDD100KDataset(
+                    base_kwargs,
+                    dataset_type=dataset_type,
+                    perform_augmentation=perform_augmentation,
+                    strict_map=dataset_kwargs.get("strict_map", True),
+                    apply_fog_prob=dataset_kwargs.get("apply_fog_prob", 0.67),
+                    depth_estimator=depth_estimator,
+                )
+            else:
+                dataset = BDD100KDataset(
+                    base_kwargs,
+                    dataset_type=dataset_type,
+                    perform_augmentation=perform_augmentation,
+                )
+
             return DataLoader(
-                dataset, 
-                batch_size=batch_size, 
+                dataset,
+                batch_size=batch_size,
                 shuffle=shuffle,
                 num_workers=num_workers,
                 collate_fn=BDDPreprocessor.collate_fn
-            )                    
-        
+            )
+
         self.train_dataloader = create_dataloader(
             dataset_kwargs["images_dir"],
             dataset_kwargs["detection_annotations_dir"],
@@ -244,7 +322,7 @@ class Trainer:
             num_workers=dataset_kwargs.get("train_num_workers", 1),
             perform_augmentation=dataset_kwargs.get("train_preprocessor_kwargs", False).get("perform_augmentation", False)
         )
-        
+
         self.val_dataloader = create_dataloader(
             dataset_kwargs["images_dir"],
             dataset_kwargs["detection_annotations_dir"],
@@ -255,7 +333,38 @@ class Trainer:
             batch_size=dataset_kwargs["val_batch_size"],
             shuffle=dataset_kwargs.get("val_shuffle", True),
             num_workers=dataset_kwargs.get("val_num_workers", 1)
-        )                
+        )
+
+        self.val_foggy_dataloader = None
+        if dataset_class == "foggy":
+            adverse_params = dataset_kwargs.get("adverse_params", {})
+            foggy_val_kwargs = create_base_dataset_kwargs(
+                dataset_kwargs["images_dir"],
+                dataset_kwargs["detection_annotations_dir"],
+                dataset_kwargs["segmentation_annotations_dir"],
+                dataset_kwargs["drivable_annotations_dir"],
+                dataset_kwargs["val_preprocessor_kwargs"]
+            )
+            foggy_val_kwargs["depth_map_dir"] = dataset_kwargs.get("depth_map_dir", None)
+            foggy_val_kwargs["adverse_params"] = adverse_params
+
+            foggy_val_dataset = FoggyBDD100KDataset(
+                foggy_val_kwargs,
+                dataset_type="val",
+                perform_augmentation=False,
+                mode=DatasetMode.EVAL,
+                strict_map=dataset_kwargs.get("strict_map", True),
+                apply_fog_prob=1.0,
+                depth_estimator=depth_estimator,
+            )
+
+            self.val_foggy_dataloader = DataLoader(
+                foggy_val_dataset,
+                batch_size=dataset_kwargs["val_batch_size"],
+                shuffle=False,
+                num_workers=dataset_kwargs.get("val_num_workers", 1),
+                collate_fn=BDDPreprocessor.collate_fn
+            )
     
     def _init_optimizer(self, optimizer_kwargs):
         
@@ -266,32 +375,80 @@ class Trainer:
         
         self.groups = optimizer_kwargs.get("groups", {})
         self.dcn_lr_mult = optimizer_kwargs.get("dcn_lr_mult", 0.1)  # DCN offset LR = base_lr * 0.1
-
-        if not self.groups:
-            # No custom groups: train full model
-            param_groups = list(self.model.parameters())
-            self.logger.log_message('Full model training (all layers trainable)')
-            self.logger.log_new_line()
-        else:
-            # Custom groups: get param groups with DCN-aware differential LR
-            param_groups = get_model_param_groups(self.model, self.groups, self.dcn_lr_mult)
-            self.logger.log_message('Training with specified groups:')
-            for group_name in self.groups:
-                group_info = self.groups[group_name]
-                self.logger.log_message(
-                    f'  Group name: {group_name} - '
-                    f'trainable: {group_info["trainable"]} - '
-                    f'layer start/end: {group_info["group"]}'
-                )
-            # Log DCN-specific param groups
-            for pg in param_groups:
-                if pg.get("name", "").startswith("dcn"):
+        
+        if isinstance(self.model, GDIPYolo):
+            if not self.groups:
+                # No custom groups: train all task_network layers
+                param_groups = [{"params": list(self.model.task_network.parameters()), "name": "task_network", "lr_scale": 1.0}]
+                self.logger.log_message('Full task_network training (all layers trainable)')
+                self.logger.log_new_line()
+            else:
+                # Custom groups: get param groups with DCN-aware differential LR
+                param_groups = get_model_param_groups(self.model.task_network, self.groups, self.dcn_lr_mult, allow_empty=True)
+                self.logger.log_message('Training with specified groups:')
+                for group_name in self.groups:
+                    group_info = self.groups[group_name]
                     self.logger.log_message(
-                        f'  DCN Group: {pg["name"]} - '
-                        f'params: {len(pg["params"])} - '
-                        f'lr_scale: {pg["lr_scale"]}'
+                        f'  Group name: {group_name} - '
+                        f'trainable: {group_info["trainable"]} - '
+                        f'layer start/end: {group_info["group"]}'
                     )
-            self.logger.log_new_line()
+                # Log DCN-specific param groups
+                for pg in param_groups:
+                    if pg.get("name", "").startswith("dcn"):
+                        self.logger.log_message(
+                            f'  DCN Group: {pg["name"]} - '
+                            f'params: {len(pg["params"])} - '
+                            f'lr_scale: {pg["lr_scale"]}'
+                        )
+                self.logger.log_new_line()
+
+            gdip_groups = optimizer_kwargs.get("gdip_groups", {})
+            if not gdip_groups:
+                # Default: train both GDIP components with lr_scale=1.0
+                param_groups.append({"params": list(self.model.vision_encoder.parameters()), "name": "vision_encoder", "lr_scale": 1.0})
+                param_groups.append({"params": list(self.model.gdip_module.parameters()), "name": "gdip_module", "lr_scale": 1.0})
+            else:
+                for component_name, cfg in gdip_groups.items():
+                    component = getattr(self.model, component_name)
+                    trainable = cfg["trainable"]
+
+                    for p in component.parameters():
+                        p.requires_grad = trainable
+
+                    if trainable:
+                        param_groups.append({
+                            "params": list(component.parameters()),
+                            "name": component_name,
+                            "lr_scale": cfg.get("lr_scale", 1.0)
+                        })
+            
+        elif isinstance(self.model, YOLOP) or isinstance(self.model, YOLOv8P):            
+            if not self.groups:
+                # No custom groups: train full model
+                param_groups = list(self.model.parameters())
+                self.logger.log_message('Full model training (all layers trainable)')
+                self.logger.log_new_line()
+            else:
+                # Custom groups: get param groups with DCN-aware differential LR
+                param_groups = get_model_param_groups(self.model, self.groups, self.dcn_lr_mult)
+                self.logger.log_message('Training with specified groups:')
+                for group_name in self.groups:
+                    group_info = self.groups[group_name]
+                    self.logger.log_message(
+                        f'  Group name: {group_name} - '
+                        f'trainable: {group_info["trainable"]} - '
+                        f'layer start/end: {group_info["group"]}'
+                    )
+                # Log DCN-specific param groups
+                for pg in param_groups:
+                    if pg.get("name", "").startswith("dcn"):
+                        self.logger.log_message(
+                            f'  DCN Group: {pg["name"]} - '
+                            f'params: {len(pg["params"])} - '
+                            f'lr_scale: {pg["lr_scale"]}'
+                        )
+                self.logger.log_new_line()
 
         if optimizer_kwargs["_type"] == "SGD":
             self.lr0 = optimizer_kwargs.get("initial_lr", 3e-5)
@@ -365,11 +522,20 @@ class Trainer:
             self.logger.log_new_line()
     
     def resume_from_ckpt(self, ckpt_path:str):
-                
+
         if ckpt_path and os.path.exists(ckpt_path):
             ckpt = torch.load(ckpt_path, map_location=self.device, weights_only=False)
 
-            missing, unexpected, loaded_keys = WeightsManager().load(self.model, ckpt_path)            
+            # Detect if checkpoint was saved from a bare YOLOP/YOLOv8P but loading into GDIPYolo
+            # If so, remap keys with "task_network." prefix
+            key_prefix = None
+            if isinstance(self.model, GDIPYolo):
+                ckpt_state = ckpt.get("model_state", ckpt)
+                sample_key = next(iter(ckpt_state), "")
+                if not sample_key.startswith("task_network."):
+                    key_prefix = "task_network"
+
+            missing, unexpected, loaded_keys = WeightsManager().load(self.model, ckpt_path, key_prefix=key_prefix)            
             # self.model.load_state_dict(ckpt["model_state"])
             self.logger.log_message("=== Weights Loaded ===")
             self.logger.log_message(f"Loaded     : {len(loaded_keys)} keys")
@@ -391,20 +557,65 @@ class Trainer:
                 self.start_epoch = ckpt.get("epoch", 1)
                 self.logger.log_message(f"Resuming from epoch {self.start_epoch}")
     
+    def _apply_stage(self, epoch):
+        """Progressive unfreezing: adjust trainability and LR per param group based on epoch."""
+        if not self.staged_training_enabled:
+            return
+
+        current_stage = None
+        for stage in self.staged_training_stages:
+            end = stage["end_epoch"] if stage["end_epoch"] != -1 else float("inf")
+            if stage["start_epoch"] <= epoch <= end:
+                current_stage = stage
+                break
+
+        if current_stage is None:
+            return
+
+        trainable_set = set(current_stage["trainable"])
+        lr_scales = current_stage["lr_scales"]
+
+        for pg in self.optimizer.param_groups:
+            name = pg.get("name", "")
+            if name in ("vision_encoder", "gdip_module"):
+                component = "gdip"
+            elif name == "backbone":
+                component = "backbone"
+            elif name == "detect":
+                component = "detect"
+            else:
+                continue
+
+            is_trainable = component in trainable_set
+            for p in pg["params"]:
+                p.requires_grad = is_trainable
+            pg["lr"] = self.lr0 * lr_scales.get(component, 0.0) if is_trainable else 0.0
+
+        if epoch == current_stage["start_epoch"]:
+            self.logger.log_message(
+                f"[Stage] epoch {epoch}: trainable={list(trainable_set)}, lr_scales={lr_scales}"
+            )
+
     def train(self, checkpoint_path:str=None):
         self.logger.log_line()
         
         tasks = []
         
-        if self.model.detection_head_idx != -1:
-            tasks.append("Detection, ")
-        
-        if self.model.segmentation_head_idx != -1:
-            tasks.append("Drivable Segmentation, ")
-            
-        if self.model.lane_segmentation_head_idx != -1:
-            tasks.append("Lane Segmentation")
-            
+        if isinstance(self.model, YOLOP) or isinstance(self.model, YOLOv8P):        
+            if self.model.detection_head_idx != -1:
+                tasks.append("Detection, ")
+            if self.model.segmentation_head_idx != -1:
+                tasks.append("Drivable Segmentation, ")
+            if self.model.lane_segmentation_head_idx != -1:
+                tasks.append("Lane Segmentation")
+        elif isinstance(self.model, GDIPYolo):
+            if self.model.task_network.detection_head_idx != -1:
+                tasks.append("Detection, ")
+            if self.model.task_network.segmentation_head_idx != -1:
+                tasks.append("Drivable Segmentation, ")
+            if self.model.task_network.lane_segmentation_head_idx != -1:
+                tasks.append("Lane Segmentation")            
+
         tasks = 'Tasks: '.join(tasks)
         
         self.logger.log_message(
@@ -442,6 +653,7 @@ class Trainer:
 
         for epoch in range(self.start_epoch, self.epochs + 1):
             self.cur_epoch = epoch
+            self._apply_stage(epoch)
             self.logger.log_line()
 
             if self.monitor_train:
@@ -468,7 +680,16 @@ class Trainer:
                     torch.save(checkpoint, f"{ckpt_dir}/ckpt-{self.cur_epoch}.pt")
 
             if self.monitor_val and self.cur_epoch >= self.first_val_epoch:
+                if self.use_ema and self.ema is not None:
+                    self.ema.apply_shadow(self.model)
+                    self.logger.log_message('Using EMA weights for evaluation')
+
                 self.eval_one_epoch()
+                if self.val_foggy_dataloader is not None:
+                    self.eval_one_epoch(self.val_foggy_dataloader, metric_prefix="val_foggy")
+
+                if self.use_ema and self.ema is not None:
+                    self.ema.restore(self.model)
 
         # Finish WandB run
         self.logger.log_line()
@@ -493,9 +714,47 @@ class Trainer:
         train_iter = tqdm(self.train_dataloader, desc=f'Training Epoch: {self.cur_epoch}')
         for batch_idx, data_items in enumerate(train_iter):
             
-            step_begin_time = time.time()            
+            step_begin_time = time.time()
             loss, model_outputs = self.train_one_step(data_items)
             step_end_time = time.time()
+
+            # Log GDIP enhanced images periodically
+            if isinstance(self.model, GDIPYolo) and (batch_idx + 1) % 200 == 0:
+                if self.model.enhanced_image is not None:
+                    
+                    enhanced_imgs = self.model.enhanced_image.clamp(0, 1)
+                    original_images = data_items["images"].clamp(0, 1)
+                    
+                    combined = torch.cat([original_images, enhanced_imgs], dim=3)
+                    combined = (combined * 255).to(torch.uint8)
+                    
+                    # enhanced_imgs = (self.model.enhanced_image.clamp(0, 1) * 255).to(torch.uint8)
+                    self.wandb_logger.log_images(
+                        "train/original_vs_enhanced",
+                        combined,
+                        step=self.cur_epoch * self.total_train_batch + batch_idx,
+                        caption=f'train_{self.cur_epoch}_batch_{batch_idx}'
+                    )
+                    self.model.enhanced_image = None
+
+                # Log GDIP gate firing pattern
+                if self.model.gates is not None:
+                    gate_names = ["white_balance", "gamma", "identity", "sharpening", "defog", "contrast", "tone"]
+                    step = self.cur_epoch * self.total_train_batch + batch_idx
+
+                    if isinstance(self.model.gates, torch.Tensor):
+                        # Single-level GDIP: gates shape (batch_size, 7)
+                        gate_means = self.model.gates.mean(dim=0)
+                        gate_metrics = {f"train/gates/{name}": gate_means[i].item() for i, name in enumerate(gate_names)}
+                        self.wandb_logger.log_metrics(gate_metrics, step=step)
+                    elif isinstance(self.model.gates, list):
+                        # Multi-level GDIP: list of (batch_size, 7) tensors
+                        for block_idx, block_gates in enumerate(self.model.gates):
+                            gate_means = block_gates.mean(dim=0)
+                            gate_metrics = {f"train/gates/block{block_idx}/{name}": gate_means[i].item() for i, name in enumerate(gate_names)}
+                            self.wandb_logger.log_metrics(gate_metrics, step=step)
+
+                    self.model.gates = None
 
             if ((batch_idx + 1) % self.gradient_accumulation_steps == 0) or (batch_idx == self.train_dataloader.__len__() - 1):
 
@@ -528,7 +787,10 @@ class Trainer:
                     warmup_factor = min(1.0, warmup_factor)
 
                     # LR warmup per param group (bias gets special warmup LR)
+                    # Skip groups frozen by staged training (lr == 0)
                     for pg in self.optimizer.param_groups:
+                        if self.staged_training_enabled and pg['lr'] == 0.0:
+                            continue
                         scale = pg.get('lr_scale', 1.0)
                         if 'bias' in pg.get('name',''):
                             pg['lr'] = (self.warmup_bias_lr + warmup_factor * (self.lr0 - self.warmup_bias_lr)) * scale
@@ -567,6 +829,8 @@ class Trainer:
         if hasattr(self, 'lr_scheduler'):
             if self.lr_scheduler_start_epoch != -1 and self.cur_epoch > self.lr_scheduler_start_epoch:
                 self.lr_scheduler.step()
+                if self.staged_training_enabled:
+                    self._apply_stage(self.cur_epoch)
                 current_lr = self.optimizer.param_groups[0]['lr']
 
         # Log epoch-level metrics to WandB
@@ -588,7 +852,8 @@ class Trainer:
             targets={
                 "drivable_area_seg": data_items.get("drivable_area_seg"),
                 "lane_seg": data_items.get("segmentation_masks"),
-                "detections": data_items["detections"]
+                "detections": data_items["detections"],
+                "clean_images": data_items.get("clean_images")
             }            
         )        
         
@@ -602,6 +867,10 @@ class Trainer:
             
         if outputs.lane_segmentation_loss is not None:
             loss += outputs.lane_segmentation_loss
+            
+        if isinstance(self.model, GDIPYolo):
+            if hasattr(outputs, "defogging_loss") and outputs.defogging_loss is not None:
+                loss += self.lambda_defog * outputs.defogging_loss
 
         loss.backward()
 
@@ -650,13 +919,10 @@ class Trainer:
 
         return iou_dict, dice_dict
 
-    def eval_one_epoch(self):
+    def eval_one_epoch(self, dataloader=None, metric_prefix="val"):
         """Evaluate model on validation set."""
 
-        # Apply EMA weights for evaluation
-        if self.use_ema and self.ema is not None:
-            self.ema.apply_shadow(self.model)
-            self.logger.log_message('Using EMA weights for evaluation')
+        dataloader = dataloader or self.val_dataloader
 
         self.model.eval()
         
@@ -679,14 +945,14 @@ class Trainer:
         total_lane_loss = 0.0
         global_image_idx = 0
 
-        conf_threshold=0.001,
-        iou_threshold=0.45,
-        max_detections=500
+        conf_threshold = 0.001
+        iou_threshold = 0.45
+        max_detections = 500
 
         self.logger.log_line()
-        self.logger.log_message(f'Evaluating Epoch {self.cur_epoch}')
+        self.logger.log_message(f'[{metric_prefix}] Evaluating Epoch {self.cur_epoch}')
 
-        val_iter = tqdm(self.val_dataloader, desc=f'Validation Epoch: {self.cur_epoch}')
+        val_iter = tqdm(dataloader, desc=f'[{metric_prefix}] Epoch: {self.cur_epoch}')
 
         with torch.no_grad():
             for batch_idx, data_items in enumerate(val_iter):
@@ -701,9 +967,45 @@ class Trainer:
                     targets={
                         "drivable_area_seg": data_items.get("drivable_area_seg"),
                         "lane_seg": data_items.get("segmentation_masks"),
-                        "detections": data_items["detections"]
+                        "detections": data_items["detections"],
+                        "clean_images": data_items.get("clean_images")
                     }
                 )
+
+                # Log GDIP enhanced images for first val batch each epoch
+                if isinstance(self.model, GDIPYolo) and batch_idx == 0:
+                    if self.model.enhanced_image is not None:
+                        # enhanced_imgs = (self.model.enhanced_image.clamp(0, 1) * 255).to(torch.uint8)
+
+                        enhanced_imgs = self.model.enhanced_image.clamp(0, 1)
+                        original_images = data_items["images"].clamp(0, 1)
+
+                        combined = torch.cat([original_images, enhanced_imgs], dim=3)
+                        combined = (combined * 255).to(torch.uint8)                        
+
+                        self.wandb_logger.log_images(
+                            f"{metric_prefix}/enhanced_images",
+                            enhanced_imgs,
+                            step=self.cur_epoch,
+                            caption=f'eval_{self.cur_epoch}'
+                        )
+                        self.model.enhanced_image = None
+
+                    # Log GDIP gate firing pattern for first val batch
+                    if self.model.gates is not None:
+                        gate_names = ["white_balance", "gamma", "identity", "sharpening", "defog", "contrast", "tone"]
+
+                        if isinstance(self.model.gates, torch.Tensor):
+                            gate_means = self.model.gates.mean(dim=0)
+                            gate_metrics = {f"{metric_prefix}/gates/{name}": gate_means[i].item() for i, name in enumerate(gate_names)}
+                            self.wandb_logger.log_metrics(gate_metrics, step=self.cur_epoch)
+                        elif isinstance(self.model.gates, list):
+                            for block_idx, block_gates in enumerate(self.model.gates):
+                                gate_means = block_gates.mean(dim=0)
+                                gate_metrics = {f"{metric_prefix}/gates/block{block_idx}/{name}": gate_means[i].item() for i, name in enumerate(gate_names)}
+                                self.wandb_logger.log_metrics(gate_metrics, step=self.cur_epoch)
+
+                        self.model.gates = None
 
                 # Accumulate losses
                 if outputs.detection_loss is not None:
@@ -876,7 +1178,7 @@ class Trainer:
                         )
 
         # Compute metrics
-        num_batches = len(self.val_dataloader)
+        num_batches = len(dataloader)
 
         # Average losses
         avg_det_loss = total_det_loss / num_batches if num_batches > 0 else 0.0
@@ -907,7 +1209,7 @@ class Trainer:
         ap_table_data.append(["mAP@0.5", f"{ap_results['mAP']:.4f}"])
 
         ap_table_string = AsciiTable(ap_table_data).table
-        self.logger.log_message("\nDetection Metrics (AP@0.5):")
+        self.logger.log_message(f"\n[{metric_prefix}] Detection Metrics (AP@0.5):")
         self.logger.log_message(ap_table_string)
         
         #Create Stats (TP, FP, FN)
@@ -925,14 +1227,14 @@ class Trainer:
                                     true_positives, false_positives, false_negatives])
             
         stats_table_string = AsciiTable(stats_table_data).table
-        self.logger.log_message(f"\nDetection Metrics @{stats_iou_threshold}:")
+        self.logger.log_message(f"\n[{metric_prefix}] Detection Metrics @{stats_iou_threshold}:")
         self.logger.log_message(stats_table_string)
 
         # Log AP table to WandB
         wandb_ap_data = [[f"{cls}: {BDD100KClassesReduced(cls).name}", ap_results.get(f'AP_class_{cls}', 0.0)] for cls in range(num_classes)]
         wandb_ap_data.append(["mAP@0.5", ap_results['mAP']])
         self.wandb_logger.log_table(
-            "val/detection_ap",
+            f"{metric_prefix}/detection_ap",
             columns=["Class", "AP"],
             data=wandb_ap_data,
             step=self.cur_epoch
@@ -960,7 +1262,7 @@ class Trainer:
 
             drivable_table_string = AsciiTable(drivable_table_data).table
 
-            self.logger.log_message("\nDrivable Segmentation Metrics:")
+            self.logger.log_message(f"\n[{metric_prefix}] Drivable Segmentation Metrics:")
             self.logger.log_message(drivable_table_string)
 
             # Log to WandB
@@ -972,7 +1274,7 @@ class Trainer:
                 wandb_drivable_data.append([f"IoU_class_{cls}", drivable_iou.get(f'IoU_class_{cls}', 0.0)])
 
             self.wandb_logger.log_table(
-                "val/drivable_metrics",
+                f"{metric_prefix}/drivable_metrics",
                 columns=["Metric", "Value"],
                 data=wandb_drivable_data,
                 step=self.cur_epoch
@@ -990,55 +1292,52 @@ class Trainer:
 
         # Log all metrics to WandB
         wandb_metrics = {
-            "val/total_loss": avg_total_loss,
-            "val/detection_loss": avg_det_loss,
-            "val/drivable_loss": avg_drivable_loss,
-            "val/lane_loss": avg_lane_loss,
-            "val/epoch": self.cur_epoch
+            f"{metric_prefix}/total_loss": avg_total_loss,
+            f"{metric_prefix}/detection_loss": avg_det_loss,
+            f"{metric_prefix}/drivable_loss": avg_drivable_loss,
+            f"{metric_prefix}/lane_loss": avg_lane_loss,
+            f"{metric_prefix}/epoch": self.cur_epoch
         }
 
         # Add detection metrics
         if detection_metrics:
-            wandb_metrics["val/mAP"] = detection_metrics["mAP"]
+            wandb_metrics[f"{metric_prefix}/mAP"] = detection_metrics["mAP"]
             for cls in range(num_classes):
-                wandb_metrics[f"val/AP_class_{cls}"] = detection_metrics.get(f'AP_class_{cls}', 0.0)
+                wandb_metrics[f"{metric_prefix}/AP_class_{cls}"] = detection_metrics.get(f'AP_class_{cls}', 0.0)
 
         # Add drivable metrics
         if drivable_metrics:
-            wandb_metrics["val/drivable_mIoU"] = drivable_metrics["mIoU"]
-            wandb_metrics["val/drivable_mDice"] = drivable_metrics["mDice"]
+            wandb_metrics[f"{metric_prefix}/drivable_mIoU"] = drivable_metrics["mIoU"]
+            wandb_metrics[f"{metric_prefix}/drivable_mDice"] = drivable_metrics["mDice"]
 
         # Add lane metrics
         if lane_metrics:
-            wandb_metrics["val/lane_mIoU"] = lane_metrics["mIoU"]
-            wandb_metrics["val/lane_mDice"] = lane_metrics["mDice"]
+            wandb_metrics[f"{metric_prefix}/lane_mIoU"] = lane_metrics["mIoU"]
+            wandb_metrics[f"{metric_prefix}/lane_mDice"] = lane_metrics["mDice"]
 
         self.wandb_logger.log_metrics(wandb_metrics, step=self.cur_epoch)
 
         # Log summary
         self.logger.log_line()
         self.logger.log_message(
-            f'Validation Epoch {self.cur_epoch} - Avg Loss: {avg_total_loss:.4f} | '
+            f'[{metric_prefix}] Epoch {self.cur_epoch} - Avg Loss: {avg_total_loss:.4f} | '
             f'Det Loss: {avg_det_loss:.4f} | Drivable Loss: {avg_drivable_loss:.4f}'
         )
         if detection_metrics:
-            self.logger.log_message(f'  mAP@0.5: {detection_metrics["mAP"]:.4f}')
+            self.logger.log_message(f'  [{metric_prefix}] mAP@0.5: {detection_metrics["mAP"]:.4f}')
         if drivable_metrics:
-            self.logger.log_message(f'  Drivable mIoU: {drivable_metrics["mIoU"]:.4f}')
+            self.logger.log_message(f'  [{metric_prefix}] Drivable mIoU: {drivable_metrics["mIoU"]:.4f}')
 
-        # Save best model checkpoint
-        current_map = detection_metrics.get("mAP", 0.0) if detection_metrics else 0.0
-        if current_map > self.best_map:
-            self.best_map = current_map
-            self.best_epoch = self.cur_epoch
-            self._save_best_checkpoint(current_map, detection_metrics, drivable_metrics)
+        # Save best model checkpoint (only clean val drives checkpointing)
+        if metric_prefix == "val":
+            current_map = detection_metrics.get("mAP", 0.0) if detection_metrics else 0.0
+            if current_map > self.best_map:
+                self.best_map = current_map
+                self.best_epoch = self.cur_epoch
+                self._save_best_checkpoint(current_map, detection_metrics, drivable_metrics)
 
-        self.logger.log_message(f'  Best mAP: {self.best_map:.4f} (epoch {self.best_epoch})')
+            self.logger.log_message(f'  Best mAP: {self.best_map:.4f} (epoch {self.best_epoch})')
         self.logger.log_line()
-
-        # Restore original weights after EMA evaluation
-        if self.use_ema and self.ema is not None:
-            self.ema.restore(self.model)
 
         # Final cleanup
         gc.collect()

@@ -14,21 +14,25 @@
                 "pretrained":true,
                 "tap_layers":[]
             },
-            "visualize_intermediate":true        
+            "visualize_intermediate":true
         }        
     },
 
     "dataset_kwargs":{
         "dataset_class": "foggy",
-        "depth_map_dir": "/workspace/data/depth_maps",
-        "strict_map": true,
+        "depth_map_dir": "",
+        "strict_map": false,
         "apply_fog_prob": 0.67,
         "adverse_params": {
-            "fog_betas": [0.005, 0.010, 0.020],
-            "darkness_gammas": [1.3, 1.6, 2.0],
+            "fog_betas": [0.008, 0.015, 0.025, 0.040],
+            "darkness_gammas": [1.3, 1.5, 2.0],
             "enable_fog_only": true,
             "enable_darkness_only": true,
-            "enable_compound": true
+            "enable_compound": true,
+            "depth_backend": "onnx",
+            "depth_device": "cuda",
+            "onnx_backend_path": "/workspace/depth_anything_small.onnx",
+            "max_depth_meters": 150.0
         },
         "images_dir": "/workspace/data/100k/100k",
         "detection_annotations_dir": "/workspace/data/bdd100k_labels/100k",
@@ -81,11 +85,11 @@
         "groups": {
             "backbone": {
                 "group": [0, 23],
-                "trainable": false
+                "trainable": true
             },
             "detect": {
                 "group": [24],
-                "trainable": false
+                "trainable": true
             },
             "segmentation": {
                 "group": [25, 33],
@@ -110,7 +114,7 @@
     },
 
     "trainer_kwargs":{
-        "output_dir": "gdip-yolov8p-768-1280",
+        "output_dir": "gdip-yolov5p-768-1280-backbone-Tuned-ONNX-DepthAnything-3",
         "eval_visualize_outputs":true,
         "is_training": true,
         "first_val_epoch": 0,
@@ -123,15 +127,23 @@
         "checkpoint_idx": 2,
         "gradient_accumulation_steps": 2,
         "lr_scheduler_start_epoch": 1,
-        "checkpoint_path": "/workspace/Panoptic-Perception/gdip-yolov8p-768-1280/checkpoints/ckpt_1/ckpt-1.pt",
+        "checkpoint_path": "/workspace/Panoptic-Perception/gdip-yolov5p-768-1280-backbone-Tuned-ONNX-DepthAnything-2/checkpoints/ckpt_1/ckpt-1.pt",
         "reload_optimizer": false,
         "reload_optimizer_with_initial_lr": false,
+        "compute_ssim": true,
 
-        "wandb_project": "GDIP-YOLOP-detection",
+        "wandb_project": "GDIP-YOLOP-detection-2",
         "wandb_enabled": true,
-        "use_ema": false,                                                                               
-        "ema_decay": 0.9999,                                                                           
-        "ema_warmup_steps": 2000         
+        "use_ema": false,
+        "ema_decay": 0.9999,
+        "ema_warmup_steps": 2000,
+
+        "staged_training": {
+            "enabled": false,
+            "stages": [
+                {"start_epoch": 10, "end_epoch": -1, "trainable": ["gdip", "backbone", "detect"], "lr_scales": {"gdip": 1.0, "backbone": 0.1, "detect": 1.0}}
+            ]
+        }
     },
 
     "loss_weights": {

@@ -5,8 +5,10 @@ import numpy as np
 import os
 import json
 import cv2
+import hashlib
 import random
 import albumentations as A
+from collections import defaultdict
 
 from panoptic_perception.dataset.enums import BDD100KClasses, BDD100KClassesReduced
 from panoptic_perception.dataset.augmentations import (
@@ -15,6 +17,13 @@ from panoptic_perception.dataset.augmentations import (
     letterbox_with_masks
 )
 from panoptic_perception.dataset.mosaic_augmentation import mosaic_augmentation
+from panoptic_perception.dataset.adverse_weather import (
+    apply_nighttime_fog,
+    FogParameters, SyntheticFogGenerator, SyntheticLowLightGenerator,
+    HeuristicDepthEstimator, DepthAnythingEstimator, ONNXDepthEstimator,
+    RadialDistance
+)
+
 from enum import Enum
 
 def visualize_batch(images, seg, drivable, targets, save_dir, batch_index=0):
@@ -347,6 +356,7 @@ class BDDPreprocessor:
     def collate_fn(batch:dict):
         
         batch_images = []
+        batch_clean_images = []
         batch_targets = []
         batch_segmentation_masks = []
         batch_drivable_masks = []
@@ -357,6 +367,7 @@ class BDDPreprocessor:
             image = batch_items['image']
             image_path = batch_items["image_path"]
             scene_attributes = batch_items["scene_attributes"]
+            clean_image = batch_items.get("clean_image")
 
             assert image is not None, f"Image tensor at batch index {batch_idx} is None."
             assert image.ndim == 3, "Image tensor must have 3 dimensions (C, H, W)."
@@ -364,6 +375,9 @@ class BDDPreprocessor:
             batch_images.append(image)
             batch_image_paths.append(image_path)
             batch_scene_attributes.append(scene_attributes)
+            
+            if clean_image is not None:
+                batch_clean_images.append(clean_image)
             
             if batch_items['detection_targets'] is not None and batch_items['detection_targets'].shape[0] > 0:
                 nt = batch_items['detection_targets'].shape[0]
@@ -385,6 +399,7 @@ class BDDPreprocessor:
                 batch_drivable_masks.append(batch_items['drivable_mask'])
                 
         batch_images_tensor = torch.stack(batch_images, dim=0)
+        batch_clean_images = torch.stack(batch_clean_images, dim=0) if batch_clean_images else None
         batch_targets_tensor = torch.cat(batch_targets, dim=0) if batch_targets else None
 
         # Sanitize detection targets — all paths (augment, mosaic, mixup, non-augment)
@@ -398,6 +413,7 @@ class BDDPreprocessor:
         
         return {
             "images": batch_images_tensor,
+            "clean_images": batch_clean_images,
             "detections": batch_targets_tensor,
             "segmentation_masks": batch_segmentation_masks_tensor,
             "drivable_area_seg": batch_drivable_masks_tensor,
@@ -616,3 +632,309 @@ class BDD100KDataset(Dataset):
             "scene_attributes": scene_attributes
         }
     
+class FoggyBDD100KDataset(BDD100KDataset):
+    
+    class FogLevels(Enum):
+        LIGHT = 500
+        MODERATE = 200
+        DENSE = 100
+        HEAVY = 50
+
+        @classmethod
+        def from_level(cls, fog_level: int):
+            try:
+                return cls(fog_level).name.lower()
+            except ValueError:
+                return None
+
+        @classmethod
+        def from_label(cls, label: str):
+            return cls[label.upper()].value    
+    
+    def __init__(self, dataset_kwargs, dataset_type = 'train',
+                perform_augmentation = False, mode = DatasetMode.TRAIN,
+                strict_map:bool=True, apply_fog_prob:float=0.67,
+                depth_estimator=None):
+
+        super().__init__(dataset_kwargs, dataset_type, perform_augmentation, mode)
+
+        self.adverse_params = dataset_kwargs["adverse_params"]
+
+        self.depth_map_dir = dataset_kwargs.get("depth_map_dir", None)
+        if self.depth_map_dir and os.path.exists(os.path.join(self.depth_map_dir, self.dataset_type)):
+            self.depth_map_ids = self.get_depth_map_ids()
+            self._cached_depth_stems = set(self.depth_map_ids)
+
+            if strict_map:
+                image_set = set(self.image_ids)
+                depth_set = set(self.depth_map_ids)
+
+                assert image_set == depth_set, (
+                    f"Image-depth ID mismatch: "
+                    f"{len(image_set - depth_set)} images missing depth, "
+                    f"{len(depth_set - image_set)} depth maps missing images"
+                )
+            else:
+                common_ids = set(self.image_ids) & set(self.depth_map_ids)
+                self.image_ids = [id for id in self.image_ids if id in common_ids]
+        else:
+            self.depth_map_ids = []
+            self._cached_depth_stems = set()
+
+        self.apply_fog_prob = apply_fog_prob
+        
+        self.min_haze_level = self.FogLevels.LIGHT
+        self.max_haze_level = self.FogLevels.DENSE
+        
+        #TODO, remove this attribute, replace with FogLevels : str = ["light", "Heavy"]
+        self.fog_betas = self.adverse_params.get("fog_betas", [0.010, 0.020, 0.035])
+        self.darkness_gammas = self.adverse_params.get("darkness_gammas", [1.5, 2.0, 3.5])
+        self.atmospheric_light_quantile = self.adverse_params.get("atmospheric_light_quantile", 0.9)
+        self.atmospheric_light_min_pixels = self.adverse_params.get("atmospheric_light_min_pixels", 10)
+        self.max_depth_meters = self.adverse_params.get("max_depth_meters", 150.0)
+        
+        # All (beta, gamma) combinations
+        self.variants = self._build_variants()
+
+        self._served = defaultdict(set)
+        
+        if depth_estimator is not None:
+            self.depth_estimator = depth_estimator
+        else:
+            self.depth_estimator = HeuristicDepthEstimator(
+                vertical_weight=0.7,
+                intensity_weight=0.2,
+                edge_weight=0.1,
+                edge_epsilon=1e-8,
+                uint8_max=255.0,
+            )
+
+        self.fog_generator = SyntheticFogGenerator(
+            depth_estimator=self.depth_estimator
+        )
+        self.lowlight_generator = SyntheticLowLightGenerator(
+            gamma_min=min(self.darkness_gammas),
+            gamma_max=max(self.darkness_gammas),
+            gamma_min_threshold=1.0,
+        )
+
+    def get_depth_map_ids(self):
+        return [f.split('.')[0] for f in os.listdir(os.path.join(self.depth_map_dir, self.dataset_type))]
+
+    def _build_variants(self):
+        """
+        Builds variant list with three categories:
+        - Fog only:      (beta, None)  — no darkness applied
+        - Darkness only: (None, gamma) — no fog applied
+        - Compound:      (beta, gamma) — both applied
+
+        Controlled by adverse_params keys:
+            "enable_fog_only": True (default)
+            "enable_darkness_only": True (default)
+            "enable_compound": True (default)
+        """
+        variants = []
+
+        if self.adverse_params.get("enable_fog_only", True):
+            variants += [(b, None) for b in self.fog_betas]
+
+        if self.adverse_params.get("enable_darkness_only", True):
+            variants += [(None, g) for g in self.darkness_gammas]
+
+        if self.adverse_params.get("enable_compound", True):
+            variants += [(b, g) for b in self.fog_betas for g in self.darkness_gammas]
+
+        assert len(variants) > 0, "At least one variant type must be enabled"
+        return variants
+
+    def _select_degradation(self, scene_attributes, beta=None, gamma=None):
+        """Adjust or skip degradation based on scene context."""
+        """
+        ┌───────────────────┬───────────────────────┬─────────────────────┐
+        │       Scene       │     Fog applied?      │  Darkness applied?  │
+        ├───────────────────┼───────────────────────┼─────────────────────┤
+        │ clear × daytime   │ Yes (any beta)        │ Yes (any gamma)     │
+        ├───────────────────┼───────────────────────┼─────────────────────┤
+        │ clear × dawn/dusk │ Yes (any beta)        │ Yes (capped at 1.5) │
+        ├───────────────────┼───────────────────────┼─────────────────────┤
+        │ clear × night     │ Yes (any beta)        │ No                  │
+        ├───────────────────┼───────────────────────┼─────────────────────┤
+        │ rainy × daytime   │ Yes (capped at 0.010) │ Yes (any gamma)     │
+        ├───────────────────┼───────────────────────┼─────────────────────┤
+        │ foggy × daytime   │ No                    │ Yes (any gamma)     │
+        ├───────────────────┼───────────────────────┼─────────────────────┤
+        │ foggy × night     │ No                    │ No → serve clean    │
+        ├───────────────────┼───────────────────────┼─────────────────────┤
+        │ snowy × night     │ Yes (capped at 0.010) │ No                  │
+        └───────────────────┴───────────────────────┴─────────────────────┘        
+        """
+        
+        def sample_beta():
+            visibility = np.random.uniform(self.min_haze_level.value, self.max_haze_level.value)
+            beta = 3.912 / visibility
+            return beta
+        
+        def sample_gamma():
+            return np.random.uniform(self.lowlight_generator.gamma_min, self.lowlight_generator.gamma_max)
+
+        weather = scene_attributes.get("weather", "undefined") if scene_attributes else "undefined"
+        tod = scene_attributes.get("timeofday", "undefined") if scene_attributes else "undefined"
+
+        # Default: sample both
+        beta = sample_beta()
+        gamma = sample_gamma()
+
+        # Already foggy — don't add more fog
+        if weather == "foggy":
+            beta = None
+
+        # Already night — skip darkness
+        if tod == "night":
+            gamma = None
+
+        # Dawn/dusk — cap darkness to mild
+        if tod == "dawn/dusk" and gamma is not None:
+            gamma = min(gamma, 1.3)
+
+        # Rainy/snowy — reduce fog intensity
+        if weather in ("rainy", "snowy") and beta is not None:
+            beta = min(beta, 0.010)
+
+        return beta, gamma
+
+    def _load_raw(self, index):
+        image, bboxes, class_labels, \
+            scene_attributes, seg, drivable, image_path = super()._load_raw(index)
+
+        image_id = self.image_ids[index]
+        depth_map_arr = None
+
+        # # Try cached .npy first
+        # if image_id in self._cached_depth_stems:
+        #     depth_map_path = os.path.join(self.depth_map_dir, self.dataset_type, f"{image_id}.npy")
+        #     if os.path.exists(depth_map_path):
+        #         depth_map_arr = np.load(str(depth_map_path))
+
+        # Fall back to on-the-fly depth estimation
+        # if depth_map_arr is None:
+        #     depth_map_arr = self.depth_estimator.estimate(image)
+
+        return image, depth_map_arr, bboxes, class_labels, scene_attributes, seg, drivable, image_path
+    
+    def _next_variant(self, image_id: str):
+        
+        served = self._served[image_id]
+    
+        if len(served) >= len(self.variants):
+            served.clear()
+
+        remaining = [i for i in range(len(self.variants)) if i not in served]
+        chosen_idx = random.choice(remaining)
+        served.add(chosen_idx)
+
+        return self.variants[chosen_idx]        
+    
+    def _apply_degradation(self, image:np.ndarray, depth_map_arr:np.ndarray, beta, gamma):
+        """Apply fog and/or darkness to the raw image. Returns degraded uint8 RGB."""
+        if beta is not None and gamma is not None:
+            params = FogParameters(
+                beta=beta,
+                max_depth_meters=self.max_depth_meters,
+                atmospheric_light_quantile=self.atmospheric_light_quantile,
+                atmospheric_light_min_pixels=self.atmospheric_light_min_pixels,
+            )
+            image, _, _ = apply_nighttime_fog(
+                image_rgb=image,
+                fog_generator=self.fog_generator,
+                fog_params=params,
+                gamma_generator=self.lowlight_generator,
+                gamma=gamma,
+                apply_order="dark_then_fog",
+                precomputed_depth=depth_map_arr,
+            )
+        elif beta is not None:
+            params = FogParameters(
+                beta=beta,
+                max_depth_meters=self.max_depth_meters,
+                atmospheric_light_quantile=self.atmospheric_light_quantile,
+                atmospheric_light_min_pixels=self.atmospheric_light_min_pixels,
+            )
+            image, _, _ = self.fog_generator.generate(
+                image_rgb=image,
+                params=params,
+                precomputed_depth=depth_map_arr,
+            )
+        elif gamma is not None:
+            image = self.lowlight_generator.apply(image, gamma)
+
+        return image
+
+    def prepare_training_sample(self, index):
+        image, depth_map_arr, bboxes, class_labels, \
+            scene_attributes, seg, drivable, image_path = self._load_raw(index)
+
+        # Step 1: Decide foggy or clean
+        if self.mode == DatasetMode.TRAIN:
+            apply_fog = random.random() < self.apply_fog_prob
+        else:
+            apply_fog = True
+
+        # Step 2: Apply degradation BEFORE augmentations (depth aligned to raw image)
+        # if apply_fog:
+        #     image_id = self.image_ids[index]
+        #     # if self.mode == DatasetMode.TRAIN:
+        #     #     beta, gamma = self._next_variant(image_id)
+        #     # else:
+        #     #     variant_idx = int(hashlib.md5(image_id.encode()).hexdigest(), 16) % len(self.variants)
+        #     #     beta, gamma = self.variants[variant_idx]
+        #     # beta, gamma = self._select_degradation(scene_attributes, beta, gamma)
+        #     beta, gamma = self._select_degradation(scene_attributes)
+        #     image = self._apply_degradation(image, depth_map_arr, beta, gamma)
+
+        # Step 3: Standard augmentations only (no mosaic, mixup, copy-paste)
+        if self.perform_augmentation:
+            image, seg, drivable, labels_xywh = self.preprocessor.standard_augmentations(
+                image=image, seg=seg, drivable=drivable,
+                bboxes=bboxes, class_labels=class_labels
+            )
+        else:
+            t = self.preprocessor.transformation(
+                image=image, bboxes=bboxes, class_labels=class_labels
+            )
+            image, bboxes, class_labels = t['image'], t['bboxes'], t['class_labels']
+            if seg is not None:
+                seg = self.preprocessor.mask_only_transformation(image=seg)['image']
+            if drivable is not None:
+                drivable = self.preprocessor.mask_only_transformation(image=drivable)['image']
+            labels_xywh = self.preprocessor.prepare_targets_2d(bboxes, class_labels)
+
+        clean_image = image.copy()
+        
+        if apply_fog:
+            image_id = self.image_ids[index]
+            # if self.mode == DatasetMode.TRAIN:
+            #     beta, gamma = self._next_variant(image_id)
+            # else:
+            #     variant_idx = int(hashlib.md5(image_id.encode()).hexdigest(), 16) % len(self.variants)
+            #     beta, gamma = self.variants[variant_idx]
+            # beta, gamma = self._select_degradation(scene_attributes, beta, gamma)
+            depth_map_arr = self.depth_estimator.estimate(image)
+            beta, gamma = self._select_degradation(scene_attributes)
+            image = self._apply_degradation(image, depth_map_arr, beta, gamma)        
+
+        # Step 4: Convert to tensors (same output format as parent)
+        image_tensor = self.preprocessor.normalize_tensor(torch.from_numpy(image).permute(2, 0, 1))
+        clean_tensor = self.preprocessor.normalize_tensor(torch.from_numpy(clean_image).permute(2, 0, 1))
+        targets = torch.from_numpy(labels_xywh).float()
+        seg_tensor = torch.from_numpy(seg).long() if seg is not None else None
+        drivable_tensor = torch.from_numpy(drivable).long() if drivable is not None else None
+
+        return {
+            "image": image_tensor,
+            "clean_image":clean_tensor,
+            "segmentation_mask": seg_tensor,
+            "drivable_mask": drivable_tensor,
+            "detection_targets": targets,
+            "image_path": image_path,
+            "scene_attributes": scene_attributes
+        }

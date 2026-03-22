@@ -19,6 +19,7 @@ class PanopticModelOutputs:
     detection_loss: torch.Tensor = None
     drivable_segmentation_loss: torch.Tensor = None
     lane_segmentation_loss: torch.Tensor = None
+    defogging_loss: torch.Tensor = None
 
     # ---- YoloV8 Anchor-Free Detection Head Outputs ----
     bbox_logits_raw: torch.Tensor = None
@@ -39,13 +40,13 @@ class WeightsManager:
     def __init__(self, verbose=True):
         self.verbose = verbose
         
-    def load(self, model:torch.nn.Module, ckpt_path:str, strict=False):
-        
+    def load(self, model:torch.nn.Module, ckpt_path:str, strict=False, key_prefix:str=None):
+
         if not os.path.exists(ckpt_path):
             if self.verbose:
                 print(f'Model Checkpoint not found: {ckpt_path}')
             return
-        
+
         ckpt = torch.load(ckpt_path, map_location="cpu", weights_only=False)
 
         if "model_state" in ckpt:
@@ -61,6 +62,11 @@ class WeightsManager:
                 new_key = key.replace('anchors_grid', 'anchors')
                 keys_to_add[new_key] = state_dict[key]
         state_dict.update(keys_to_add)
+
+        # Remap keys when loading a bare YOLOP/YOLOv8P checkpoint into a wrapper like GDIPYolo
+        # e.g., key_prefix="task_network" remaps "module_list.0.weight" -> "task_network.module_list.0.weight"
+        if key_prefix:
+            state_dict = {f"{key_prefix}.{k}": v for k, v in state_dict.items()}
 
         missing, unexpected = model.load_state_dict(
             state_dict, strict=False
