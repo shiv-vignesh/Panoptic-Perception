@@ -483,7 +483,7 @@ class BDD100KDataset(Dataset):
         assert os.path.exists(image_path), f"Image path {image_path} does not exist."
 
         # Load image
-        image = cv2.imread(image_path, cv2.COLOR_BGR2RGB)
+        image = cv2.imread(image_path, cv2.IMREAD_COLOR)
         image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
 
         # Load masks
@@ -683,14 +683,15 @@ class FoggyBDD100KDataset(BDD100KDataset):
 
         self.apply_fog_prob = apply_fog_prob
         
-        self.min_haze_level = self.FogLevels.LIGHT
-        self.max_haze_level = self.FogLevels.DENSE
+        self.min_haze_level = self.FogLevels.MODERATE
+        self.max_haze_level = self.FogLevels.HEAVY
         
         #TODO, remove this attribute, replace with FogLevels : str = ["light", "Heavy"]
         self.fog_betas = self.adverse_params.get("fog_betas", [0.010, 0.020, 0.035])
         self.darkness_gammas = self.adverse_params.get("darkness_gammas", [1.5, 2.0, 3.5])
         self.atmospheric_light_quantile = self.adverse_params.get("atmospheric_light_quantile", 0.9)
         self.atmospheric_light_min_pixels = self.adverse_params.get("atmospheric_light_min_pixels", 10)
+        self.atmospheric_light = self.adverse_params.get("atmospheric_light", None)
         self.max_depth_meters = self.adverse_params.get("max_depth_meters", 150.0)
         
         # All (beta, gamma) combinations
@@ -842,6 +843,7 @@ class FoggyBDD100KDataset(BDD100KDataset):
                 max_depth_meters=self.max_depth_meters,
                 atmospheric_light_quantile=self.atmospheric_light_quantile,
                 atmospheric_light_min_pixels=self.atmospheric_light_min_pixels,
+                atmospheric_light=np.array(self.atmospheric_light) if self.atmospheric_light is not None else None,
             )
             image, _, _ = apply_nighttime_fog(
                 image_rgb=image,
@@ -858,6 +860,7 @@ class FoggyBDD100KDataset(BDD100KDataset):
                 max_depth_meters=self.max_depth_meters,
                 atmospheric_light_quantile=self.atmospheric_light_quantile,
                 atmospheric_light_min_pixels=self.atmospheric_light_min_pixels,
+                atmospheric_light=np.array(self.atmospheric_light) if self.atmospheric_light is not None else None,
             )
             image, _, _ = self.fog_generator.generate(
                 image_rgb=image,

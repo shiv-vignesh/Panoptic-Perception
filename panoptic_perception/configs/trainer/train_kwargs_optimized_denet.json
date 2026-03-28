@@ -27,6 +27,7 @@
         "adverse_params": {
             "fog_betas": [0.008, 0.015, 0.025, 0.040],
             "darkness_gammas": [1.3, 1.5, 2.0],
+            "atmospheric_light": [0.9, 0.9, 0.9],
             "enable_fog_only": true,
             "enable_darkness_only": true,
             "enable_compound": true,
