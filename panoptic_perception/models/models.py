@@ -11,6 +11,7 @@ from panoptic_perception.models.common import (
 )
 from panoptic_perception.models.utils import parse_model_config, initialize_weights, PanopticModelOutputs
 from panoptic_perception.models.gdip import GDIP, MultiLevelGDIP, build_vision_encoder
+from panoptic_perception.models.denet import DENet
 from panoptic_perception.utils.detection_utils import DetectionLossCalculator
 from panoptic_perception.utils.segmentation_utils import SegmentationLossCalculator
 
@@ -561,6 +562,50 @@ class GDIPYolo(nn.Module):
                 self.intermediate_images = [img.detach() for img in intermediate_images] if intermediate_images else []
                 self.gates = [g.detach() for g in gates]
 
+        defogging_loss = None
+        if compute_ssim and targets is not None and targets.get("clean_images") is not None:
+            ssim_val = self.ssim(enhanced_image, targets["clean_images"])
+            defogging_loss = 1. - ssim_val
+
+        outputs = self.task_network(enhanced_image, targets)
+
+        if defogging_loss is not None:
+            outputs.defogging_loss = defogging_loss
+
+        return outputs
+
+class DENetYolo(nn.Module):
+    def __init__(self, task_network:Union[YOLOP, YOLOv8P], denet_kwargs:dict):
+        super(DENetYolo, self).__init__()
+        
+        self.task_network = task_network
+        self.enhanced_image = None
+        
+        self.denet = DENet(
+            num_high=denet_kwargs.get("num_high", 3),
+            gaussian_kernel_size=denet_kwargs.get("gaussian_kernel_size", 5),
+            num_channels=denet_kwargs.get("num_channels", 3),
+            channel_blocks=denet_kwargs.get("channel_blocks", 64),
+            channel_mask=denet_kwargs.get("channel_mask", 16),
+            up_kernel_size=denet_kwargs.get("up_kernel_size", 1),
+            high_channels=denet_kwargs.get("high_channels", 32),
+            high_kernel_size=denet_kwargs.get("high_kernel_size", 3)
+        )
+        
+        self.vis_intermediate = denet_kwargs.get("visualize_intermediate", True)
+        self.ssim = StructuralSimilarityIndexMeasure(data_range=1.0)
+        
+    def forward(self, x:torch.Tensor, targets=None, store_enhanced_image:bool = True, 
+                compute_ssim:bool = True):
+        
+        assert x.shape[1] == self.denet.num_channels, f'Image Input Channels does not match, DENet Expected: {self.denet.num_channels}'
+        enhanced_image = self.denet(x)
+
+        assert enhanced_image.shape == x.shape, f'Enhanced Image and Input Image Shape Mismatch, {enhanced_image.shape} and {x.shape}'
+
+        if store_enhanced_image:
+            self.enhanced_image = enhanced_image.detach()
+            
         defogging_loss = None
         if compute_ssim and targets is not None and targets.get("clean_images") is not None:
             ssim_val = self.ssim(enhanced_image, targets["clean_images"])

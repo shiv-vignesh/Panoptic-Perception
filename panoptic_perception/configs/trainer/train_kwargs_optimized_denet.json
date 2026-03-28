@@ -5,16 +5,17 @@
         "model_type":"yolop",
         "cfg_path":"panoptic_perception/configs/models/yolo-768-1280-detection.cfg",
         "device":"cuda",
-        "use_gdip":true,
-        "gdip_kwargs":{
-            "mode": "mgdip",
-            "encoder" : {
-                "type":"resnet18",
-                "latent_dim":256,
-                "pretrained":true,
-                "tap_layers":[5, 6, 7]
-            },
-            "visualize_intermediate":true
+        "use_gdip": false,
+        "use_denet": true,
+        "denet_kwargs": {
+            "num_high": 3,
+            "gaussian_kernel_size": 5,
+            "num_channels": 3,
+            "channel_blocks": 64,
+            "channel_mask": 16,
+            "high_channels": 32,
+            "high_kernel_size": 3,
+            "visualize_intermediate": true
         }
     },
 

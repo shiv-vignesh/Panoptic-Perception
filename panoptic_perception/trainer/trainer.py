@@ -99,7 +99,7 @@ class ModelEMA:
 
 from panoptic_perception.dataset.enums import BDD100KClassesReduced
 
-from panoptic_perception.models.models import YOLOP, YOLOv8P, GDIPYolo, get_model_param_groups
+from panoptic_perception.models.models import YOLOP, YOLOv8P, GDIPYolo, DENetYolo, get_model_param_groups
 from panoptic_perception.models.utils import PanopticModelOutputs, WeightsManager
 
 from panoptic_perception.utils.logger import Logger
@@ -113,7 +113,7 @@ CLASS_NAMES = [cls.name for cls in BDD100KClassesReduced]
 
 class Trainer:
     
-    def __init__(self, model:Optional[Union[YOLOP, YOLOv8P, GDIPYolo]], device:torch.device,
+    def __init__(self, model:Optional[Union[YOLOP, YOLOv8P, GDIPYolo, DENetYolo]], device:torch.device,
                  dataset_kwargs:dict, 
                  optimizer_kwargs:dict, lr_scheduler_kwargs:dict,
                  trainer_kwargs:dict):
@@ -423,7 +423,37 @@ class Trainer:
                             "lr_scale": cfg.get("lr_scale", 1.0)
                         })
             
-        elif isinstance(self.model, YOLOP) or isinstance(self.model, YOLOv8P):            
+        elif isinstance(self.model, DENetYolo):
+            if not self.groups:
+                param_groups = [{"params": list(self.model.task_network.parameters()), "name": "task_network", "lr_scale": 1.0}]
+                self.logger.log_message('Full task_network training (all layers trainable)')
+                self.logger.log_new_line()
+            else:
+                # Custom groups: get param groups with DCN-aware differential LR
+                param_groups = get_model_param_groups(self.model.task_network, self.groups, self.dcn_lr_mult, allow_empty=True)
+                self.logger.log_message('Training with specified groups:')
+                for group_name in self.groups:
+                    group_info = self.groups[group_name]
+                    self.logger.log_message(
+                        f'  Group name: {group_name} - '
+                        f'trainable: {group_info["trainable"]} - '
+                        f'layer start/end: {group_info["group"]}'
+                    )
+                # Log DCN-specific param groups
+                for pg in param_groups:
+                    if pg.get("name", "").startswith("dcn"):
+                        self.logger.log_message(
+                            f'  DCN Group: {pg["name"]} - '
+                            f'params: {len(pg["params"])} - '
+                            f'lr_scale: {pg["lr_scale"]}'
+                        )
+                self.logger.log_new_line()
+            
+            param_groups.append({
+                "params": list(self.model.denet.parameters()), "name": "DENet", "lr_scale": 1.0
+            })
+        
+        elif isinstance(self.model, YOLOP) or isinstance(self.model, YOLOv8P):
             if not self.groups:
                 # No custom groups: train full model
                 param_groups = list(self.model.parameters())
@@ -529,7 +559,7 @@ class Trainer:
             # Detect if checkpoint was saved from a bare YOLOP/YOLOv8P but loading into GDIPYolo
             # If so, remap keys with "task_network." prefix
             key_prefix = None
-            if isinstance(self.model, GDIPYolo):
+            if isinstance(self.model, GDIPYolo) or isinstance(self.model, DENetYolo):
                 ckpt_state = ckpt.get("model_state", ckpt)
                 sample_key = next(iter(ckpt_state), "")
                 if not sample_key.startswith("task_network."):
@@ -608,7 +638,7 @@ class Trainer:
                 tasks.append("Drivable Segmentation, ")
             if self.model.lane_segmentation_head_idx != -1:
                 tasks.append("Lane Segmentation")
-        elif isinstance(self.model, GDIPYolo):
+        elif isinstance(self.model, GDIPYolo) or isinstance(self.model, DENetYolo):
             if self.model.task_network.detection_head_idx != -1:
                 tasks.append("Detection, ")
             if self.model.task_network.segmentation_head_idx != -1:
@@ -756,6 +786,24 @@ class Trainer:
 
                     self.model.gates = None
 
+            if isinstance(self.model, DENetYolo) and (batch_idx + 1) % 200 == 0:
+                if self.model.enhanced_image is not None:
+                    
+                    enhanced_imgs = self.model.enhanced_image.clamp(0, 1)
+                    original_images = data_items["images"].clamp(0, 1)
+                    
+                    combined = torch.cat([original_images, enhanced_imgs], dim=3)
+                    combined = (combined * 255).to(torch.uint8)
+                    
+                    # enhanced_imgs = (self.model.enhanced_image.clamp(0, 1) * 255).to(torch.uint8)
+                    self.wandb_logger.log_images(
+                        "train/original_vs_enhanced",
+                        combined,
+                        step=self.cur_epoch * self.total_train_batch + batch_idx,
+                        caption=f'train_{self.cur_epoch}_batch_{batch_idx}'
+                    )
+                    self.model.enhanced_image = None                    
+            
             if ((batch_idx + 1) % self.gradient_accumulation_steps == 0) or (batch_idx == self.train_dataloader.__len__() - 1):
 
                 # Clip gradients and check for non-finite norms before optimizer step
@@ -868,7 +916,7 @@ class Trainer:
         if outputs.lane_segmentation_loss is not None:
             loss += outputs.lane_segmentation_loss
             
-        if isinstance(self.model, GDIPYolo):
+        if isinstance(self.model, GDIPYolo) or isinstance(self.model, DENetYolo):
             if hasattr(outputs, "defogging_loss") and outputs.defogging_loss is not None:
                 loss += self.lambda_defog * outputs.defogging_loss
 
@@ -985,7 +1033,7 @@ class Trainer:
 
                         self.wandb_logger.log_images(
                             f"{metric_prefix}/enhanced_images",
-                            enhanced_imgs,
+                            combined,
                             step=self.cur_epoch,
                             caption=f'eval_{self.cur_epoch}'
                         )
@@ -1006,6 +1054,24 @@ class Trainer:
                                 self.wandb_logger.log_metrics(gate_metrics, step=self.cur_epoch)
 
                         self.model.gates = None
+                        
+                if isinstance(self.model, DENetYolo) and batch_idx == 0:
+                    if self.model.enhanced_image is not None:
+                        # enhanced_imgs = (self.model.enhanced_image.clamp(0, 1) * 255).to(torch.uint8)
+
+                        enhanced_imgs = self.model.enhanced_image.clamp(0, 1)
+                        original_images = data_items["images"].clamp(0, 1)
+
+                        combined = torch.cat([original_images, enhanced_imgs], dim=3)
+                        combined = (combined * 255).to(torch.uint8)                        
+
+                        self.wandb_logger.log_images(
+                            f"{metric_prefix}/enhanced_images",
+                            combined,
+                            step=self.cur_epoch,
+                            caption=f'eval_{self.cur_epoch}'
+                        )
+                        self.model.enhanced_image = None                    
 
                 # Accumulate losses
                 if outputs.detection_loss is not None:
