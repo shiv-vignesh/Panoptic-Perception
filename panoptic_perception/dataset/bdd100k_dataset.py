@@ -683,8 +683,8 @@ class FoggyBDD100KDataset(BDD100KDataset):
 
         self.apply_fog_prob = apply_fog_prob
         
-        self.min_haze_level = self.FogLevels.MODERATE
-        self.max_haze_level = self.FogLevels.HEAVY
+        self.min_haze_level = self.FogLevels.LIGHT
+        self.max_haze_level = self.FogLevels.DENSE
         
         #TODO, remove this attribute, replace with FogLevels : str = ["light", "Heavy"]
         self.fog_betas = self.adverse_params.get("fog_betas", [0.010, 0.020, 0.035])
