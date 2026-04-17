@@ -631,7 +631,7 @@ class BDD100KDataset(Dataset):
             "image_path": image_path,
             "scene_attributes": scene_attributes
         }
-    
+
 class FoggyBDD100KDataset(BDD100KDataset):
     
     class FogLevels(Enum):

@@ -376,6 +376,7 @@ class Trainer:
         self.groups = optimizer_kwargs.get("groups", {})
         self.dcn_lr_mult = optimizer_kwargs.get("dcn_lr_mult", 0.1)  # DCN offset LR = base_lr * 0.1
         
+        #TODO, replace 
         if isinstance(self.model, GDIPYolo):
             if not self.groups:
                 # No custom groups: train all task_network layers
@@ -423,6 +424,7 @@ class Trainer:
                             "lr_scale": cfg.get("lr_scale", 1.0)
                         })
             
+        #TODO, replace 
         elif isinstance(self.model, DENetYolo):
             if not self.groups:
                 param_groups = [{"params": list(self.model.task_network.parameters()), "name": "task_network", "lr_scale": 1.0}]
@@ -453,6 +455,7 @@ class Trainer:
                 "params": list(self.model.denet.parameters()), "name": "DENet", "lr_scale": 1.0
             })
         
+        #TODO, replace 
         elif isinstance(self.model, YOLOP) or isinstance(self.model, YOLOv8P):
             if not self.groups:
                 # No custom groups: train full model
@@ -565,7 +568,7 @@ class Trainer:
                 if not sample_key.startswith("task_network."):
                     key_prefix = "task_network"
 
-            missing, unexpected, loaded_keys = WeightsManager().load(self.model, ckpt_path, key_prefix=key_prefix)            
+            missing, unexpected, loaded_keys = WeightsManager().load(self.model, ckpt_path, key_prefix=key_prefix)
             # self.model.load_state_dict(ckpt["model_state"])
             self.logger.log_message("=== Weights Loaded ===")
             self.logger.log_message(f"Loaded     : {len(loaded_keys)} keys")
@@ -631,6 +634,7 @@ class Trainer:
         
         tasks = []
         
+        #replace, TODO
         if isinstance(self.model, YOLOP) or isinstance(self.model, YOLOv8P):        
             if self.model.detection_head_idx != -1:
                 tasks.append("Detection, ")
@@ -751,13 +755,13 @@ class Trainer:
             # Log GDIP enhanced images periodically
             if isinstance(self.model, GDIPYolo) and (batch_idx + 1) % 200 == 0:
                 if self.model.enhanced_image is not None:
-                    
+
                     enhanced_imgs = self.model.enhanced_image.clamp(0, 1)
                     original_images = data_items["images"].clamp(0, 1)
-                    
+
                     combined = torch.cat([original_images, enhanced_imgs], dim=3)
                     combined = (combined * 255).to(torch.uint8)
-                    
+
                     # enhanced_imgs = (self.model.enhanced_image.clamp(0, 1) * 255).to(torch.uint8)
                     self.wandb_logger.log_images(
                         "train/original_vs_enhanced",
@@ -827,7 +831,7 @@ class Trainer:
 
             epoch_training_time += (step_end_time - step_begin_time)
             ten_percent_training_time += (step_end_time - step_begin_time)
-                
+
             if (batch_idx + 1) % self.ten_percent_train_batch == 0:
 
                 if self.cur_epoch < self.warmup_epochs:
@@ -1192,12 +1196,12 @@ class Trainer:
                                 original_imgs=data_items["images"],
                                 masks=drivable_preds
                             )
-                            
+
                             batch_drivable_gts = SegmentationUtils.transparent_overlay(
                                 original_imgs=data_items["images"],
                                 masks=drivable_targets
                             )
-                            
+
                             image_paths = data_items.get("image_paths", [])
                             for image_idx, (pred_overlay, gt_overlay) in enumerate(zip(batch_drivable_preds, batch_drivable_gts)):
                                 if image_paths and image_idx < len(image_paths):
