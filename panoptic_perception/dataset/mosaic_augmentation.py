@@ -9,21 +9,23 @@ import numpy as np
 import random
 import albumentations as A
 
-def mosaic_augmentation(images_list, bboxes_list, class_labels_list, 
-                    segs_list, drivables_list, output_size=(640, 640)):                
-    """                                                                                                                                 
-    Create mosaic augmentation by combining 4 images.                                                                                   
-                                                                                                                                        
-    Args:                                                                                                                               
-        images_list: list of 4 images (each HWC, BGR)                                                                                   
-        bboxes_list: list of 4 bbox arrays, each Nx4 in pascal_voc format [x1, y1, x2, y2] original pixel coords                        
-        class_labels_list: list of 4 class label arrays                                                                                 
-        segs_list: list of 4 segmentation masks or None                                                                                 
-        drivables_list: list of 4 drivable masks or None                                                                                
-        output_size: output image size (height, width)                                                                                  
+def mosaic_augmentation(images_list, bboxes_list, class_labels_list,
+                    segs_list, drivables_list, lane_polys_list=None,
+                    output_size=(640, 640)):
+    """
+    Create mosaic augmentation by combining 4 images.
 
-    Returns:                                                                                                                            
-        mosaic_img, mosaic_labels (Nx5 normalized xywh), mosaic_seg, mosaic_drivable                                                    
+    Args:
+        images_list: list of 4 images (each HWC, BGR)
+        bboxes_list: list of 4 bbox arrays, each Nx4 in pascal_voc format [x1, y1, x2, y2] original pixel coords
+        class_labels_list: list of 4 class label arrays
+        segs_list: list of 4 segmentation masks or None
+        drivables_list: list of 4 drivable masks or None
+        lane_polys_list: list of 4 lane_polys lists or None
+        output_size: output image size (height, width)
+
+    Returns:
+        mosaic_img, mosaic_labels (Nx5 normalized xywh), mosaic_seg, mosaic_drivable, mosaic_lane_polys
     """                                                                                                                                 
     assert len(images_list) == 4, "Mosaic requires exactly 4 images"                                                                    
                                                                                                                                         
@@ -37,9 +39,10 @@ def mosaic_augmentation(images_list, bboxes_list, class_labels_list,
     has_seg = segs_list[0] is not None                                                                                                  
     has_drivable = drivables_list[0] is not None                                                                                        
                                                                                                                                         
-    mosaic_seg = np.zeros((h_out, w_out), dtype=np.uint8) if has_seg else None                                                          
-    mosaic_drivable = np.zeros((h_out, w_out), dtype=np.uint8) if has_drivable else None                                                
-                                                                                                                                        
+    mosaic_seg = np.zeros((h_out, w_out), dtype=np.uint8) if has_seg else None
+    mosaic_drivable = np.zeros((h_out, w_out), dtype=np.uint8) if has_drivable else None
+    mosaic_lane_polys = [] if lane_polys_list is not None else None
+
     # Random center point for dividing the mosaic                                                                                       
     yc = int(random.uniform(0.4 * h_out, 0.6 * h_out))                                                                                  
     xc = int(random.uniform(0.4 * w_out, 0.6 * w_out))                                                                                  
@@ -117,9 +120,28 @@ def mosaic_augmentation(images_list, bboxes_list, class_labels_list,
                 bw = (x2_out - x1_out) / w_out                                                                                          
                 bh = (y2_out - y1_out) / h_out                                                                                          
                                                                                                                                         
-                if 0 <= cx <= 1 and 0 <= cy <= 1 and bw > 0.001 and bh > 0.001:                                                         
-                    mosaic_labels.append([cls, cx, cy, bw, bh])                                                                         
-                                                                                                                                        
-    mosaic_labels = np.array(mosaic_labels) if mosaic_labels else np.zeros((0, 5))                                                      
+                if 0 <= cx <= 1 and 0 <= cy <= 1 and bw > 0.001 and bh > 0.001:
+                    mosaic_labels.append([cls, cx, cy, bw, bh])
 
-    return mosaic_img, mosaic_labels, mosaic_seg, mosaic_drivable 
+        # Transform lane polylines for this tile
+        if lane_polys_list is not None and lane_polys_list[idx] is not None:
+            for poly in lane_polys_list[idx]:
+                pts = poly["points"].copy()
+                # Scale to tile and offset to mosaic position
+                pts[:, 0] = pts[:, 0] * scale + x1_place
+                pts[:, 1] = pts[:, 1] * scale + y1_place
+
+                # Keep only points within output bounds
+                valid = ((pts[:, 0] >= 0) & (pts[:, 0] < w_out) &
+                         (pts[:, 1] >= 0) & (pts[:, 1] < h_out))
+                pts_valid = pts[valid]
+
+                if len(pts_valid) >= 2:
+                    mosaic_lane_polys.append({
+                        "points": pts_valid.astype(np.float32),
+                        "category": poly["category"]
+                    })
+
+    mosaic_labels = np.array(mosaic_labels) if mosaic_labels else np.zeros((0, 5))
+
+    return mosaic_img, mosaic_labels, mosaic_seg, mosaic_drivable, mosaic_lane_polys

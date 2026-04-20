@@ -69,11 +69,13 @@ def test_integration():
     print("TEST: Model Forward Pass with DataLoader")
     print("="*60)
     
-    # cfg_path = 'panoptic_perception/configs/models/yolop.cfg'
-    # model = YOLOP(cfg_path)
+    cfg_path = "/Users/shivvignesh/Documents/PersonalProjects/PanopticPerceptionProject/panoptic_perception/configs/models/yolo-lane-detect.cfg"
+    model = YOLOP(
+        cfg_path
+    )
 
-    cfg_path = 'panoptic_perception/configs/models/yolov8-detection-anchorFree.cfg'
-    model = YOLOv8P(cfg_path)
+    # cfg_path = 'panoptic_perception/configs/models/yolov8-detection-anchorFree.cfg'
+    # model = YOLOv8P(cfg_path)
     module_defs = model.module_defs
 
     assert isinstance(module_defs, list), "Module definitions should be a list"
@@ -96,6 +98,7 @@ def test_integration():
         targets={
             "drivable_area_seg": batch.get("drivable_area_seg"),
             "lane_seg": batch.get("segmentation_masks"),
+            "lanes_detections":batch.get("lanes_detections"),
             "detections": batch["detections"]
         }
     )

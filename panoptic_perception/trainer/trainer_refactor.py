@@ -227,21 +227,25 @@ class Trainer:
                 "drivable_area_seg": data_items.get("drivable_area_seg"),
                 "lane_seg": data_items.get("segmentation_masks"),
                 "detections": data_items["detections"],
+                "lanes_detections": data_items.get("lanes_detections"),
                 "clean_images": data_items.get("clean_images")
             }
         )
-        
+
         loss = torch.zeros(1, device=self.device)
-        
+
         if outputs.detection_loss is not None:
             loss += outputs.detection_loss
-            
+
         if outputs.drivable_segmentation_loss is not None:
             loss += outputs.drivable_segmentation_loss
-            
+
         if outputs.lane_segmentation_loss is not None:
             loss += outputs.lane_segmentation_loss
-            
+
+        if outputs.lane_detection_loss is not None:
+            loss += outputs.lane_detection_loss
+
         if self.has_enhancement:
             if hasattr(outputs, "defogging_loss") and outputs.defogging_loss is not None:
                 loss += self.training_args.lambda_defog * outputs.defogging_loss
@@ -282,6 +286,7 @@ class Trainer:
                         "drivable_area_seg": data_items.get("drivable_area_seg"),
                         "lane_seg": data_items.get("segmentation_masks"),
                         "detections": data_items["detections"],
+                        "lanes_detections": data_items.get("lanes_detections"),
                         "clean_images": data_items.get("clean_images")
                     }
                 )
@@ -298,6 +303,7 @@ class Trainer:
             self.eval_batch_ctx.cur_eval_gt_detections = data_items["detections"]
             self.eval_batch_ctx.cur_eval_gt_drivable_area_seg = data_items.get("drivable_area_seg")
             self.eval_batch_ctx.cur_eval_gt_lane_seg = data_items.get("segmentation_masks")
+            self.eval_batch_ctx.cur_eval_gt_lane_detections = data_items.get("lanes_detections")
 
             self.callbacks.on_eval_batch_end(self)
 

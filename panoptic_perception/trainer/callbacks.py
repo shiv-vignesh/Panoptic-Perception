@@ -17,6 +17,7 @@ from panoptic_perception.models.utils import WeightsManager
 from panoptic_perception.utils.detection_utils import DetectionHelper
 from panoptic_perception.utils.segmentation_utils import SegmentationUtils
 from panoptic_perception.utils.evaluation_helper import DetectionMetrics
+from panoptic_perception.utils.lane_utils import lane_nms, predictions_to_lanes, _make_activated_gt, polyline_iou
 
 from panoptic_perception.trainer.utils import listify
 
@@ -61,19 +62,19 @@ class Callbacks(TrainerCallback):
     def on_step_begin(self, trainer):
         for callback in self.callbacks:
             callback.on_step_begin(trainer)
-            
+
     def on_step_end(self, trainer):
         for callback in self.callbacks:
             callback.on_step_end(trainer)
-            
+
     def on_eval_begin(self, trainer):
         for callback in self.callbacks:
             callback.on_eval_begin(trainer)
-            
+
     def on_eval_batch_end(self, trainer):
         for callback in self.callbacks:
             callback.on_eval_batch_end(trainer)
-            
+
     def on_eval_end(self, trainer):
         for callback in self.callbacks:
             callback.on_eval_end(trainer)
@@ -318,12 +319,15 @@ class EnhancedImageLogger(TrainerCallback):
             
 class EvalMetricsCallback(TrainerCallback):
     
-    def __init__(self, conf_threshold = 0.001, 
-                iou_threshold = 0.45, 
-                max_detections = 500, 
+    def __init__(self, conf_threshold = 0.001,
+                iou_threshold = 0.45,
+                max_detections = 500,
                 stats_iou_threshold : float = 0.25,
-                num_drivable_classes = 2, 
-                num_lane_classes = 2,  # Will be updated dynamically if needed                
+                num_drivable_classes = 2,
+                num_lane_classes = 2,  # Will be updated dynamically if needed
+                lane_det_conf_threshold = 0.5,
+                lane_det_nms_threshold = 0.5,
+                lane_det_iou_threshold = 0.5,
                 visualize_idx:int = 100):
 
         self.conf_threshold = conf_threshold
@@ -331,30 +335,38 @@ class EvalMetricsCallback(TrainerCallback):
         self.max_detections = max_detections
         self.visualize_idx = visualize_idx
         self.stats_iou_threshold = stats_iou_threshold
-        
+
         self.num_drivable_classes = num_drivable_classes
         self.num_lane_classes = num_lane_classes
+
+        self.lane_det_conf_threshold = lane_det_conf_threshold
+        self.lane_det_nms_threshold = lane_det_nms_threshold
+        self.lane_det_iou_threshold = lane_det_iou_threshold
 
         self._reset()
 
     def _reset(self):
-        
+
         self.total_val_loss = 0.0
         self.total_det_loss = 0.0
         self.total_drivable_loss = 0.0
         self.total_lane_loss = 0.0
-        
+        self.total_lane_det_loss = 0.0
+
         self.global_image_idx = 0
-        
+
         self.dets_by_image = defaultdict(None) #image_id -> (num_dets, 6)
-        self.gt_by_image = defaultdict(None) #image_id -> (num_gt, 5)          
-        
+        self.gt_by_image = defaultdict(None) #image_id -> (num_gt, 5)
+
         self.drivable_confusion_matrix = torch.zeros(
-                        self.num_drivable_classes, 
+                        self.num_drivable_classes,
                         self.num_drivable_classes, dtype=torch.int64
                     )
 
-        self.lane_confusion_matrix = None        
+        self.lane_confusion_matrix = None
+
+        self.lane_det_preds = []   # list of list[dict] per image
+        self.lane_det_gts = []     # list of list[dict] per image
 
     def _post_process_detections(self, trainer:Trainer):
         
@@ -520,8 +532,34 @@ class EvalMetricsCallback(TrainerCallback):
             # Update confusion matrix
             self.lane_confusion_matrix += SegmentationUtils._compute_confusion_matrix(
                 lane_preds.cpu(), lane_targets.cpu(), num_lane_classes
-            )        
-        
+            )
+
+    def _post_process_lane_detection_predictions(self, trainer: Trainer):
+        outputs = trainer.eval_batch_ctx.cur_eval_model_outputs
+        if outputs.lane_detection_predictions is None:
+            return
+
+        preds = outputs.lane_detection_predictions                     # (bs, 192, 78)
+        img_h = trainer.eval_batch_ctx.cur_eval_image_h
+        img_w = trainer.eval_batch_ctx.cur_eval_image_w
+        gt_lanes = trainer.eval_batch_ctx.cur_eval_gt_lane_detections  # (bs, max_lanes, 78) or None
+
+        for b in range(preds.shape[0]):
+            nms_preds = lane_nms(preds[b], img_w,
+                                 conf_threshold=self.lane_det_conf_threshold,
+                                 nms_threshold=self.lane_det_nms_threshold)
+            pred_lanes = predictions_to_lanes(nms_preds, img_h, img_w)
+
+            gt_lane_list = []
+            if gt_lanes is not None:
+                gt_b = gt_lanes[b]                                     # (max_lanes, 78)
+                valid = gt_b[gt_b[:, 0] == 1]                         # (T, 78) valid GTs
+                if len(valid) > 0:
+                    gt_lane_list = predictions_to_lanes(
+                        _make_activated_gt(valid), img_h, img_w)
+
+            self.lane_det_preds.append(pred_lanes)
+            self.lane_det_gts.append(gt_lane_list)
 
     def on_eval_batch_end(self, trainer):
         
@@ -540,6 +578,10 @@ class EvalMetricsCallback(TrainerCallback):
             self.total_lane_loss += outputs.lane_segmentation_loss.item()
             self.total_val_loss += outputs.lane_segmentation_loss.item()
 
+        if outputs.lane_detection_loss is not None:
+            self.total_lane_det_loss += outputs.lane_detection_loss.item()
+            self.total_val_loss += outputs.lane_detection_loss.item()
+
         # Process detection predictions - concatenate layer outputs and apply NMS
         self._post_process_detections(trainer)
 
@@ -548,6 +590,8 @@ class EvalMetricsCallback(TrainerCallback):
 
         if trainer.eval_batch_ctx.cur_eval_model_outputs.lane_segmentation_predictions is not None:
             self._post_process_lane_segmentation_predictions(trainer)
+
+        self._post_process_lane_detection_predictions(trainer)
         
     def _compute_detection_metrics(self, trainer:Trainer):
 
@@ -653,24 +697,87 @@ class EvalMetricsCallback(TrainerCallback):
                 step=trainer.cur_epoch
             )
 
+    def _compute_lane_detection_metrics(self, trainer: Trainer):
+        if not self.lane_det_preds:
+            return
+
+        tp, fp, fn = 0, 0, 0
+
+        for pred_lanes, gt_lanes in zip(self.lane_det_preds, self.lane_det_gts):
+            matched_gt = set()
+            for pred in pred_lanes:
+                best_iou, best_gt_idx = 0.0, -1
+                for g_idx, gt in enumerate(gt_lanes):
+                    if g_idx in matched_gt:
+                        continue
+                    iou = polyline_iou(
+                        pred['points'], gt['points'],
+                        trainer.eval_batch_ctx.cur_eval_image_h,
+                        trainer.eval_batch_ctx.cur_eval_image_w
+                    )
+                    if iou > best_iou:
+                        best_iou, best_gt_idx = iou, g_idx
+                if best_iou >= self.lane_det_iou_threshold and best_gt_idx >= 0:
+                    tp += 1
+                    matched_gt.add(best_gt_idx)
+                else:
+                    fp += 1
+            fn += len(gt_lanes) - len(matched_gt)
+
+        precision = tp / (tp + fp) if (tp + fp) > 0 else 0.0
+        recall = tp / (tp + fn) if (tp + fn) > 0 else 0.0
+        f1 = 2 * precision * recall / (precision + recall) if (precision + recall) > 0 else 0.0
+
+        metric_prefix = trainer.eval_metric_prefix
+        metrics = {'F1': f1, 'Precision': precision, 'Recall': recall,
+                   'TP': tp, 'FP': fp, 'FN': fn}
+
+        trainer.eval_metrics[metric_prefix].lane_detection_metrics = metrics
+
+        lane_table_data = [["Metric", "Value"]]
+        lane_table_data.append(["F1", f"{f1:.4f}"])
+        lane_table_data.append(["Precision", f"{precision:.4f}"])
+        lane_table_data.append(["Recall", f"{recall:.4f}"])
+        lane_table_data.append(["TP / FP / FN", f"{tp} / {fp} / {fn}"])
+
+        lane_table_string = AsciiTable(lane_table_data).table
+        trainer.logger.log_message(f"\n[{metric_prefix}] Lane Detection Metrics @IoU={self.lane_det_iou_threshold}:")
+        trainer.logger.log_message(lane_table_string)
+        trainer.logger.log_line()
+
+        wandb_lane_data = [
+            ["F1", f1], ["Precision", precision], ["Recall", recall],
+            ["TP", tp], ["FP", fp], ["FN", fn]
+        ]
+        trainer.wandb_logger.log_table(
+            f"{metric_prefix}/lane_detection_metrics",
+            columns=["Metric", "Value"],
+            data=wandb_lane_data,
+            step=trainer.cur_epoch
+        )
+
     def on_eval_end(self, trainer):
 
-        if trainer.total_eval_batch > 0:        
-            avg_det_loss = self.total_det_loss / trainer.total_eval_batch if trainer.total_eval_batch > 0 else 0.0
-            avg_drivable_loss = self.total_drivable_loss / trainer.total_eval_batch if trainer.total_eval_batch > 0 else 0.0
-            avg_lane_loss = self.total_lane_loss / trainer.total_eval_batch if trainer.total_eval_batch > 0 else 0.0
-            avg_total_loss = (self.total_det_loss + self.total_drivable_loss + self.total_lane_loss) / trainer.total_eval_batch
+        if trainer.total_eval_batch > 0:
+            avg_det_loss = self.total_det_loss / trainer.total_eval_batch
+            avg_drivable_loss = self.total_drivable_loss / trainer.total_eval_batch
+            avg_lane_loss = self.total_lane_loss / trainer.total_eval_batch
+            avg_lane_det_loss = self.total_lane_det_loss / trainer.total_eval_batch
+            avg_total_loss = (self.total_det_loss + self.total_drivable_loss +
+                              self.total_lane_loss + self.total_lane_det_loss) / trainer.total_eval_batch
 
         # Log summary
         trainer.logger.log_line()
         trainer.logger.log_message(
             f'[{trainer.eval_metric_prefix}] Epoch {trainer.cur_epoch} - Avg Loss: {avg_total_loss:.4f} | '
-            f'Det Loss: {avg_det_loss:.4f} | Drivable Loss: {avg_drivable_loss:.4f} | Lane Loss: {avg_lane_loss:.4f}'
+            f'Det Loss: {avg_det_loss:.4f} | Drivable Loss: {avg_drivable_loss:.4f} | '
+            f'Lane Seg Loss: {avg_lane_loss:.4f} | Lane Det Loss: {avg_lane_det_loss:.4f}'
         )
 
         trainer.logger.log_new_line()
 
         self._compute_detection_metrics(trainer)
         self._compute_drivable_metrics(trainer)
+        self._compute_lane_detection_metrics(trainer)
 
         self._reset()

@@ -24,12 +24,24 @@ from panoptic_perception.dataset.adverse_weather import (
     RadialDistance
 )
 
+from panoptic_perception.utils.lane_utils import build_lane_targets
+
 from enum import Enum
 
-def visualize_batch(images, seg, drivable, targets, save_dir, batch_index=0):
+LANE_VIS_COLORS = [
+    (255, 255, 255),  # single white
+    (0, 255, 255),    # single yellow
+    (0, 200, 255),    # double yellow
+    (255, 128, 0),    # road curb
+]
+
+def visualize_batch(images, seg, drivable, targets, save_dir, batch_index=0,
+                    lane_targets=None, lane_categories=None):
     """
     images: tensor (B,3,H,W) normalized to [0,1]
     targets: tensor (N,6) -> (batch_idx, class, x_center, y_center, w, h)
+    lane_targets: tensor (B, max_lanes, 78) or None
+    lane_categories: tensor (B, max_lanes) or None
     batch_index: index of image in batch to visualize
     """
     img = images[batch_index].permute(1,2,0).cpu().numpy()
@@ -40,7 +52,7 @@ def visualize_batch(images, seg, drivable, targets, save_dir, batch_index=0):
     # collect targets for this specific image
     t = targets[targets[:,0] == batch_index]
 
-    # convert xywh normalized → pixel PascalVOC (x1,y1,x2,y2)
+    # convert xywh normalized -> pixel PascalVOC (x1,y1,x2,y2)
     boxes = []
     classes = []
     for row in t:
@@ -62,20 +74,47 @@ def visualize_batch(images, seg, drivable, targets, save_dir, batch_index=0):
     # draw bounding boxes on the image
     img_draw = img.copy()
     for (x1,y1,x2,y2), cls in zip(boxes, classes):
-        cv2.rectangle(img_draw, 
-                      (int(x1), int(y1)), 
-                      (int(x2), int(y2)), 
+        cv2.rectangle(img_draw,
+                      (int(x1), int(y1)),
+                      (int(x2), int(y2)),
                       (0,255,0), 2)
-        cv2.putText(img_draw, str(cls), 
+        cv2.putText(img_draw, str(cls),
                     (int(x1), int(y1)-5),
-                    cv2.FONT_HERSHEY_SIMPLEX, 
+                    cv2.FONT_HERSHEY_SIMPLEX,
                     0.6, (0,255,0), 2)
+
+    # draw lane targets
+    if lane_targets is not None:
+        lt = lane_targets[batch_index]  # (max_lanes, 78)
+        lc = lane_categories[batch_index] if lane_categories is not None else None
+        n_offsets = lt.shape[1] - 6  # 72
+
+        # y-positions: 1.0 (bottom) to 0.0 (top), matching CLRNet prior_ys
+        prior_ys = np.linspace(1.0, 0.0, n_offsets)
+
+        for i in range(lt.shape[0]):
+            if lt[i, 0].item() < 0.5:  # not valid
+                continue
+
+            xs = lt[i, 6:].cpu().numpy()  # (72,) normalized x-coords
+            cat_idx = int(lc[i].item()) if lc is not None and lc[i].item() >= 0 else 0
+            color = LANE_VIS_COLORS[cat_idx % len(LANE_VIS_COLORS)]
+
+            pts = []
+            for j in range(n_offsets):
+                if xs[j] > -1e4:
+                    x_pix = int(xs[j] * (W - 1))
+                    y_pix = int(prior_ys[j] * (H - 1))
+                    pts.append((x_pix, y_pix))
+
+            for k in range(len(pts) - 1):
+                cv2.line(img_draw, pts[k], pts[k + 1], color, 2)
 
     if not os.path.exists(save_dir):
         os.makedirs(save_dir)
-    
+
     cv2.imwrite(f'{save_dir}/sample_batch_{batch_index}.png', cv2.cvtColor(img_draw, cv2.COLOR_RGB2BGR))
-    
+
     if seg is not None:
         if seg[batch_index].ndim == 3:
             seg_vis = seg[batch_index].permute(1, 2, 0).cpu().numpy()
@@ -173,7 +212,14 @@ class BDDPreprocessor:
         self.mask_only_transformation = A.Compose(base_resize_mask)
 
     def load_detection(self, json_path, filter_by_area=False):
-        
+        """
+        Load 2D bbox annotations from a BDD100K detection JSON file.
+
+        Returns:
+            bboxes: list of [x1, y1, x2, y2] in original pixel coordinates
+            class_labels - list of label_id
+            attributes - dict of occluded, truncated, trafficLightColor
+        """        
         with open(json_path, 'r') as f:
             data = json.load(f)
             
@@ -210,7 +256,69 @@ class BDDPreprocessor:
             assert type(attributes) == dict, f'Expected Attributes to be a dict, got: {type(attributes)}'
 
         return bboxes, class_labels, attributes
-                
+
+    def load_lane_annotations(self, json_path):
+        """
+        Load lane polyline annotations from a BDD100K detection JSON file.
+
+        Returns:
+            lane_polys: list of dicts {"points": np.array(N,2), "category": str}
+                        points in original pixel coordinates
+        """
+        lane_polys = []
+
+        if not os.path.exists(json_path):
+            return lane_polys
+
+        with open(json_path, 'r') as f:
+            data = json.load(f)
+
+        for frames in data["frames"]:
+            for item in frames["objects"]:
+                if "poly2d" not in item:
+                    continue
+                category = item.get("category", "")
+                if not category.startswith("lane/"):
+                    continue
+
+                pts = np.array(
+                    [[p[0], p[1]] for p in item["poly2d"] if p[2] == "L"],
+                    dtype=np.float32
+                )
+                if len(pts) >= 2:
+                    lane_polys.append({
+                        "points": pts,
+                        "category": category
+                    })
+
+        return lane_polys
+
+    def transform_lane_points_resize(self, lane_polys, orig_h, orig_w):
+        """
+        Apply the same LongestMaxSize + PadIfNeeded transform to lane points.
+        Mirrors what self.transformation does to the image geometry.
+        """
+        if lane_polys is None:
+            return None
+
+        max_size = max(self.resized_height, self.resized_width)
+
+        # LongestMaxSize: scale so longest side = max_size
+        scale = max_size / max(orig_h, orig_w)
+        new_h = int(orig_h * scale)
+        new_w = int(orig_w * scale)
+
+        # PadIfNeeded: symmetric padding to reach target dims
+        pad_top = (self.resized_height - new_h) // 2
+        pad_left = (self.resized_width - new_w) // 2
+
+        for poly in lane_polys:
+            poly["points"] = poly["points"].astype(np.float32)
+            poly["points"][:, 0] = poly["points"][:, 0] * scale + pad_left
+            poly["points"][:, 1] = poly["points"][:, 1] * scale + pad_top
+
+        return lane_polys
+
     def prepare_targets_2d(self, boxes, labels):
         if len(boxes) == 0:
             return np.zeros((0, 5), dtype=np.float32)
@@ -261,76 +369,90 @@ class BDDPreprocessor:
         tensor = tensor.float() / 255.0 
         return tensor
     
-    def mosaic_augmentation(self, images_list, bboxes_list, class_labels_list, segs_list, drivables_list):
-        
-        image, labels_xywh, seg, drivable = mosaic_augmentation(
+    def mosaic_augmentation(self, images_list, bboxes_list, class_labels_list,
+                            segs_list, drivables_list, lane_polys_list=None):
+
+        image, labels_xywh, seg, drivable, lane_polys = mosaic_augmentation(
             images_list, bboxes_list, class_labels_list, segs_list, drivables_list,
+            lane_polys_list=lane_polys_list,
             output_size=self.image_resize
         )
-        
-        image, seg, drivable, labels_xywh = random_perspective(
-            image, seg, drivable, labels_xywh,
+
+        image, seg, drivable, labels_xywh, lane_polys = random_perspective(
+            image, seg, drivable, labels_xywh, lane_polys=lane_polys,
             degrees=self.augment_params["degrees"],
             translate=self.augment_params["translate"],
             scale=self.augment_params["scale"],
-            shear=self.augment_params["shear"],            
+            shear=self.augment_params["shear"],
         )
 
         # Apply remaining augmentations (HSV, flip, etc. but skip letterbox since mosaic outputs correct size)
         augment_hsv(
-            image, 
+            image,
             self.augment_params.get("hsv_h", 0.015),
             self.augment_params.get("hsv_s", 0.7),
             self.augment_params.get("hsv_v", 0.4)
         )
 
         if random.random() < 0.5:
-            image, seg, drivable, labels_xywh = flip_horizontal(
-                image, seg, drivable, labels_xywh
+            image, seg, drivable, labels_xywh, lane_polys = flip_horizontal(
+                image, seg, drivable, labels_xywh, lane_polys=lane_polys
             )
 
-        return image, seg, drivable, labels_xywh
+        return image, seg, drivable, labels_xywh, lane_polys
     
     def mixup_augmentation(self, img1, bboxes1, class_labels1, seg1, drivable1,
-                           img2, bboxes2, class_labels2, seg2, drivable2):
-        
+                           img2, bboxes2, class_labels2, seg2, drivable2,
+                           lane_polys1=None, lane_polys2=None):
+
+        orig_h1, orig_w1 = img1.shape[:2]
+        orig_h2, orig_w2 = img2.shape[:2]
+
         # Transform image 1
         t1 = self.transformation(
             image=img1, bboxes=bboxes1, class_labels=class_labels1
-        )        
+        )
         img1, bboxes1, class_labels1 = t1['image'], t1['bboxes'], t1['class_labels']
-        
+
         if seg1 is not None:
             seg1 = self.mask_only_transformation(image=seg1)['image']
         if drivable1 is not None:
             drivable1 = self.mask_only_transformation(image=drivable1)['image']
-            
+        if lane_polys1 is not None:
+            lane_polys1 = self.transform_lane_points_resize(lane_polys1, orig_h1, orig_w1)
+
         # Transform image 2
         t2 = self.transformation(
             image=img2, bboxes=bboxes2, class_labels=class_labels2
-        )        
+        )
         img2, bboxes2, class_labels2 = t2['image'], t2['bboxes'], t2['class_labels']
-        
+
         if seg2 is not None:
             seg2 = self.mask_only_transformation(image=seg2)['image']
         if drivable2 is not None:
             drivable2 = self.mask_only_transformation(image=drivable2)['image']
-            
+        if lane_polys2 is not None:
+            lane_polys2 = self.transform_lane_points_resize(lane_polys2, orig_h2, orig_w2)
+
         labels1 = self.prepare_targets_2d(boxes=bboxes1, labels=class_labels1)
         labels2 = self.prepare_targets_2d(boxes=bboxes2, labels=class_labels2)
-        
-        image, labels_xywh, seg, drivable = mixup_augmentation(
+
+        image, labels_xywh, seg, drivable, lane_polys = mixup_augmentation(
             img1=img1, img2=img2, seg1=seg1, seg2=seg2,
             drivable1=drivable1, drivable2=drivable2,
-            labels1=labels1, labels2=labels2, alpha=0.5
+            labels1=labels1, labels2=labels2, alpha=0.5,
+            lane_polys1=lane_polys1, lane_polys2=lane_polys2
         )
-        
-        return image, labels_xywh, seg, drivable
 
-    def standard_augmentations(self, image, seg, drivable, bboxes, class_labels):
+        return image, labels_xywh, seg, drivable, lane_polys
 
-        t = self.transformation(image=image, 
-                            bboxes=bboxes, 
+    def standard_augmentations(self, image, seg, drivable, bboxes, class_labels,
+                               lane_polys=None):
+
+        orig_h, orig_w = image.shape[:2]
+
+        t = self.transformation(image=image,
+                            bboxes=bboxes,
                             class_labels=class_labels)
 
         image, bboxes, class_labels = t['image'], t['bboxes'], t['class_labels']
@@ -338,31 +460,36 @@ class BDDPreprocessor:
             seg = self.mask_only_transformation(image=seg)['image']
         if drivable is not None:
             drivable = self.mask_only_transformation(image=drivable)['image']
-        
+        if lane_polys is not None:
+            lane_polys = self.transform_lane_points_resize(lane_polys, orig_h, orig_w)
+
         labels_xywh = self.prepare_targets_2d(bboxes, class_labels)
-        
-        image, seg, drivable, labels_xywh = apply_augmentations(
+
+        image, seg, drivable, labels_xywh, lane_polys = apply_augmentations(
             img=image,
             seg=seg,
             drivable=drivable,
             labels=labels_xywh,
             params=self.augment_params,
-            img_size=self.image_resize
+            img_size=self.image_resize,
+            lane_polys=lane_polys
         )
 
-        return image, seg, drivable, labels_xywh
+        return image, seg, drivable, labels_xywh, lane_polys
         
     @staticmethod
     def collate_fn(batch:dict):
-        
+
         batch_images = []
         batch_clean_images = []
         batch_targets = []
         batch_segmentation_masks = []
         batch_drivable_masks = []
+        batch_lane_targets = []
+        batch_lane_categories = []
         batch_image_paths = []
         batch_scene_attributes = []
-        
+
         for batch_idx, batch_items in enumerate(batch):
             image = batch_items['image']
             image_path = batch_items["image_path"]
@@ -371,33 +498,38 @@ class BDDPreprocessor:
 
             assert image is not None, f"Image tensor at batch index {batch_idx} is None."
             assert image.ndim == 3, "Image tensor must have 3 dimensions (C, H, W)."
-            
+
             batch_images.append(image)
             batch_image_paths.append(image_path)
             batch_scene_attributes.append(scene_attributes)
-            
+
             if clean_image is not None:
                 batch_clean_images.append(clean_image)
-            
+
             if batch_items['detection_targets'] is not None and batch_items['detection_targets'].shape[0] > 0:
                 nt = batch_items['detection_targets'].shape[0]
                 batch_targets.append(
                     torch.cat(
                         [
-                            torch.full(size=(nt,1), 
-                                       fill_value=batch_idx, 
+                            torch.full(size=(nt,1),
+                                       fill_value=batch_idx,
                                        dtype=batch_items['detection_targets'].dtype),
                             batch_items['detection_targets']
                         ], dim=1
                     )
                 )
-            
+
             if batch_items['segmentation_mask'] is not None:
                 batch_segmentation_masks.append(batch_items['segmentation_mask'])
-            
+
             if batch_items['drivable_mask'] is not None:
                 batch_drivable_masks.append(batch_items['drivable_mask'])
-                
+
+            if batch_items.get('lane_targets') is not None:
+                batch_lane_targets.append(batch_items['lane_targets'])
+            if batch_items.get('lane_categories') is not None:
+                batch_lane_categories.append(batch_items['lane_categories'])
+
         batch_images_tensor = torch.stack(batch_images, dim=0)
         batch_clean_images = torch.stack(batch_clean_images, dim=0) if batch_clean_images else None
         batch_targets_tensor = torch.cat(batch_targets, dim=0) if batch_targets else None
@@ -410,13 +542,17 @@ class BDDPreprocessor:
             batch_targets_tensor[:, 4:6] = batch_targets_tensor[:, 4:6].clamp(0.001, 1.0)  # w, h
         batch_segmentation_masks_tensor = torch.stack(batch_segmentation_masks, dim=0) if batch_segmentation_masks else None
         batch_drivable_masks_tensor = torch.stack(batch_drivable_masks, dim=0) if batch_drivable_masks else None
-        
+        batch_lane_targets_tensor = torch.stack(batch_lane_targets, dim=0) if batch_lane_targets else None
+        batch_lane_categories_tensor = torch.stack(batch_lane_categories, dim=0) if batch_lane_categories else None
+
         return {
             "images": batch_images_tensor,
             "clean_images": batch_clean_images,
             "detections": batch_targets_tensor,
             "segmentation_masks": batch_segmentation_masks_tensor,
             "drivable_area_seg": batch_drivable_masks_tensor,
+            "lanes_detections": batch_lane_targets_tensor,
+            "lane_categories": batch_lane_categories_tensor,
             "image_paths":batch_image_paths,
             "scene_attributes":batch_scene_attributes
         }
@@ -479,7 +615,7 @@ class BDD100KDataset(Dataset):
         image_path = os.path.join(self.images_dir, self.dataset_type, f"{image_id}.jpg")
         seg_path = os.path.join(self.segmentation_annotations_dir, self.dataset_type, f"{image_id}_train_id.png")
         drivable_path = os.path.join(self.drivable_annotations_dir, self.dataset_type, f"{image_id}_drivable_id.png")
-        
+
         assert os.path.exists(image_path), f"Image path {image_path} does not exist."
 
         # Load image
@@ -497,16 +633,18 @@ class BDD100KDataset(Dataset):
             #merge alternative to drivable
             drivable[drivable == 2] = 1
 
-        # Load detection annotations and convert to normalized xywh
+        # Load detection and lane annotations
         bboxes = []
         class_labels = []
+        lane_polys = []
 
         det_path = os.path.join(self.detection_annotations_dir, self.dataset_type, f"{image_id}.json")
         if self.mode != DatasetMode.INFER:
-            assert os.path.exists(det_path), f"Detection path {det_path} does not exist."            
+            assert os.path.exists(det_path), f"Detection path {det_path} does not exist."
             bboxes, class_labels, scene_attributes = self.preprocessor.load_detection(det_path)
+            lane_polys = self.preprocessor.load_lane_annotations(det_path)
 
-        return image, bboxes, class_labels, scene_attributes, seg, drivable, image_path
+        return image, bboxes, class_labels, scene_attributes, seg, drivable, lane_polys, image_path
 
     def __getitem__(self, index):
         if self.mode == DatasetMode.INFER:
@@ -517,72 +655,66 @@ class BDD100KDataset(Dataset):
             return self.prepare_training_sample(index)
 
     def prepare_training_sample(self, index):
-        # image_id = self.image_ids[index]
-        # image_path = os.path.join(self.images_dir, self.dataset_type, f"{image_id}.jpg")
 
         # Check for advanced augmentations (mosaic, mixup, copy-paste)
         use_mosaic = self.perform_augmentation and random.random() < self.mosaic_prob
         use_mixup = self.perform_augmentation and random.random() < self.mixup_prob
         use_copy_paste = self.perform_augmentation and random.random() < self.copy_paste_prob
         image_path = None
+        lane_polys = []
 
         if use_mosaic:
             # Mosaic: combine 4 images
             indices = [index] + [random.randint(0, len(self) - 1) for _ in range(3)]
             images_list, class_labels_list, bboxes_list = [], [], []
-            segs_list, drivables_list = [], []
+            segs_list, drivables_list, lane_polys_list = [], [], []
 
             for idx in indices:
                 if idx == index:
-                    image, bboxes, class_labels, scene_attributes, seg, drivable, image_path = self._load_raw(idx)
+                    image, bboxes, class_labels, scene_attributes, seg, drivable, lp, image_path = self._load_raw(idx)
                 else:
-                    image, bboxes, class_labels, scene_attributes, seg, drivable, _ = self._load_raw(idx)
-                
+                    image, bboxes, class_labels, scene_attributes, seg, drivable, lp, _ = self._load_raw(idx)
+
                 images_list.append(image)
                 class_labels_list.append(class_labels)
                 bboxes_list.append(bboxes)
                 segs_list.append(seg)
                 drivables_list.append(drivable)
+                lane_polys_list.append(lp)
 
-            image, seg, drivable, labels_xywh = self.preprocessor.mosaic_augmentation(
-                images_list, bboxes_list, class_labels_list, 
-                segs_list, drivables_list
+            image, seg, drivable, labels_xywh, lane_polys = self.preprocessor.mosaic_augmentation(
+                images_list, bboxes_list, class_labels_list,
+                segs_list, drivables_list, lane_polys_list=lane_polys_list
             )
 
         elif use_mixup:
             # MixUp: blend 2 images
-            image1, bboxes1, class_labels1, scene_attributes, seg1, drivable1, image_path = self._load_raw(index)
+            image1, bboxes1, class_labels1, scene_attributes, seg1, drivable1, lp1, image_path = self._load_raw(index)
             idx2 = random.randint(0, len(self) - 1)
-            image2, bboxes2, class_labels2, _, seg2, drivable2, _ = self._load_raw(idx2)
+            image2, bboxes2, class_labels2, _, seg2, drivable2, lp2, _ = self._load_raw(idx2)
 
-            # Apply mixup
-            image, labels_xywh, seg, drivable = self.preprocessor.mixup_augmentation(
-                img1=image1,
-                bboxes1=bboxes1,
-                class_labels1=class_labels1,
-                seg1=seg1,
-                drivable1=drivable1,
-                img2=image2,
-                bboxes2=bboxes2,
-                class_labels2=class_labels2,
-                seg2=seg2,
-                drivable2=drivable2
+            image, labels_xywh, seg, drivable, lane_polys = self.preprocessor.mixup_augmentation(
+                img1=image1, bboxes1=bboxes1, class_labels1=class_labels1,
+                seg1=seg1, drivable1=drivable1,
+                img2=image2, bboxes2=bboxes2, class_labels2=class_labels2,
+                seg2=seg2, drivable2=drivable2,
+                lane_polys1=lp1, lane_polys2=lp2
             )
 
         else:
             # Standard augmentation path
-            image, bboxes, class_labels, scene_attributes, seg, drivable, image_path = self._load_raw(index)
+            image, bboxes, class_labels, scene_attributes, seg, drivable, lane_polys, image_path = self._load_raw(index)
 
             if self.perform_augmentation:
                 # Apply copy-paste for long-tail classes before other augmentations
-                #TODO, modify random -> sampling from known images containing long tail classes. 
+                #TODO, modify random -> sampling from known images containing long tail classes.
                 if use_copy_paste:
                     source_idx = random.randint(0, len(self) - 1)
-                    source_img, source_bboxes, source_class_labels, _, _, _, _ = self._load_raw(source_idx)
+                    source_img, source_bboxes, source_class_labels, _, _, _, _, _ = self._load_raw(source_idx)
 
                     h, w = image.shape[:2]
-                    if source_img.shape[:2] != image.shape[:2]:                        
-                        source_img = cv2.resize(source_img, (w, h)) # Resize source to match
+                    if source_img.shape[:2] != image.shape[:2]:
+                        source_img = cv2.resize(source_img, (w, h))
 
                     labels_xywh = self.preprocessor.to_normalize_xywh(bboxes, class_labels, h, w)
                     source_labels = self.preprocessor.to_normalize_xywh(source_bboxes, source_class_labels, h, w)
@@ -597,16 +729,16 @@ class BDD100KDataset(Dataset):
                         labels_xywh, h, w
                     )
 
-                image, seg, drivable, labels_xywh = self.preprocessor.standard_augmentations(
+                image, seg, drivable, labels_xywh, lane_polys = self.preprocessor.standard_augmentations(
                     image=image, seg=seg, drivable=drivable,
-                    bboxes=bboxes,
-                    class_labels=class_labels
+                    bboxes=bboxes, class_labels=class_labels,
+                    lane_polys=lane_polys
                 )
 
             else:
-                image, bboxes, class_labels, scene_attributes, seg, drivable, image_path = self._load_raw(index)
-                t = self.preprocessor.transformation(image=image, 
-                                                    bboxes=bboxes, 
+                orig_h, orig_w = image.shape[:2]
+                t = self.preprocessor.transformation(image=image,
+                                                    bboxes=bboxes,
                                                     class_labels=class_labels)
 
                 image, bboxes, class_labels = t['image'], t['bboxes'], t['class_labels']
@@ -614,20 +746,32 @@ class BDD100KDataset(Dataset):
                     seg = self.preprocessor.mask_only_transformation(image=seg)['image']
                 if drivable is not None:
                     drivable = self.preprocessor.mask_only_transformation(image=drivable)['image']
+                if lane_polys:
+                    lane_polys = self.preprocessor.transform_lane_points_resize(
+                        lane_polys, orig_h, orig_w
+                    )
 
                 labels_xywh = self.preprocessor.prepare_targets_2d(bboxes, class_labels)
+
+        # Build lane targets from augmented polylines
+        img_h, img_w = image.shape[:2]
+        lane_targets, lane_categories = build_lane_targets(
+            lane_polys, img_h, img_w
+        )
 
         # Convert to tensors
         image_tensor = self.preprocessor.normalize_tensor(torch.from_numpy(image).permute(2, 0, 1))
         targets = torch.from_numpy(labels_xywh).float()
         seg_tensor = torch.from_numpy(seg).long() if seg is not None else None
-        drivable_tensor = torch.from_numpy(drivable).long() if drivable is not None else None        
+        drivable_tensor = torch.from_numpy(drivable).long() if drivable is not None else None
 
         return {
             "image": image_tensor,
             "segmentation_mask": seg_tensor,
             "drivable_mask": drivable_tensor,
             "detection_targets": targets,
+            "lane_targets": lane_targets,
+            "lane_categories": lane_categories,
             "image_path": image_path,
             "scene_attributes": scene_attributes
         }
@@ -805,7 +949,7 @@ class FoggyBDD100KDataset(BDD100KDataset):
 
     def _load_raw(self, index):
         image, bboxes, class_labels, \
-            scene_attributes, seg, drivable, image_path = super()._load_raw(index)
+            scene_attributes, seg, drivable, lane_polys, image_path = super()._load_raw(index)
 
         image_id = self.image_ids[index]
         depth_map_arr = None
@@ -820,7 +964,7 @@ class FoggyBDD100KDataset(BDD100KDataset):
         # if depth_map_arr is None:
         #     depth_map_arr = self.depth_estimator.estimate(image)
 
-        return image, depth_map_arr, bboxes, class_labels, scene_attributes, seg, drivable, image_path
+        return image, depth_map_arr, bboxes, class_labels, scene_attributes, seg, drivable, lane_polys, image_path
     
     def _next_variant(self, image_id: str):
         
@@ -874,7 +1018,7 @@ class FoggyBDD100KDataset(BDD100KDataset):
 
     def prepare_training_sample(self, index):
         image, depth_map_arr, bboxes, class_labels, \
-            scene_attributes, seg, drivable, image_path = self._load_raw(index)
+            scene_attributes, seg, drivable, lane_polys, image_path = self._load_raw(index)
 
         # Step 1: Decide foggy or clean
         if self.mode == DatasetMode.TRAIN:
@@ -882,25 +1026,15 @@ class FoggyBDD100KDataset(BDD100KDataset):
         else:
             apply_fog = True
 
-        # Step 2: Apply degradation BEFORE augmentations (depth aligned to raw image)
-        # if apply_fog:
-        #     image_id = self.image_ids[index]
-        #     # if self.mode == DatasetMode.TRAIN:
-        #     #     beta, gamma = self._next_variant(image_id)
-        #     # else:
-        #     #     variant_idx = int(hashlib.md5(image_id.encode()).hexdigest(), 16) % len(self.variants)
-        #     #     beta, gamma = self.variants[variant_idx]
-        #     # beta, gamma = self._select_degradation(scene_attributes, beta, gamma)
-        #     beta, gamma = self._select_degradation(scene_attributes)
-        #     image = self._apply_degradation(image, depth_map_arr, beta, gamma)
-
-        # Step 3: Standard augmentations only (no mosaic, mixup, copy-paste)
+        # Step 2: Standard augmentations (with lane polys)
         if self.perform_augmentation:
-            image, seg, drivable, labels_xywh = self.preprocessor.standard_augmentations(
+            image, seg, drivable, labels_xywh, lane_polys = self.preprocessor.standard_augmentations(
                 image=image, seg=seg, drivable=drivable,
-                bboxes=bboxes, class_labels=class_labels
+                bboxes=bboxes, class_labels=class_labels,
+                lane_polys=lane_polys
             )
         else:
+            orig_h, orig_w = image.shape[:2]
             t = self.preprocessor.transformation(
                 image=image, bboxes=bboxes, class_labels=class_labels
             )
@@ -909,23 +1043,27 @@ class FoggyBDD100KDataset(BDD100KDataset):
                 seg = self.preprocessor.mask_only_transformation(image=seg)['image']
             if drivable is not None:
                 drivable = self.preprocessor.mask_only_transformation(image=drivable)['image']
+            if lane_polys:
+                lane_polys = self.preprocessor.transform_lane_points_resize(
+                    lane_polys, orig_h, orig_w
+                )
             labels_xywh = self.preprocessor.prepare_targets_2d(bboxes, class_labels)
 
         clean_image = image.copy()
-        
+
         if apply_fog:
             image_id = self.image_ids[index]
-            # if self.mode == DatasetMode.TRAIN:
-            #     beta, gamma = self._next_variant(image_id)
-            # else:
-            #     variant_idx = int(hashlib.md5(image_id.encode()).hexdigest(), 16) % len(self.variants)
-            #     beta, gamma = self.variants[variant_idx]
-            # beta, gamma = self._select_degradation(scene_attributes, beta, gamma)
             depth_map_arr = self.depth_estimator.estimate(image)
             beta, gamma = self._select_degradation(scene_attributes)
-            image = self._apply_degradation(image, depth_map_arr, beta, gamma)        
+            image = self._apply_degradation(image, depth_map_arr, beta, gamma)
 
-        # Step 4: Convert to tensors (same output format as parent)
+        # Build lane targets from augmented polylines
+        img_h, img_w = image.shape[:2]
+        lane_targets, lane_categories = build_lane_targets(
+            lane_polys, img_h, img_w
+        )
+
+        # Step 3: Convert to tensors (same output format as parent)
         image_tensor = self.preprocessor.normalize_tensor(torch.from_numpy(image).permute(2, 0, 1))
         clean_tensor = self.preprocessor.normalize_tensor(torch.from_numpy(clean_image).permute(2, 0, 1))
         targets = torch.from_numpy(labels_xywh).float()
@@ -938,6 +1076,8 @@ class FoggyBDD100KDataset(BDD100KDataset):
             "segmentation_mask": seg_tensor,
             "drivable_mask": drivable_tensor,
             "detection_targets": targets,
+            "lane_targets": lane_targets,
+            "lane_categories": lane_categories,
             "image_path": image_path,
             "scene_attributes": scene_attributes
         }

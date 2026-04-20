@@ -7,12 +7,13 @@ import torch.nn as nn
 from torchmetrics.image import StructuralSimilarityIndexMeasure
 
 from panoptic_perception.models.common import (
-    ConvBlock, Focus, BottleneckCSP, SPP, Upsample, Detect, C2F, SPPF, DetectV8
+    ConvBlock, Focus, BottleneckCSP, SPP, Upsample, Detect, C2F, SPPF, DetectV8, LaneDetect
 )
 from panoptic_perception.models.utils import parse_model_config, initialize_weights, PanopticModelOutputs
 from panoptic_perception.models.gdip import GDIP, MultiLevelGDIP, build_vision_encoder
 from panoptic_perception.models.denet import DENet
 from panoptic_perception.utils.detection_utils import DetectionLossCalculator
+from panoptic_perception.utils.lane_utils import LaneDetectionLossCalculator
 from panoptic_perception.utils.segmentation_utils import SegmentationLossCalculator
 from panoptic_perception.models.model_factory import ModelFactory
 
@@ -144,6 +145,23 @@ def create_modules(module_defs: list,
             reg_max = int(module_def.get("reg_max", 16))
 
             module = DetectV8(num_classes, channels, reg_max=reg_max)
+            
+        elif mtype == "LaneDetect":
+
+            num_points = int(module_def.get("num_points", 72))
+            num_priors = int(module_def.get("num_priors", 192))
+            feat_channels = int(module_def.get("feat_channels", 64))
+            sample_points = int(module_def.get("sample_points", 36))
+            
+            channels = [output_channels[r] if r != -1 else output_channels[-1] for r in route]
+
+            module = LaneDetect(
+                in_channels=channels,
+                num_points=num_points,
+                num_priors=num_priors,
+                feat_channels=feat_channels,
+                sample_points=sample_points
+            )
 
         module_list.append(module)
         routes.append(route)
@@ -325,6 +343,7 @@ class YOLOP(BaseTaskModel):
         self.loss_weights = loss_weights or {
             "detection": 1.0,
             "drivable_segmentation": 1.0,
+            "lane_detection":1.0,
             "lane_segmentation": 0.0
         }
 
@@ -398,6 +417,21 @@ class YOLOP(BaseTaskModel):
                     # for detection in detection_outputs:
                     #     print(f'Layer: {i} - Module Name: {self.module_names[i]} - prediction shape: {detection.shape}')
                 
+                elif self.module_names[i] == "LaneDetect":
+                    inputs = []
+                    for r in route:
+                        if r == -1:
+                            continue
+                        assert r in cache, f"Output for layer {r} not found in cache."
+                        inputs.append(cache[r])
+    
+                    #(bs, 192, 78)
+                    lane_detection_outputs = module(inputs, image_size=(height, width))
+                    model_outputs.lane_detection_logits = lane_detection_outputs
+
+                    if not self.training:
+                        model_outputs.lane_detection_predictions = module.activation(lane_detection_outputs)
+
                 else: #TODO, future modules
                     pass # concatenate multiple previous layers
 
@@ -443,7 +477,19 @@ class YOLOP(BaseTaskModel):
 
                 # Apply multi-task loss weight
                 model_outputs.detection_loss = det_loss * self.loss_weights.get("detection", 1.0)
-                # print(f'Detection Loss: {det_loss}')
+
+            if model_outputs.lane_detection_logits is not None and targets["lanes_detections"] is not None:
+                output_name = "lanes_detections"
+                assert output_name in targets, f"Target for {output_name} not provided."
+
+                lane_det_loss, lane_det_loss_items = LaneDetectionLossCalculator.compute_lane_det_loss(
+                    model_outputs.lane_detection_logits,
+                    targets["lanes_detections"],
+                    img_w=width,
+                    img_h=height
+                )
+
+                model_outputs.lane_detection_loss = lane_det_loss * self.loss_weights.get("lane_detection", 1.0)
 
             if model_outputs.drivable_segmentation_logits is not None and targets["drivable_area_seg"] is not None:
                 output_name = "drivable_area_seg"
@@ -479,6 +525,7 @@ class YOLOv8P(BaseTaskModel):
         # Multi-task loss weights (detection prioritized by default)
         self.loss_weights = loss_weights or {
             "detection": 1.0,
+            "lane_detection":1.0,
             "drivable_segmentation": 1.0,
             "lane_segmentation": 0.0
         }
@@ -489,8 +536,7 @@ class YOLOv8P(BaseTaskModel):
             self.detection_head_idx = int(module_defs[0].get('detection_head_idx', -1))
             self.segmentation_head_idx = int(module_defs[0].get('segmentation_head_idx', -1))
             self.lane_segmentation_head_idx = int(module_defs[0].get('lane_segmentation_head_idx', -1))
-            
-            
+
         self.in_channels = int(self.module_defs[0].get("in_channels", 3))
         self.module_list, self.routes, self.module_names, self._cache_layer_idx = create_modules(
             self.module_defs,
@@ -578,9 +624,24 @@ class YOLOv8P(BaseTaskModel):
                                 model_outputs.strides
                             ) #torch.Tensor (B, 8400, 4+C)
                 
+                elif self.module_names[i] == "LaneDetect":
+                    inputs = []
+                    for r in route:
+                        if r == -1:
+                            continue
+                        assert r in cache, f"Output for layer {r} not found in cache."
+                        inputs.append(cache[r])
+    
+                    #(bs, 192, 78)
+                    lane_detection_outputs = module(inputs, image_size=(height, width))
+                    model_outputs.lane_detection_logits = lane_detection_outputs
+
+                    if not self.training:
+                        model_outputs.lane_detection_predictions = module.activation(lane_detection_outputs)
+
                 else: #TODO, future modules
-                    pass # concatenate multiple previous layers                
-            
+                    pass # concatenate multiple previous layers
+
             # Capture segmentation outputs
             if self.module_names[i] == "DrivableAreaSegmentation":
                 model_outputs.drivable_segmentation_logits = x
@@ -629,6 +690,19 @@ class YOLOv8P(BaseTaskModel):
                 model_outputs.detection_loss = det_loss * self.loss_weights.get("detection", 1.0)
                 # print(f'Detection Loss: {det_loss}')
 
+            if model_outputs.lane_detection_logits is not None and targets.get("lanes_detections") is not None:
+                output_name = "lanes_detections"
+                assert output_name in targets, f"Target for {output_name} not provided."
+
+                lane_det_loss, lane_det_loss_items = LaneDetectionLossCalculator.compute_lane_det_loss(
+                    model_outputs.lane_detection_logits,
+                    targets["lanes_detections"],
+                    img_w=width,
+                    img_h=height
+                )
+
+                model_outputs.lane_detection_loss = lane_det_loss * self.loss_weights.get("lane_detection", 1.0)
+
             if model_outputs.drivable_segmentation_logits is not None and targets["drivable_area_seg"] is not None:
                 output_name = "drivable_area_seg"
                 assert output_name in targets, f"Target for {output_name} not provided."
@@ -639,7 +713,7 @@ class YOLOv8P(BaseTaskModel):
                 # Apply multi-task loss weight
                 model_outputs.drivable_segmentation_loss = drivable_seg_loss * self.loss_weights.get("drivable_segmentation", 0.2)
                 # print(f'Drivable Area Segmentation Loss: {drivable_seg_loss}')
-                
+
             if model_outputs.lane_segmentation_logits is not None:
                 output_name = "lane_seg"
                 assert output_name in targets, f"Target for {output_name} not provided."

@@ -42,3 +42,4 @@ class BDD100KClassesReduced(Enum):
     @classmethod
     def from_label(cls, label: str):
         return cls[label.upper()].value
+
