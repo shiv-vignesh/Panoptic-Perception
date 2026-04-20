@@ -152,7 +152,8 @@ def create_modules(module_defs: list,
             num_priors = int(module_def.get("num_priors", 192))
             feat_channels = int(module_def.get("feat_channels", 64))
             sample_points = int(module_def.get("sample_points", 36))
-            
+            refine_layers = int(module_def.get("refine_layers", 3))
+
             channels = [output_channels[r] if r != -1 else output_channels[-1] for r in route]
 
             module = LaneDetect(
@@ -160,7 +161,8 @@ def create_modules(module_defs: list,
                 num_points=num_points,
                 num_priors=num_priors,
                 feat_channels=feat_channels,
-                sample_points=sample_points
+                sample_points=sample_points,
+                refine_layers=refine_layers
             )
 
         module_list.append(module)

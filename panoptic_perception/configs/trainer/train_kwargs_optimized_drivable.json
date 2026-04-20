@@ -1,16 +1,17 @@
 {
-    "_description": "Optimized config for joint detection + drivable training with advanced augmentations",
+    "_description": "Optimized config for joint detection + drivable + lane detection training",
 
     "model_kwargs":{
-        "cfg_path":"panoptic_perception/configs/models/yolo-detection-drivable-unet.cfg",
+        "model_type":"yolop",
+        "cfg_path":"panoptic_perception/configs/models/yolo-lane-detect.cfg",
         "device":"cuda:0"
     },
 
     "dataset_kwargs":{
-        "images_dir": "/workspace/data/100k/100k",
+        "images_dir": "/workspace/data/bdd100k_images/100k/100k",
         "detection_annotations_dir": "/workspace/data/bdd100k_labels/100k",
         "segmentation_annotations_dir": "",
-        "drivable_annotations_dir": "/workspace/data/drivable_maps/labels",
+        "drivable_annotations_dir": "/workspace/data/bdd100k_drivable_maps/labels",
         "train_batch_size": 16,
         "train_shuffle": true,
         "train_num_workers": 4,
@@ -55,20 +56,7 @@
         "warmup_bias_lr": 0.1,
         "warmup_momentum": 0.8,
         "warmup_epochs": 3,
-        "groups": {
-            "backbone": {
-                "group": [0, 23],
-                "trainable": true
-            },
-            "detect": {
-                "group": [24],
-                "trainable": false
-            },
-            "segmentation": {
-                "group": [25, 35],
-                "trainable": true
-            }
-        }
+        "groups": {}
     },
 
     "lr_scheduler_kwargs":{
@@ -83,7 +71,7 @@
     },
 
     "trainer_kwargs":{
-        "output_dir": "yolop-detection-drivable",
+        "output_dir": "yolop-lane-detect",
         "is_training": true,
         "first_val_epoch": 0,
         "metric_eval_mode": "strict",
@@ -95,21 +83,21 @@
         "checkpoint_idx": 2,
         "gradient_accumulation_steps": 2,
         "lr_scheduler_start_epoch": 1,
-        "checkpoint_path": "/workspace/best_model.pt",
         "reload_optimizer": false,
         "reload_optimizer_with_initial_lr": false,
 
-        "wandb_project": "yolop-detection",
+        "wandb_project": "yolop-lane-detect",
         "wandb_enabled": true,
-        "use_ema": false,                                                                               
-        "ema_decay": 0.9999,                                                                           
-        "ema_warmup_steps": 2000         
+        "use_ema": false,
+        "ema_decay": 0.9999,
+        "ema_warmup_steps": 2000
     },
 
     "loss_weights": {
-        "_description": "Multi-task loss weights - detection prioritized",
+        "_description": "Multi-task loss weights",
         "detection": 1.0,
         "drivable_segmentation": 1.0,
+        "lane_detection": 1.0,
         "lane_segmentation": 0.0
     }
 }

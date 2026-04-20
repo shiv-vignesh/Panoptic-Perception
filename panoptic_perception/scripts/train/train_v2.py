@@ -144,7 +144,7 @@ def main(args:argparse.Namespace):
     if "model_kwargs" not in config:
         raise ValueError(f"Expected Model Kwargs dict")
 
-    model = create_model(config["model_kwargs"])
+    model, device = create_model(config["model_kwargs"], config.get("loss_weights"))
 
     optimizer = create_optimizer(
             model,
