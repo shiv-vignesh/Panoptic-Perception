@@ -81,7 +81,7 @@ def create_optimizer(model:Union[BaseTaskModel, BaseEnhancementModel],
 def create_scheduler(optimizer:torch.optim,
                     training_args:TrainingArgument) -> torch.optim.lr_scheduler:
 
-    ctx = SchedulerContext(optimizer, training_args)
+    ctx = SchedulerContext(optimizer, training_args, training_args.epochs)
     return build_scheduler(ctx)
 
 def create_logger(training_args:TrainingArgument) -> Logger:
