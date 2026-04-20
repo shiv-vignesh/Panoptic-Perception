@@ -97,7 +97,7 @@ class CheckpointCallback(TrainerCallback):
         
         if os.path.exists(trainer.checkpoint_path):
             try:
-                checkpoint = torch.load(trainer.checkpoint_path)
+                checkpoint = torch.load(trainer.checkpoint_path, map_location=trainer.device, weights_only=False)
             except Exception as e:
                 trainer.logger.log_message(f'Error loading checkpoint: {trainer.checkpoint_path} - {e}')
                 return
