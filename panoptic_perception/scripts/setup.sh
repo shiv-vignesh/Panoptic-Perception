@@ -4,9 +4,19 @@ set -e
 WORKSPACE="/workspace" #change to your project root
 DATA_DIR="${WORKSPACE}/data"
 
+# Original BDD100K server URLs (currently down)
 IMAGES_URL="http://128.32.162.150/bdd100k/bdd100k_images_100k.zip"
 DET_LABELS_URL="http://128.32.162.150/bdd100k/bdd100k_labels.zip"
 DRIVABLE_MAPS_URL="http://128.32.162.150/bdd100k/bdd100k_drivable_maps.zip"
+
+# Google Drive file IDs — set these as env vars to keep them out of git
+# Export them in your shell or in a .env file before running this script:
+#   export GDRIVE_IMAGES_ID="1abc..."
+#   export GDRIVE_DET_LABELS_ID="1def..."
+#   export GDRIVE_DRIVABLE_MAPS_ID="1ghi..."
+GDRIVE_IMAGES_ID="${GDRIVE_IMAGES_ID:-}"
+GDRIVE_DET_LABELS_ID="${GDRIVE_DET_LABELS_ID:-}"
+GDRIVE_DRIVABLE_MAPS_ID="${GDRIVE_DRIVABLE_MAPS_ID:-}"
 
 echo "========================================"
 echo "  Vast.ai Instance Setup"
@@ -31,19 +41,20 @@ echo "[3/6] Downloading BDD100K data"
 echo "----------------------------------------"
 download_and_extract() {
     local url="$1"
-    local dest="$2"
-    local name="$3"
-
-    if [[ "${url}" == *"REPLACE"* ]]; then
-        echo "SKIPPED: ${name} - URL not set (replace placeholder in script)"
-        return
-    fi
-
-    local filename=$(basename "${url}")
+    local gdrive_id="$2"
+    local dest="$3"
+    local name="$4"
+    local filename="$5"
 
     mkdir -p "${dest}"
-    echo "Downloading ${name}..."
-    wget -q --show-progress -O "${dest}/${filename}" "${url}"
+
+    if [[ -n "${gdrive_id}" ]]; then
+        echo "Downloading ${name} from Google Drive..."
+        gdown "${gdrive_id}" -O "${dest}/${filename}"
+    else
+        echo "Downloading ${name} from BDD100K server..."
+        wget -q --show-progress -O "${dest}/${filename}" "${url}"
+    fi
 
     if [[ "${filename}" == *.zip ]]; then
         echo "Extracting ${filename}..."
@@ -63,9 +74,11 @@ download_and_extract() {
     echo ""
 }
 
-download_and_extract "${IMAGES_URL}" "${DATA_DIR}/100k" "BDD100K Images"
-download_and_extract "${DET_LABELS_URL}" "${DATA_DIR}/bdd100k_labels" "BDD100K Detection Labels"
-download_and_extract "${DRIVABLE_MAPS_URL}" "${DATA_DIR}/drivable_maps" "BDD100K Drivable Maps"
+pip install -q gdown 2>/dev/null || true
+
+download_and_extract "${IMAGES_URL}" "${GDRIVE_IMAGES_ID}" "${DATA_DIR}/100k" "BDD100K Images" "bdd100k_images_100k.zip"
+download_and_extract "${DET_LABELS_URL}" "${GDRIVE_DET_LABELS_ID}" "${DATA_DIR}/bdd100k_labels" "BDD100K Detection Labels" "bdd100k_labels.zip"
+download_and_extract "${DRIVABLE_MAPS_URL}" "${GDRIVE_DRIVABLE_MAPS_ID}" "${DATA_DIR}/drivable_maps" "BDD100K Drivable Maps" "bdd100k_drivable_maps.zip"
 
 # Final structure:
 #   data/100k/100k/{train,val}/*.jpg                              ← images
