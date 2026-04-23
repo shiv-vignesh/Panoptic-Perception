@@ -131,6 +131,11 @@ class Trainer:
         total_loss = 0.0
         ten_percent_batch_total_loss = 0
 
+        ten_percent_det_loss = 0.0
+        ten_percent_drivable_loss = 0.0
+        ten_percent_lane_seg_loss = 0.0
+        ten_percent_lane_det_loss = 0.0
+
         epoch_training_time = 0.0
         ten_percent_training_time = 0.0
         
@@ -169,28 +174,66 @@ class Trainer:
             total_loss += loss.item()
             ten_percent_batch_total_loss += loss.item()
 
+            if model_outputs.detection_loss is not None:
+                ten_percent_det_loss += model_outputs.detection_loss.item()
+            if model_outputs.drivable_segmentation_loss is not None:
+                ten_percent_drivable_loss += model_outputs.drivable_segmentation_loss.item()
+            if model_outputs.lane_segmentation_loss is not None:
+                ten_percent_lane_seg_loss += model_outputs.lane_segmentation_loss.item()
+            if model_outputs.lane_detection_loss is not None:
+                ten_percent_lane_det_loss += model_outputs.lane_detection_loss.item()
+
             epoch_training_time += (step_end_time - step_begin_time)
             ten_percent_training_time += (step_end_time - step_begin_time)
 
             if (batch_idx + 1) % self.ten_percent_train_batch == 0:
                 self._apply_warmup()
 
-                average_loss = ten_percent_batch_total_loss/self.ten_percent_train_batch
-                average_time = ten_percent_training_time/self.ten_percent_train_batch
+                n = self.ten_percent_train_batch
+                average_loss = ten_percent_batch_total_loss / n
+                average_time = ten_percent_training_time / n
+                avg_det = ten_percent_det_loss / n
+                avg_drv = ten_percent_drivable_loss / n
+                avg_lane_seg = ten_percent_lane_seg_loss / n
+                avg_lane_det = ten_percent_lane_det_loss / n
 
-                message = f'Epoch {self.cur_epoch} - iter {batch_idx}/{self.total_train_batch} - total loss {average_loss:.4f} -- current_lr: {current_lr}'
+                parts = [f'total {average_loss:.4f}']
+                if avg_det > 0:
+                    parts.append(f'det {avg_det:.4f}')
+                if avg_drv > 0:
+                    parts.append(f'drv {avg_drv:.4f}')
+                if avg_lane_seg > 0:
+                    parts.append(f'lane_seg {avg_lane_seg:.4f}')
+                if avg_lane_det > 0:
+                    parts.append(f'lane_det {avg_lane_det:.4f}')
+
+                loss_str = ' | '.join(parts)
+                message = f'Epoch {self.cur_epoch} - iter {batch_idx}/{self.total_train_batch} - {loss_str} -- lr: {current_lr}'
                 self.logger.log_message(message=message)
 
                 # Log to WandB
-                self.wandb_logger.log_metrics({
+                wandb_metrics = {
                     "train/loss_10pct": average_loss,
                     "train/lr": current_lr,
-                    "train/avg_step_time": average_time
-                }, step=self.cur_epoch * self.total_train_batch + batch_idx)
+                    "train/avg_step_time": average_time,
+                }
+                if avg_det > 0:
+                    wandb_metrics["train/det_loss"] = avg_det
+                if avg_drv > 0:
+                    wandb_metrics["train/drivable_loss"] = avg_drv
+                if avg_lane_seg > 0:
+                    wandb_metrics["train/lane_seg_loss"] = avg_lane_seg
+                if avg_lane_det > 0:
+                    wandb_metrics["train/lane_det_loss"] = avg_lane_det
+
+                self.wandb_logger.log_metrics(wandb_metrics, step=self.cur_epoch * self.total_train_batch + batch_idx)
 
                 ten_percent_batch_total_loss = 0
+                ten_percent_det_loss = 0.0
+                ten_percent_drivable_loss = 0.0
+                ten_percent_lane_seg_loss = 0.0
+                ten_percent_lane_det_loss = 0.0
                 ten_percent_training_time = 0.0
-                ten_percent_metric_per_grid = defaultdict(lambda:defaultdict(int))
                 
             self.callbacks.on_step_end(self)
 
