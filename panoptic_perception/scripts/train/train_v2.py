@@ -74,6 +74,14 @@ def create_optimizer(model:Union[BaseTaskModel, BaseEnhancementModel],
             logger.log_message(f'{model.__class__.__name__} Full model training (all layers trainable)')
 
     param_groups = model.get_param_groups(optimizer_kwargs)
+
+    # Apply lr_scale to each param group's lr before optimizer creation
+    # This ensures differential LR is active from the start, not just during warmup
+    for pg in param_groups:
+        scale = pg.get("lr_scale", 1.0)
+        pg["lr"] = training_args.initial_lr * scale
+        logger.log_message(f"  Param group '{pg.get('name', '?')}': lr_scale={scale}, lr={pg['lr']:.6f}, params={len(pg['params'])}")
+
     ctx = OptimizerContext(param_groups, training_args)
 
     return build_optmizer(ctx)
