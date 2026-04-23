@@ -78,7 +78,10 @@ def create_modules(module_defs: list,
 
         # -- BOTTLENECKCSP -----------------------------------------------------
         elif mtype == "BottleneckCSP":
-            in_ch = output_channels[-1] if len(output_channels) > 0 else int(module_def["in_channels"])
+            if route[0] != -1:
+                in_ch = int(module_def["in_channels"])
+            else:
+                in_ch = output_channels[-1] if len(output_channels) > 0 else int(module_def["in_channels"])
             out_ch = int(module_def["out_channels"])
             n = int(module_def["num_bottlenecks"])
             residual = str(module_def.get("residual", "True")) == "True"
@@ -138,6 +141,10 @@ def create_modules(module_defs: list,
             channels = [output_channels[r] if r != -1 else output_channels[-1] for r in route]
 
             module = Detect(anchors, num_classes, channels)
+
+            #placeholder - adding output channels to keep index aligned,
+            # to ensure downstream layer will use the right channel value
+            output_channels.append(0)
         
         elif mtype == "DetectV8":
             num_classes = int(module_def.get("num_classes"))
@@ -145,6 +152,10 @@ def create_modules(module_defs: list,
             reg_max = int(module_def.get("reg_max", 16))
 
             module = DetectV8(num_classes, channels, reg_max=reg_max)
+
+            #placeholder - adding output channels to keep index aligned,
+            # to ensure downstream layer will use the right channel value
+            output_channels.append(0)            
             
         elif mtype == "LaneDetect":
 
@@ -155,6 +166,10 @@ def create_modules(module_defs: list,
             refine_layers = int(module_def.get("refine_layers", 3))
 
             channels = [output_channels[r] if r != -1 else output_channels[-1] for r in route]
+            
+            assert all([ch > 0 for ch in channels]), \
+                f'LaneDetect: invalid channel dims {channels} from route={route}. ' \
+                f'A routed layer may not have appended to output_channels (len={len(output_channels)})'
 
             module = LaneDetect(
                 in_channels=channels,
@@ -356,7 +371,7 @@ class YOLOP(BaseTaskModel):
             self.lane_segmentation_head_idx = int(module_defs[0].get('lane_segmentation_head_idx', -1))
             self.detection_head_idx = int(module_defs[0].get('detection_head_idx', -1))
 
-        self.in_channels = self.module_defs[0].get('in_channels', 3)
+        self.in_channels = int(self.module_defs[0].get('in_channels', 3))
         self.module_list, self.routes, self.module_names, self._cache_layer_idx = create_modules(
             self.module_defs,
             segmentation_head_idx=self.segmentation_head_idx,
