@@ -44,6 +44,14 @@ class WandBLogger:
                 print(f"  Continuing without WandB logging")
                 self.enabled = False
 
+    def update_config(self, config: Dict[str, Any]):
+        if not self.enabled:
+            return
+        try:
+            wandb.config.update(config, allow_val_change=True)
+        except Exception as e:
+            print(f"WandB config update failed: {e}")
+
     def log_metrics(self, metrics: Dict[str, Any], step: Optional[int] = None, commit: bool = True):
         """
         Log metrics to WandB.
