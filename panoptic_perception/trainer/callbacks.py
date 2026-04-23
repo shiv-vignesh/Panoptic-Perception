@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import os
 import torch
+import numpy as np
 
 from typing import Any, Iterable, Dict, TYPE_CHECKING
 from collections import defaultdict
@@ -17,7 +18,9 @@ from panoptic_perception.models.utils import WeightsManager
 from panoptic_perception.utils.detection_utils import DetectionHelper
 from panoptic_perception.utils.segmentation_utils import SegmentationUtils
 from panoptic_perception.utils.evaluation_helper import DetectionMetrics
-from panoptic_perception.utils.lane_utils import lane_nms, predictions_to_lanes, _make_activated_gt, polyline_iou
+from panoptic_perception.utils.lane_utils import (
+    lane_nms, predictions_to_lanes, _make_activated_gt, polyline_iou, _draw_lanes_on_image
+)
 
 from panoptic_perception.trainer.utils import listify
 
@@ -412,7 +415,6 @@ class EvalMetricsCallback(TrainerCallback):
                 gts = None
                 
                 if img_targets.shape[0] > 0:
-                    print(img_targets.shape)
                     boxes_xywh = img_targets[:, 2:6]
                     boxes_xywh[:, [0,2]] *= trainer.eval_batch_ctx.cur_eval_image_w
                     boxes_xywh[:, [1,3]] *= trainer.eval_batch_ctx.cur_eval_image_h
@@ -447,7 +449,13 @@ class EvalMetricsCallback(TrainerCallback):
                             targets=gts,
                             class_names=CLASS_NAMES,
                             save_path=save_path
-                        )                    
+                        )
+
+                        trainer.wandb_logger.log_image(
+                            key=f'Detection_Eval_Epoch_{trainer.cur_epoch}_step_{image_idx}',
+                            caption=f'Object Detection Visualization - Eval Epoch: {trainer.cur_epoch}',
+                            image=save_path
+                        )
     
     def _post_process_drivable_segmentation_predictions(self, trainer:Trainer):
         
@@ -504,7 +512,14 @@ class EvalMetricsCallback(TrainerCallback):
                         SegmentationUtils.save_overlay_image(
                             vis_image=gt_overlay,
                             save_path=gt_save_path
-                        )                            
+                        )
+
+                        combined = np.concatenate([pred_overlay, gt_overlay], axis=1)  # (H, 2W, 3)
+                        trainer.wandb_logger.log_image(
+                            key=f'Drivable_Segmentation_Eval_Epoch_{trainer.cur_epoch}_step_{image_idx}',
+                            caption=f'Drivable Segmentation (left=pred, right=GT) - Eval Epoch: {trainer.cur_epoch}',
+                            image=combined
+                        )
 
     def _post_process_lane_segmentation_predictions(self, trainer:Trainer):
         #TODO, not tested or vetted
@@ -560,6 +575,31 @@ class EvalMetricsCallback(TrainerCallback):
 
             self.lane_det_preds.append(pred_lanes)
             self.lane_det_gts.append(gt_lane_list)
+
+            if trainer.training_args.eval_visualize_outputs and \
+                (trainer.eval_batch_idx + 1) % self.visualize_idx == 0:
+
+                    vis_dir = f'{trainer.training_args.output_dir}/visualizations/lane_detection'
+                    epoch_vis_dir = f'{vis_dir}/eval_epoch_{trainer.cur_epoch}'
+                    os.makedirs(epoch_vis_dir, exist_ok=True)
+
+                    image_paths = trainer.eval_batch_ctx.cur_eval_image_paths
+                    if image_paths and b < len(image_paths):
+                        img_name = os.path.basename(image_paths[b])
+                        save_path = os.path.join(epoch_vis_dir, f'vis_{img_name}.png')
+                    else:
+                        save_path = os.path.join(epoch_vis_dir, f'vis_{b}.png')
+
+                    _draw_lanes_on_image(
+                        trainer.eval_batch_ctx.cur_eval_images[b],
+                        pred_lanes, gt_lane_list, save_path
+                    )
+
+                    trainer.wandb_logger.log_image(
+                        key=f'Lane_Detection_Eval_Epoch_{trainer.cur_epoch}_step_{b}',
+                        caption=f'Lane Detection (green=pred, red=GT) - Eval Epoch: {trainer.cur_epoch}',
+                        image=save_path
+                    )
 
     def on_eval_batch_end(self, trainer):
         

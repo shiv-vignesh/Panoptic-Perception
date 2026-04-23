@@ -814,7 +814,7 @@ class GDIPYolo(BaseEnhancementModel):
             )
             
         self.vis_intermediate = gdip_kwargs.get("visualize_intermediate", True)
-        
+
         self.ssim = StructuralSimilarityIndexMeasure(data_range=1.0)
             
     def forward(self, x:torch.Tensor, targets=None, 

@@ -3,6 +3,7 @@ CLRNet-style lane target utilities.
 Converts augmented lane polylines to CLRNet target format.
 """
 
+import cv2
 import numpy as np
 import torch
 from scipy.interpolate import interp1d
@@ -36,6 +37,35 @@ class BDD100KLaneCategories(Enum):
 NUM_LANE_POINTS = 72
 MAX_LANES = 8
 
+
+def _draw_lanes_on_image(image_tensor, pred_lanes, gt_lanes, save_path):
+    """
+    Draw predicted (green) and GT (red) lane polylines on an image.
+    image_tensor: (C, H, W) float [0,1] or uint8 [0,255]
+    Returns: (H, W, 3) uint8 numpy array
+    """
+
+    img = image_tensor.cpu()
+    if img.dtype == torch.float32 or img.dtype == torch.float16:
+        img = (img.clamp(0, 1) * 255).to(torch.uint8)
+    img = img.permute(1, 2, 0).numpy().copy()                     # (H, W, 3)
+
+    for lane in gt_lanes:
+        pts = np.array(lane['points'], dtype=np.int32)
+        cv2.polylines(img, [pts], isClosed=False, color=(255, 0, 0), thickness=2)
+
+    for lane in pred_lanes:
+        pts = np.array(lane['points'], dtype=np.int32)
+        conf = lane['confidence']
+        cv2.polylines(img, [pts], isClosed=False, color=(0, 255, 0), thickness=2)
+        if len(pts) > 0:
+            cv2.putText(img, f'{conf:.2f}', (int(pts[0][0]), int(pts[0][1]) - 5),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.4, (0, 255, 0), 1)
+
+    cv2.imwrite(save_path, 
+                cv2.cvtColor(img, cv2.COLOR_RGB2BGR))
+    
+    return img
 
 def polyline_to_lane_target(points, img_h, img_w, n_offsets=NUM_LANE_POINTS):
     """
