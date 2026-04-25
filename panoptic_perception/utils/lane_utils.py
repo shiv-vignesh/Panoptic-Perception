@@ -261,9 +261,11 @@ class LaneDetectionLossCalculator:
             union = (torch.max(px2[:, None, :], tx2[None, ...]) -
                      torch.min(px1[:, None, :], tx1[None, ...]))                    # (N, M, 72)
 
-        valid = (~invalid).float()
-        ovr = ovr.clamp(min=0) * valid
-        union = union.clamp(min=0) * valid
+        # Match official CLRNet: do NOT clamp ovr to >=0.
+        # Negative overlap at valid positions penalizes misaligned lanes,
+        # giving stronger gradients for geometry refinement.
+        ovr[invalid] = 0.
+        union[invalid] = 0.
         return ovr.sum(-1) / (union.sum(-1) + 1e-9)                                # (N,) or (N, M)
 
     @staticmethod
@@ -394,7 +396,7 @@ class LaneDetectionLossCalculator:
             for b in range(bs):
                 pred = preds_stage[b]                                               # (192, 78)
                 target = targets[b]                                                 # (max_lanes, 78)
-                target = target[target[:, 0] == 1]                                  # (T, 78) valid
+                target = target[target[:, 0] == 1] #TODO, target[:, 1] == 1         # (T, 78) valid
 
                 if len(target) == 0:
                     cls_target = pred.new_zeros(pred.shape[0]).long()                # (192,)

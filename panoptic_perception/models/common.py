@@ -588,7 +588,7 @@ class LaneROIGather(nn.Module):
         context = torch.bmm(sim_map, value.permute(0, 2, 1)) #(bs, 192, 64)
         context = self.W(context)
         
-        prior_feature_stages = prior_feature_stages + torch.nn.functional.dropout(prior_feature_stages, p=0.1, training=self.training)
+        prior_feature_stages = prior_feature_stages + torch.nn.functional.dropout(context, p=0.1, training=self.training)
         return prior_feature_stages
 
 class LaneDetect(nn.Module):
@@ -763,7 +763,7 @@ class LaneDetect(nn.Module):
         prior_xs = prior_xs.view(batch_size, num_priors, -1, 1)
         
         # self.prior_feat_ys - torch.Size([36])
-        # prior_ys - torch.Size([1, 192, 36, 1])
+        # prior_ys - torch.Size([bs, 192, 36, 1])
         prior_ys = self.prior_feat_ys.repeat(batch_size * num_priors).view(
             batch_size, num_priors, -1, 1
         ) 
@@ -881,14 +881,48 @@ class LaneDetect(nn.Module):
 
     def activation(self, output:List[torch.Tensor]):
         """
-        Apply activations to raw lane detection logits.
+        Apply activations to raw lane detection logits (pre-NMS).
         output: List[(bs, 192, 78)] per refinement stage
-        Returns: (bs, 192, 78) from final stage, with softmax on cls and clamped geometry.
+        Returns: (bs, 192, 78) from final stage, with softmax on cls.
+
+        Note: x-offset and length scaling happens in lane_nms / predictions_to_pred,
+        matching the official CLRNet get_lanes flow.
         """
         predictions = output[-1]                                       # (bs, 192, 78) final stage
         activated = predictions.clone()
         activated[:, :, :2] = torch.softmax(predictions[:, :, :2], dim=-1)  # bg/fg probs
-        activated[:, :, 2] = predictions[:, :, 2].clamp(0, 1)         # start_y
-        activated[:, :, 3] = predictions[:, :, 3].clamp(0, 1)         # start_x
-        activated[:, :, 5] = predictions[:, :, 5].clamp(0, 1)         # length
         return activated
+
+    def predictions_to_pred(self, predictions):
+        """
+        Convert NMS-surviving predictions to pixel-space lane coordinates.
+        predictions: (K, 78) — [bg, fg, start_y, start_x, theta, length, x0..x71]
+                     cls already softmaxed, geometry in normalized space.
+        Returns: list of (valid_points, 2) arrays in pixel coords [(x, y), ...].
+        """
+        lanes = []
+        for lane in predictions:
+            lane_xs = lane[6:]  # (72,) normalized x
+            start_y = lane[2]
+            length = int(torch.round(lane[5] * self.n_strips).item())
+
+            if length == 0:
+                continue
+
+            # start index in the 72-point grid
+            start = min(max(0, int(torch.round(start_y * self.n_strips).item())),
+                        self.n_strips)
+            end = min(start + length + 1, self.n_offsets)
+
+            xs_px = lane_xs[start:end] * (self.img_w - 1)
+            ys_px = self.prior_ys[start:end] * (self.img_h - 1)
+
+            # filter invalid points
+            valid = xs_px >= 0
+            if valid.sum() < 2:
+                continue
+
+            points = torch.stack([xs_px[valid], ys_px[valid]], dim=1)  # (P, 2)
+            lanes.append(points)
+
+        return lanes
