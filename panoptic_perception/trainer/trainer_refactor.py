@@ -135,6 +135,7 @@ class Trainer:
         ten_percent_drivable_loss = 0.0
         ten_percent_lane_seg_loss = 0.0
         ten_percent_lane_det_loss = 0.0
+        ten_percent_lane_det_items = {}
 
         epoch_training_time = 0.0
         ten_percent_training_time = 0.0
@@ -182,6 +183,9 @@ class Trainer:
                 ten_percent_lane_seg_loss += model_outputs.lane_segmentation_loss.item()
             if model_outputs.lane_detection_loss is not None:
                 ten_percent_lane_det_loss += model_outputs.lane_detection_loss.item()
+            if model_outputs.lane_detection_loss_items is not None:
+                for k, v in model_outputs.lane_detection_loss_items.items():
+                    ten_percent_lane_det_items[k] = ten_percent_lane_det_items.get(k, 0.0) + v
 
             epoch_training_time += (step_end_time - step_begin_time)
             ten_percent_training_time += (step_end_time - step_begin_time)
@@ -225,6 +229,9 @@ class Trainer:
                     wandb_metrics["train/lane_seg_loss"] = avg_lane_seg
                 if avg_lane_det > 0:
                     wandb_metrics["train/lane_det_loss"] = avg_lane_det
+                if ten_percent_lane_det_items:
+                    for k, v in ten_percent_lane_det_items.items():
+                        wandb_metrics[f"train/{k}"] = v / n
 
                 self.wandb_logger.log_metrics(wandb_metrics, step=self.cur_epoch * self.total_train_batch + batch_idx)
 
@@ -233,6 +240,7 @@ class Trainer:
                 ten_percent_drivable_loss = 0.0
                 ten_percent_lane_seg_loss = 0.0
                 ten_percent_lane_det_loss = 0.0
+                ten_percent_lane_det_items = {}
                 ten_percent_training_time = 0.0
                 
             self.callbacks.on_step_end(self)
@@ -271,6 +279,7 @@ class Trainer:
                 "lane_seg": data_items.get("segmentation_masks"),
                 "detections": data_items["detections"],
                 "lanes_detections": data_items.get("lanes_detections"),
+                "lane_seg_masks": data_items.get("lane_seg_masks"),
                 "clean_images": data_items.get("clean_images")
             }
         )
@@ -330,6 +339,7 @@ class Trainer:
                         "lane_seg": data_items.get("segmentation_masks"),
                         "detections": data_items["detections"],
                         "lanes_detections": data_items.get("lanes_detections"),
+                        "lane_seg_masks": data_items.get("lane_seg_masks"),
                         "clean_images": data_items.get("clean_images")
                     }
                 )

@@ -12,6 +12,7 @@ class PanopticModelOutputs:
     drivable_segmentation_logits: torch.Tensor = None
     lane_segmentation_logits: torch.Tensor = None 
     lane_detection_logits: torch.Tensor = None
+    lane_seg_logits: torch.Tensor = None
     
     detection_predictions: List[torch.Tensor] = None
     drivable_segmentation_predictions: torch.Tensor = None
@@ -22,6 +23,7 @@ class PanopticModelOutputs:
     drivable_segmentation_loss: torch.Tensor = None
     lane_segmentation_loss: torch.Tensor = None
     lane_detection_loss: torch.Tensor = None
+    lane_detection_loss_items: dict = None
     defogging_loss: torch.Tensor = None
 
     # ---- YoloV8 Anchor-Free Detection Head Outputs ----

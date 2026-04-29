@@ -465,6 +465,31 @@ class FeatureResize(nn.Module):
         x = torch.nn.functional.interpolate(x, self.size)
         return x.flatten(2)
 
+class SegDecoder(nn.Module):
+    '''
+    Optionaly seg decoder
+    '''
+    def __init__(self,
+                 image_height,
+                 image_width,
+                 num_class,
+                 prior_feat_channels=64,
+                 refine_layers=3):
+        super().__init__()
+        self.dropout = nn.Dropout2d(0.1)
+        self.conv = nn.Conv2d(prior_feat_channels * refine_layers, num_class, 1)
+        self.image_height = image_height
+        self.image_width = image_width
+
+    def forward(self, x):
+        x = self.dropout(x)
+        x = self.conv(x)
+        x = torch.nn.functional.interpolate(x,
+                          size=[self.image_height, self.image_width],
+                          mode='bilinear',
+                          align_corners=False)
+        return x
+
 class LaneROIGather(nn.Module):
     
     def __init__(self, feat_channels, num_priors, refine_layers,
@@ -602,7 +627,9 @@ class LaneDetect(nn.Module):
                 sample_points: int = 36,
                 refine_layers: int = 3,
                 num_fc: int = 2,
-                num_categories: int = 4):
+                num_classes:int = 2,
+                num_categories: int = 4,
+                use_seg_decoder:bool = True):
         super(LaneDetect, self).__init__()
         
         self.img_h = img_h
@@ -614,6 +641,7 @@ class LaneDetect(nn.Module):
         self.refine_layers = refine_layers
         self.feat_channels = feat_channels
         self.num_categories = num_categories
+        self.use_seg_decoder = use_seg_decoder
         
         # -- Fixed buffers --
         self.register_buffer(
@@ -651,7 +679,17 @@ class LaneDetect(nn.Module):
             feat_channels, num_priors, refine_layers,
             fc_hidden_dim=feat_channels,
             sample_points=sample_points
-        )        
+        )
+        
+        self.seg_decoder = None
+        if self.use_seg_decoder:
+            self.seg_decoder = SegDecoder(
+                image_height=img_h,
+                image_width=img_w, 
+                num_class=num_classes,
+                prior_feat_channels=self.feat_channels,
+                refine_layers=self.refine_layers
+            )
         
         # -- Classification branch --
         cls_modules = []
@@ -799,6 +837,10 @@ class LaneDetect(nn.Module):
         if image_size and image_size != (self.img_h, self.img_w):
             self.img_h = image_size[0]
             self.img_w = image_size[1]
+            
+            if self.use_seg_decoder and self.training:
+                self.seg_decoder.image_height = self.img_h
+                self.seg_decoder.image_width = self.img_w
 
         # Project all FPN features to feat_channels (64)
         batch_features = []
@@ -876,8 +918,18 @@ class LaneDetect(nn.Module):
             if stage != self.refine_layers - 1:
                 priors = prediction_lines.detach().clone()
                 priors_on_featmap = priors[..., 6 + self.sample_x_indexs]
-                
-        return predictions_lists
+
+        seg_logits = None
+        if self.use_seg_decoder and self.training:
+            target_size = batch_features[-1].shape[2:]
+            seg_features = torch.cat([
+                torch.nn.functional.interpolate(feat, size=target_size,
+                                                mode='bilinear', align_corners=False)
+                for feat in batch_features
+            ], dim=1)
+            seg_logits = self.seg_decoder(seg_features)
+
+        return predictions_lists, seg_logits
 
     def activation(self, output:List[torch.Tensor]):
         """

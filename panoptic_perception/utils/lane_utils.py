@@ -210,6 +210,34 @@ def build_lane_targets(lane_polys, img_h, img_w,
 
     return torch.from_numpy(targets), torch.from_numpy(categories)
 
+def build_lane_seg_mask(lane_polys, img_h, img_w, thickness=15):
+    """
+    Rasterize lane polylines into a binary segmentation mask.
+    Args:           
+        lane_polys: list of dicts {"points": np.array(N,2), "category": str}
+                    points in pixel coordinates of augmented image
+        img_h, img_w: image dimensions
+        thickness: line thickness in pixels (CLRNet uses ~15)               
+    Returns:
+        mask: np.array (img_h, img_w) uint8, 0 = bg, 1 = lane
+    """
+    
+    mask = np.zeros((img_h, img_w), dtype=np.uint8)
+    if lane_polys is None:
+        return torch.from_numpy(mask).long()
+    
+    for poly in lane_polys:
+        if poly.get("category") == "lane/crosswalk":
+            continue
+
+        pts = poly["points"]
+        if pts is None or len(pts) < 2:
+            continue
+
+        pts_int = np.array(pts, dtype=np.int32).reshape(-1, 1, 2)
+        cv2.polylines(mask, [pts_int], isClosed=False, color=1, thickness=thickness)
+
+    return torch.from_numpy(mask).long()
 
 # ----- Lane Detection -----
 # Adapted from: https://github.com/Turoad/CLRNet
@@ -227,12 +255,12 @@ class LaneDetectionLossCalculator:
         Note: DetectionLossCalculator.focal_loss is BCE-based (binary), not reusable here.
         """
         # inputs: (N, C) raw logits, targets: (N,) long labels
-        p = torch.softmax(inputs, dim=1) + 1e-8                                    # (N, C)
+        p = torch.softmax(inputs, dim=1) + 1e-8        # (N, C)
         ce = torch.nn.functional.cross_entropy(inputs, targets, reduction='none')   # (N,)
         p_t = p[torch.arange(len(targets), device=targets.device), targets]         # (N,)
         # Class-balanced alpha: alpha for fg (class=1), 1-alpha for bg (class=0)
         alpha_factor = torch.where(targets == 1, alpha, 1 - alpha)                 # (N,)
-        loss = alpha_factor * (1 - p_t) ** gamma * ce                              # (N,)
+        loss = alpha_factor * (1 - p_t) ** gamma * ce  # (N,)
         if reduction == 'mean':
             return loss.mean()
         elif reduction == 'sum':
@@ -247,11 +275,11 @@ class LaneDetectionLossCalculator:
         naturally receive 0 overlap via geometry).
         """
         # pred: (N, 72) pixels, target: (N, 72) or (M, 72) pixels
-        px1, px2 = pred - length, pred + length                                     # (N, 72)
+        px1, px2 = pred - length, pred + length         # (N, 72)
         tx1, tx2 = target - length, target + length
 
         if aligned:
-            invalid = (target < 0) | (target >= img_w)                              # (N, 72)
+            invalid = (target < 0) | (target >= img_w)  # (N, 72)
             ovr = torch.min(px2, tx2) - torch.max(px1, tx1)                         # (N, 72)
             union = torch.max(px2, tx2) - torch.min(px1, tx1)                       # (N, 72)
         else:
@@ -268,16 +296,16 @@ class LaneDetectionLossCalculator:
         # giving stronger gradients for geometry refinement.
         ovr[invalid] = 0.
         union[invalid] = 0.
-        return ovr.sum(-1) / (union.sum(-1) + 1e-9)                                # (N,) or (N, M)
+        return ovr.sum(-1) / (union.sum(-1) + 1e-9)    # (N,) or (N, M)
 
     @staticmethod
     def _distance_cost(predictions, targets, img_w):
         """Mean absolute x-distance between pred and GT at valid y-levels (pixel space)."""
         # predictions[:, 6:] and targets[:, 6:] already in pixel space (scaled by assign)
-        pred_xs = predictions[:, 6:].unsqueeze(1)                                   # (P, 1, 72)
-        tgt_xs = targets[:, 6:].unsqueeze(0)                                        # (1, T, 72)
+        pred_xs = predictions[:, 6:].unsqueeze(1)       # (P, 1, 72)
+        tgt_xs = targets[:, 6:].unsqueeze(0)            # (1, T, 72)
 
-        valid = (tgt_xs >= 0) & (tgt_xs < img_w)                                   # (P, T, 72)
+        valid = (tgt_xs >= 0) & (tgt_xs < img_w)       # (P, T, 72)
         dist = torch.abs(pred_xs - tgt_xs) * valid.float()                          # (P, T, 72)
         return dist.sum(-1) / valid.sum(-1).float().clamp(min=1)                    # (P, T)
 
@@ -293,11 +321,11 @@ class LaneDetectionLossCalculator:
     def _dynamic_k_assign(cost, pair_wise_ious):
         """Dynamic k matching: top-4 IoU per GT determines number of assigned priors."""
         # cost: (P, T), pair_wise_ious: (P, T)
-        matching = torch.zeros_like(cost)                                           # (P, T)
+        matching = torch.zeros_like(cost)               # (P, T)
         n_candidate_k = min(4, cost.shape[0])
 
         topk_ious, _ = torch.topk(pair_wise_ious, n_candidate_k, dim=0)            # (4, T)
-        dynamic_ks = topk_ious.sum(0).int().clamp(min=1)                            # (T,)
+        dynamic_ks = topk_ious.sum(0).int().clamp(min=1)# (T,)
 
         for gt_idx in range(cost.shape[1]):
             _, pos_idx = torch.topk(
@@ -307,7 +335,7 @@ class LaneDetectionLossCalculator:
         # Resolve conflicts: prior matched to multiple GTs -> keep lowest cost
         conflict_rows = torch.where(matching.sum(1) > 1)[0]                         # (C,)
         if len(conflict_rows) > 0:
-            _, best_gt = cost[conflict_rows].min(dim=1)                             # (C,)
+            _, best_gt = cost[conflict_rows].min(dim=1) # (C,)
             matching[conflict_rows] = 0
             matching[conflict_rows, best_gt] = 1.0
 
@@ -330,51 +358,52 @@ class LaneDetectionLossCalculator:
             num_targets = targets.shape[0]
 
             # Scale to pixel space for spatial costs
-            predictions[:, 3] *= (img_w - 1)                                       # start_x -> px
-            predictions[:, 6:] *= (img_w - 1)                                      # x-coords -> px
-            targets[:, 3] *= (img_w - 1)                                           # start_x -> px
-            targets[:, 6:] *= (img_w - 1)                                          # x-coords -> px
+            predictions[:, 3] *= (img_w - 1)           # start_x -> px
+            predictions[:, 6:] *= (img_w - 1)          # x-coords -> px
+            targets[:, 3] *= (img_w - 1)               # start_x -> px
+            targets[:, 6:] *= (img_w - 1)              # x-coords -> px
 
             # 1. Distance similarity
             distances = LaneDetectionLossCalculator._distance_cost(
-                predictions, targets, img_w)                                        # (P, T)
+                predictions, targets, img_w)            # (P, T)
             distances = 1 - (distances / distances.max().clamp(min=1e-4)) + 1e-2   # -> similarity
 
             # 2. Classification cost
             cls_pred = torch.softmax(predictions[:, :2], dim=1)                     # (P, 2)
             gt_labels = torch.ones(num_targets, dtype=torch.long,
-                                   device=targets.device)                           # (T,)
+       device=targets.device)                           # (T,)
             cls_cost = LaneDetectionLossCalculator._focal_cost(
-                cls_pred, gt_labels)                                                # (P, T)
+                cls_pred, gt_labels)                    # (P, T)
 
             # 3. Start point similarity (scale start_y to pixels for comparable L2)
-            pred_start = predictions[:, 2:4].clone()                                # (P, 2)
-            pred_start[:, 0] *= (img_h - 1)                                        # start_y -> px
-            tgt_start = targets[:, 2:4].clone()                                     # (T, 2)
-            tgt_start[:, 0] *= (img_h - 1)                                         # start_y -> px
+            pred_start = predictions[:, 2:4].clone()    # (P, 2)
+            pred_start[:, 0] *= (img_h - 1)            # start_y -> px
+            tgt_start = targets[:, 2:4].clone()         # (T, 2)
+            tgt_start[:, 0] *= (img_h - 1)             # start_y -> px
             start_xys = torch.cdist(pred_start, tgt_start, p=2).reshape(
-                num_priors, num_targets)                                            # (P, T)
+                num_priors, num_targets)                # (P, T)
             start_xys = (1 - start_xys / start_xys.max().clamp(min=1e-4)) + 1e-2  # -> similarity
 
             # 4. Theta similarity (scale to degrees for magnitude)
             thetas = torch.cdist(
                 predictions[:, 4:5], targets[:, 4:5], p=1).reshape(
-                num_priors, num_targets) * 180                                      # (P, T)
+                num_priors, num_targets) * 180          # (P, T)
             thetas = (1 - thetas / thetas.max().clamp(min=1e-4)) + 1e-2            # -> similarity
 
             # Combined cost: high similarity product -> large negative -> selected by topk(largest=False)
             cost = -(distances * start_xys * thetas) ** 2 * distance_cost_weight \
-                   + cls_cost * cls_cost_weight                                     # (P, T)
+                   + cls_cost * cls_cost_weight         # (P, T)
 
             # Line IoU for dynamic-k
             pair_wise_ious = LaneDetectionLossCalculator.line_iou(
                 predictions[:, 6:], targets[:, 6:],
-                img_w, aligned=False)                                               # (P, T)
+                img_w, aligned=False)                   # (P, T)
 
         return LaneDetectionLossCalculator._dynamic_k_assign(cost, pair_wise_ious)
 
     @staticmethod
-    def compute_lane_det_loss(predictions_lists, targets, img_w, img_h, n_strips=71):
+    def compute_lane_det_loss(predictions_lists, targets, 
+                            img_w, img_h, n_strips=71):
         """
         predictions_lists: List[(bs, 192, 78)] per refinement stage, or single (bs, 192, 78)
         targets: (bs, max_lanes, 78)
@@ -393,11 +422,11 @@ class LaneDetectionLossCalculator:
         iou_loss = torch.tensor(0.0, device=device)
 
         for stage in range(num_stages):
-            preds_stage = predictions_lists[stage]                                  # (bs, 192, 78)
+            preds_stage = predictions_lists[stage]      # (bs, 192, 78)
 
             for b in range(bs):
-                pred = preds_stage[b]                                               # (192, 78)
-                target = targets[b]                                                 # (max_lanes, 78)
+                pred = preds_stage[b]                   # (192, 78)
+                target = targets[b]                     # (max_lanes, 78)
                 target = target[target[:, 0] == 1] #TODO, target[:, 1] == 1         # (T, 78) valid
 
                 if len(target) == 0:
@@ -414,30 +443,28 @@ class LaneDetectionLossCalculator:
                 cls_target = pred.new_zeros(pred.shape[0]).long()                   # (192,)
                 cls_target[matched_row] = 1
                 cls_loss = cls_loss + LaneDetectionLossCalculator.focal_loss(
-                    pred[:, :2], cls_target                                         # (192, 2) vs (192,)
+                    pred[:, :2], cls_target             # (192, 2) vs (192,)
                 ).sum() / target.shape[0]
 
                 # --- Regression: start_y, start_x, theta, length ---
                 reg_yxtl = pred[matched_row, 2:6].clone()                           # (K, 4)
-                reg_yxtl[:, 0] *= n_strips                                          # start_y -> strips
-                reg_yxtl[:, 1] *= (img_w - 1)                                      # start_x -> px
-                reg_yxtl[:, 2] *= 180                                               # theta -> degrees
-                reg_yxtl[:, 3] *= n_strips                                          # length -> strips
+                reg_yxtl[:, 0] *= n_strips              # start_y -> strips
+                reg_yxtl[:, 1] *= (img_w - 1)          # start_x -> px
+                reg_yxtl[:, 2] *= 180                   # theta -> degrees
+                reg_yxtl[:, 3] *= n_strips              # length -> strips
 
                 target_yxtl = target[matched_col, 2:6].clone()                      # (K, 4)
 
                 # Adjust target length relative to prediction start position
                 with torch.no_grad():
-                    pred_starts = (pred[matched_row, 2] * n_strips
-                                   ).round().long().clamp(0, n_strips)              # (K,)
-                    tgt_starts = (target[matched_col, 2] * n_strips
-                                  ).round().long()                                  # (K,)
+                    pred_starts = (pred[matched_row, 2] * n_strips).round().long().clamp(0, n_strips)              # (K,)
+                    tgt_starts = (target[matched_col, 2] * n_strips).round().long()      # (K,)
                     target_yxtl[:, 3] -= (pred_starts - tgt_starts).float() / n_strips
 
-                target_yxtl[:, 0] *= n_strips                                       # start_y -> strips
-                target_yxtl[:, 1] *= (img_w - 1)                                   # start_x -> px
-                target_yxtl[:, 2] *= 180                                            # theta -> degrees
-                target_yxtl[:, 3] *= n_strips                                       # length -> strips
+                target_yxtl[:, 0] *= n_strips           # start_y -> strips
+                target_yxtl[:, 1] *= (img_w - 1)       # start_x -> px
+                target_yxtl[:, 2] *= 180                # theta -> degrees
+                target_yxtl[:, 3] *= n_strips           # length -> strips
 
                 reg_xytl_loss = reg_xytl_loss + torch.nn.functional.smooth_l1_loss(
                     reg_yxtl, target_yxtl, reduction='none').mean()
@@ -472,7 +499,7 @@ def lane_nms(predictions, img_w, conf_threshold=0.5, nms_threshold=0.5):
     predictions: (N, 78) activated — [bg_prob, fg_prob, start_y, start_x, theta, length, x0..x71]
     Returns: (K, 78) surviving lanes sorted by confidence descending.
     """
-    scores = predictions[:, 1]                                         # (N,) fg confidence
+    scores = predictions[:, 1]             # (N,) fg confidence
     keep_mask = scores > conf_threshold
     predictions = predictions[keep_mask]
     scores = scores[keep_mask]
@@ -506,11 +533,11 @@ def lane_nms(predictions, img_w, conf_threshold=0.5, nms_threshold=0.5):
             xs_px[i:i+1].expand(len(remaining_idx), -1),
             xs_px[remaining_idx],
             img_w, aligned=True
-        )                                                              # (R,)
+        )      # (R,)
         suppress = remaining_idx[ious > nms_threshold]
         alive[suppress] = False
 
-    return predictions[keep]                                           # (K', 78)
+    return predictions[keep]               # (K', 78)
 
 
 def predictions_to_lanes(predictions, img_h, img_w, n_offsets=NUM_LANE_POINTS):
@@ -526,10 +553,10 @@ def predictions_to_lanes(predictions, img_h, img_w, n_offsets=NUM_LANE_POINTS):
     prior_ys = torch.linspace(1.0, 0.0, steps=n_offsets, device=predictions.device)
 
     for pred in predictions:
-        conf = pred[1].item()                                          # fg prob
+        conf = pred[1].item()              # fg prob
         start_y = pred[2].item()
         length = pred[5].item()
-        x_coords = pred[6:]                                            # (72,) normalized
+        x_coords = pred[6:]                # (72,) normalized
 
         # Valid range: from start_y downward for `length` fraction of the strip range
         start_idx = (prior_ys <= start_y + 0.01).nonzero(as_tuple=True)[0]

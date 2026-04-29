@@ -311,7 +311,7 @@ class BaseTaskModel(nn.Module):
                     frozen_layers.append(idx)
 
             if regular_params:
-                param_groups.append({"params": regular_params, "name": group_name, "lr_scale": lr_scale})
+                param_groups.append({"params": regular_params, "name": group_name, "lr_scale": lr_scale, "trainable": trainable})
         
         return param_groups, frozen_layers, dcn_offset_params, dcn_conv_params
     
@@ -443,8 +443,9 @@ class YOLOP(BaseTaskModel):
                         inputs.append(cache[r])
     
                     #(bs, 192, 78)
-                    lane_detection_outputs = module(inputs, image_size=(height, width))
+                    lane_detection_outputs, seg_logits = module(inputs, image_size=(height, width))
                     model_outputs.lane_detection_logits = lane_detection_outputs
+                    model_outputs.lane_seg_logits = seg_logits
 
                     if not self.training:
                         model_outputs.lane_detection_predictions = module.activation(lane_detection_outputs)
@@ -505,8 +506,18 @@ class YOLOP(BaseTaskModel):
                     img_w=width,
                     img_h=height
                 )
-
+                
                 model_outputs.lane_detection_loss = lane_det_loss * self.loss_weights.get("lane_detection", 1.0)
+                model_outputs.lane_detection_loss_items = lane_det_loss_items                
+
+                if model_outputs.lane_seg_logits is not None and targets["lane_seg_masks"] is not None:
+                    seg_loss = torch.nn.functional.nll_loss(
+                        torch.nn.functional.log_softmax(model_outputs.lane_seg_logits, dim=1),
+                        targets["lane_seg_masks"].long()
+                    )
+
+                    model_outputs.lane_detection_loss += seg_loss * self.loss_weights.get("lane_seg", 1.0)
+                    model_outputs.lane_detection_loss_items["lane_seg_loss"] = seg_loss.item()
 
             if model_outputs.drivable_segmentation_logits is not None and targets["drivable_area_seg"] is not None:
                 output_name = "drivable_area_seg"
@@ -650,8 +661,9 @@ class YOLOv8P(BaseTaskModel):
                         inputs.append(cache[r])
     
                     #(bs, 192, 78)
-                    lane_detection_outputs = module(inputs, image_size=(height, width))
+                    lane_detection_outputs, seg_logits = module(inputs, image_size=(height, width))
                     model_outputs.lane_detection_logits = lane_detection_outputs
+                    model_outputs.lane_seg_logits = seg_logits
 
                     if not self.training:
                         model_outputs.lane_detection_predictions = module.activation(lane_detection_outputs)
@@ -719,6 +731,16 @@ class YOLOv8P(BaseTaskModel):
                 )
 
                 model_outputs.lane_detection_loss = lane_det_loss * self.loss_weights.get("lane_detection", 1.0)
+                model_outputs.lane_detection_loss_items = lane_det_loss_items
+
+                if model_outputs.lane_seg_logits is not None and targets["lane_seg_masks"] is not None:
+                    seg_loss = torch.nn.functional.nll_loss(
+                        torch.nn.functional.log_softmax(model_outputs.lane_seg_logits, dim=1),
+                        targets["lane_seg_masks"].long()
+                    )
+
+                    model_outputs.lane_detection_loss += seg_loss * self.loss_weights.get("lane_seg", 1.0)
+                    model_outputs.lane_detection_loss_items["lane_seg_loss"] = seg_loss.item()
 
             if model_outputs.drivable_segmentation_logits is not None and targets["drivable_area_seg"] is not None:
                 output_name = "drivable_area_seg"

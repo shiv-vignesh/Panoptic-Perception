@@ -24,7 +24,7 @@ from panoptic_perception.dataset.adverse_weather import (
     RadialDistance
 )
 
-from panoptic_perception.utils.lane_utils import build_lane_targets
+from panoptic_perception.utils.lane_utils import build_lane_targets, build_lane_seg_mask
 
 from enum import Enum
 
@@ -489,6 +489,7 @@ class BDDPreprocessor:
         batch_lane_categories = []
         batch_image_paths = []
         batch_scene_attributes = []
+        batch_lane_seg_masks = []
 
         for batch_idx, batch_items in enumerate(batch):
             image = batch_items['image']
@@ -529,6 +530,8 @@ class BDDPreprocessor:
                 batch_lane_targets.append(batch_items['lane_targets'])
             if batch_items.get('lane_categories') is not None:
                 batch_lane_categories.append(batch_items['lane_categories'])
+            if batch_items.get('lane_seg_mask') is not None:
+                batch_lane_seg_masks.append(batch_items['lane_seg_mask'])
 
         batch_images_tensor = torch.stack(batch_images, dim=0)
         batch_clean_images = torch.stack(batch_clean_images, dim=0) if batch_clean_images else None
@@ -544,6 +547,7 @@ class BDDPreprocessor:
         batch_drivable_masks_tensor = torch.stack(batch_drivable_masks, dim=0) if batch_drivable_masks else None
         batch_lane_targets_tensor = torch.stack(batch_lane_targets, dim=0) if batch_lane_targets else None
         batch_lane_categories_tensor = torch.stack(batch_lane_categories, dim=0) if batch_lane_categories else None
+        batch_lane_seg_masks = torch.stack(batch_lane_seg_masks, dim=0) if batch_lane_seg_masks else None
 
         return {
             "images": batch_images_tensor,
@@ -552,6 +556,7 @@ class BDDPreprocessor:
             "segmentation_masks": batch_segmentation_masks_tensor,
             "drivable_area_seg": batch_drivable_masks_tensor,
             "lanes_detections": batch_lane_targets_tensor,
+            "lane_seg_masks": batch_lane_seg_masks,
             "lane_categories": batch_lane_categories_tensor,
             "image_paths":batch_image_paths,
             "scene_attributes":batch_scene_attributes
@@ -759,6 +764,11 @@ class BDD100KDataset(Dataset):
             lane_polys, img_h, img_w
         )
 
+        lane_seg_mask = build_lane_seg_mask(
+            lane_polys,
+            img_h, img_w
+        )
+
         # Convert to tensors
         image_tensor = self.preprocessor.normalize_tensor(torch.from_numpy(image).permute(2, 0, 1))
         targets = torch.from_numpy(labels_xywh).float()
@@ -771,6 +781,7 @@ class BDD100KDataset(Dataset):
             "drivable_mask": drivable_tensor,
             "detection_targets": targets,
             "lane_targets": lane_targets,
+            "lane_seg_mask": lane_seg_mask,
             "lane_categories": lane_categories,
             "image_path": image_path,
             "scene_attributes": scene_attributes
@@ -1062,6 +1073,11 @@ class FoggyBDD100KDataset(BDD100KDataset):
         lane_targets, lane_categories = build_lane_targets(
             lane_polys, img_h, img_w
         )
+        
+        lane_seg_mask = build_lane_seg_mask(
+            lane_polys,
+            img_h, img_w
+        )
 
         # Step 3: Convert to tensors (same output format as parent)
         image_tensor = self.preprocessor.normalize_tensor(torch.from_numpy(image).permute(2, 0, 1))
@@ -1077,6 +1093,7 @@ class FoggyBDD100KDataset(BDD100KDataset):
             "drivable_mask": drivable_tensor,
             "detection_targets": targets,
             "lane_targets": lane_targets,
+            "lane_seg_mask": lane_seg_mask,
             "lane_categories": lane_categories,
             "image_path": image_path,
             "scene_attributes": scene_attributes
