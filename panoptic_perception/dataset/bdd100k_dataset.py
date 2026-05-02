@@ -257,6 +257,61 @@ class BDDPreprocessor:
 
         return bboxes, class_labels, attributes
 
+    @staticmethod
+    def _expand_poly2d_to_polyline(poly2d, samples_per_curve=20):
+        """
+        Convert BDD100K poly2d (mixed L/C/M codes) into a dense on-curve polyline.
+
+        BDD100K uses matplotlib Path.CURVE4 (cubic Bezier) encoding:
+            'M' -> move-to (start point, on-curve)
+            'L' -> line-to (anchor point, on-curve)
+            'C' -> cubic Bezier control point (off-curve, in groups of 3:
+                   the 3rd is the next on-curve anchor; first two are tangent hints)
+
+        Treating 'C' points as polyline vertices produces zigzags since they
+        are off the actual curve. This samples each cubic from L0 -> C3 using
+        C1, C2 as controls, yielding dense on-curve points.
+        """
+        if not poly2d:
+            return np.zeros((0, 2), dtype=np.float32)
+
+        points = []
+        i = 0
+        n = len(poly2d)
+
+        if poly2d[0][2] in ('M', 'L'):
+            points.append([poly2d[0][0], poly2d[0][1]])
+            i = 1
+
+        while i < n:
+            code = poly2d[i][2]
+
+            if code in ('L', 'M'):
+                points.append([poly2d[i][0], poly2d[i][1]])
+                i += 1
+            elif code == 'C':
+                if (i + 2 >= n
+                        or poly2d[i + 1][2] != 'C'
+                        or poly2d[i + 2][2] != 'C'
+                        or not points):
+                    i += 1
+                    continue
+                P0 = np.array(points[-1], dtype=np.float64)
+                P1 = np.array(poly2d[i][:2], dtype=np.float64)
+                P2 = np.array(poly2d[i + 1][:2], dtype=np.float64)
+                P3 = np.array(poly2d[i + 2][:2], dtype=np.float64)
+                for t in np.linspace(0.0, 1.0, samples_per_curve)[1:]:
+                    pt = ((1 - t) ** 3 * P0
+                          + 3 * (1 - t) ** 2 * t * P1
+                          + 3 * (1 - t) * t ** 2 * P2
+                          + t ** 3 * P3)
+                    points.append(pt.tolist())
+                i += 3
+            else:
+                i += 1
+
+        return np.array(points, dtype=np.float32)
+
     def load_lane_annotations(self, json_path):
         """
         Load lane polyline annotations from a BDD100K detection JSON file.
@@ -281,10 +336,7 @@ class BDDPreprocessor:
                 if not category.startswith("lane/"):
                     continue
 
-                pts = np.array(
-                    [[p[0], p[1]] for p in item["poly2d"] if p[2] == "L"],
-                    dtype=np.float32
-                )
+                pts = self._expand_poly2d_to_polyline(item["poly2d"])
                 if len(pts) >= 2:
                     lane_polys.append({
                         "points": pts,

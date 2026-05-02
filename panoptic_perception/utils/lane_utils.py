@@ -258,9 +258,8 @@ class LaneDetectionLossCalculator:
         p = torch.softmax(inputs, dim=1) + 1e-8        # (N, C)
         ce = torch.nn.functional.cross_entropy(inputs, targets, reduction='none')   # (N,)
         p_t = p[torch.arange(len(targets), device=targets.device), targets]         # (N,)
-        # Class-balanced alpha: alpha for fg (class=1), 1-alpha for bg (class=0)
-        alpha_factor = torch.where(targets == 1, alpha, 1 - alpha)                 # (N,)
-        loss = alpha_factor * (1 - p_t) ** gamma * ce  # (N,)
+        # Constant alpha for all classes (matches official CLRNet focal_loss.py)
+        loss = alpha * (1 - p_t) ** gamma * ce                                     # (N,)
         if reduction == 'mean':
             return loss.mean()
         elif reduction == 'sum':
