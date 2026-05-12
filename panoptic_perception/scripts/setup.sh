@@ -1,7 +1,7 @@
 #!/bin/bash
 set -e
 
-WORKSPACE="/workspace" #change to your project root
+WORKSPACE="" #change to your project root
 DATA_DIR="${WORKSPACE}/data"
 
 # Original BDD100K server URLs (currently down)
