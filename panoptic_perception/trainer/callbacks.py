@@ -325,7 +325,7 @@ class EvalMetricsCallback(TrainerCallback):
     def __init__(self, conf_threshold = 0.001,
                 iou_threshold = 0.45,
                 max_detections = 500,
-                stats_iou_threshold : float = 0.25,
+                stats_iou_threshold : float = 0.5,
                 num_drivable_classes = 2,
                 num_lane_classes = 2,  # Will be updated dynamically if needed
                 lane_det_conf_threshold = 0.5,
@@ -645,6 +645,7 @@ class EvalMetricsCallback(TrainerCallback):
         
         metric_prefix = trainer.eval_metric_prefix
         num_classes = len(BDD100KClassesReduced)
+        ap_label = f"mAP@{self.stats_iou_threshold:g}"
 
         # Create AP table for logging with class names
         ap_table_data = [["Class", "AP"]]
@@ -652,12 +653,12 @@ class EvalMetricsCallback(TrainerCallback):
             class_name = BDD100KClassesReduced(cls).name
             ap_value = ap_results.get(f'AP_class_{cls}', 0.0)
             ap_table_data.append([f"{cls}: {class_name}", f"{ap_value:.4f}"])
-        ap_table_data.append(["mAP@0.5", f"{ap_results['mAP']:.4f}"])
+        ap_table_data.append([ap_label, f"{ap_results['mAP']:.4f}"])
 
         trainer.eval_batch_ctx.ap_table_data = ap_table_data
         
         ap_table_string = AsciiTable(trainer.eval_batch_ctx.ap_table_data).table
-        trainer.logger.log_message(f"\n[{metric_prefix}] Detection Metrics (AP@0.5):")
+        trainer.logger.log_message(f"\n[{metric_prefix}] Detection Metrics (AP@{self.stats_iou_threshold:g}):")
         trainer.logger.log_message(ap_table_string)        
 
         #Create Stats (TP, FP, FN)
@@ -684,7 +685,7 @@ class EvalMetricsCallback(TrainerCallback):
 
         # Log AP table to WandB
         wandb_ap_data = [[f"{cls}: {BDD100KClassesReduced(cls).name}", ap_results.get(f'AP_class_{cls}', 0.0)] for cls in range(num_classes)]
-        wandb_ap_data.append([f"mAP@{self.stats_iou_threshold}", ap_results['mAP']])
+        wandb_ap_data.append([ap_label, ap_results['mAP']])
 
         trainer.eval_batch_ctx.wandb_ap_data = wandb_ap_data
         trainer.wandb_logger.log_table(

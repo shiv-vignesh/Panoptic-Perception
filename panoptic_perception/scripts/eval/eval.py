@@ -1,3 +1,5 @@
+import argparse
+import json
 import os
 from tqdm import tqdm
 from typing import List, Optional
@@ -5,7 +7,7 @@ from collections import defaultdict
 
 import torch
 
-from panoptic_perception.dataset.bdd100k_dataset import BDD100KDataset, BDDPreprocessor
+from panoptic_perception.dataset.bdd100k_dataset import BDD100KDataset, BDDPreprocessor, DatasetMode
 from panoptic_perception.dataset.enums import BDD100KClassesReduced
 
 from panoptic_perception.models.models import YOLOP, YOLOv8P, PanopticModelOutputs
@@ -31,6 +33,8 @@ def create_model(model_kwargs:dict):
         model = YOLOP(cfg_path)
     elif model_type == "yolov8p":
         model = YOLOv8P(cfg_path)
+    else:
+        raise ValueError(f"Unsupported model_type: {model_type}")
     
     if model_path and os.path.exists(model_path):
 
@@ -60,7 +64,7 @@ def create_dataloader(images_dir:str, detection_annotations_dir:str,
         "segmentation_annotations_dir":segmentation_annotations_dir,
         "drivable_annotations_dir":drivable_annotations_dir,
         "preprocessor_kwargs":preprocessor_kwargs,
-    }, dataset_type=dataset_type)
+    }, dataset_type=dataset_type, mode=DatasetMode.EVAL)
 
     return torch.utils.data.DataLoader(
         dataset, 
@@ -81,10 +85,11 @@ def log_detection_ap_table(ap_results:dict,
         class_name = BDD100KClassesReduced(cls).name
         ap_value = ap_results.get(f'AP_class_{cls}', 0.0)
         ap_table_data.append([f"{cls}: {class_name}", f"{ap_value:.4f}"])
-    ap_table_data.append(["mAP@0.5", f"{ap_results['mAP']:.4f}"])
+    ap_label = f"mAP@{stats_iou_threshold:g}"
+    ap_table_data.append([ap_label, f"{ap_results['mAP']:.4f}"])
 
     ap_table_string = AsciiTable(ap_table_data).table
-    print("\nDetection Metrics (AP@0.5):")
+    print(f"\nDetection Metrics (AP@{stats_iou_threshold:g}):")
     print(ap_table_string)
     
     #Create Stats (TP, FP, FN)
@@ -181,7 +186,7 @@ def process_detection_outputs(outputs: PanopticModelOutputs, images: torch.Tenso
     """
 
     if outputs.detection_predictions is None:
-        return
+        return global_image_idx
 
     conf_threshold=0.001
     iou_threshold=0.45
@@ -352,7 +357,8 @@ def run_eval_pipeline(model: torch.nn.Module,
                       visualize: bool = True,
                       eval_weather_grouping:bool = True,
                       early_stop:bool = True,
-                      max_visualizations: int = 100):
+                      max_visualizations: int = 100,
+                      stats_iou_threshold: float = 0.5):
     """
     Run evaluation pipeline on the dataloader.
 
@@ -446,7 +452,6 @@ def run_eval_pipeline(model: torch.nn.Module,
     detection_metrics = {}
     num_classes = len(BDD100KClassesReduced)
     
-    stats_iou_threshold=0.25
     ap_results, stats_per_class = DetectionMetrics.compute_stats(
         dets_by_image,
         gt_by_image,
@@ -478,8 +483,16 @@ def run_eval_pipeline(model: torch.nn.Module,
                 groups[key].append(idx)
 
         for conditions, image_indices in groups.items():
-            group_dets = {i:dets_by_image[i] for i, idx in enumerate(image_indices) if idx in dets_by_image}
-            group_gts = {i:gt_by_image[i] for i, idx in enumerate(image_indices) if idx in gt_by_image}
+            group_dets = {
+                new_idx: dets_by_image[image_idx]
+                for new_idx, image_idx in enumerate(image_indices)
+                if image_idx in dets_by_image
+            }
+            group_gts = {
+                new_idx: gt_by_image[image_idx]
+                for new_idx, image_idx in enumerate(image_indices)
+                if image_idx in gt_by_image
+            }
             
             ap_results, stats_per_class = DetectionMetrics.compute_stats(
                 group_dets,
@@ -497,9 +510,8 @@ def run_eval_pipeline(model: torch.nn.Module,
                         stats_per_class=stats_per_class,
                         stats_iou_threshold=stats_iou_threshold)
 
-if __name__ == "__main__":
-
-    model_kwargs = {
+def _default_model_kwargs():
+    return {
         "model_type":"yolop",
         # "cfg_path": "panoptic_perception/configs/models/yolo-detection.cfg",
         # "cfg_path": "panoptic_perception/configs/models/yolo-768-1280-detection.cfg",  
@@ -510,7 +522,8 @@ if __name__ == "__main__":
         "model_path": "checkpoints/yolov8p-checkpoints/yolov8p-768x1280-detection/best_model.pt"        
     }
 
-    dataset_kwargs = {
+def _default_dataset_kwargs():
+    return {
         "images_dir": "panoptic_perception/BDD100k/100k/100k",
         "detection_annotations_dir": "panoptic_perception/BDD100k/bdd100k_labels/100k",
         "segmentation_annotations_dir": "panoptic_perception/BDD100k/bdd100k_seg_maps/labels",
@@ -523,6 +536,85 @@ if __name__ == "__main__":
         }        
     }
 
+def _load_kwargs_from_config(config_path: str):
+    with open(config_path, "r") as f:
+        config = json.load(f)
+
+    model_kwargs = dict(config.get("model_kwargs", {}))
+    dataset_config = dict(config.get("dataset_kwargs", {}))
+    trainer_config = dict(config.get("trainer_kwargs", {}))
+
+    dataset_kwargs = {
+        "images_dir": dataset_config.get("images_dir", ""),
+        "detection_annotations_dir": dataset_config.get("detection_annotations_dir", ""),
+        "segmentation_annotations_dir": dataset_config.get("segmentation_annotations_dir", ""),
+        "drivable_annotations_dir": dataset_config.get("drivable_annotations_dir", ""),
+        "dataset_type": "val",
+        "batch_size": dataset_config.get("val_batch_size", 1),
+        "preprocessor_kwargs": dataset_config.get(
+            "val_preprocessor_kwargs",
+            dataset_config.get("preprocessor_kwargs", {}),
+        ),
+    }
+
+    if "model_path" not in model_kwargs:
+        checkpoint_path = trainer_config.get("checkpoint_path")
+        if checkpoint_path:
+            model_kwargs["model_path"] = checkpoint_path
+
+    return model_kwargs, dataset_kwargs
+
+def parse_args():
+    parser = argparse.ArgumentParser(description="Evaluate a YOLOP/YOLOv8P checkpoint.")
+    parser.add_argument("--config", type=str, default=None, help="Training/eval JSON config to load.")
+    parser.add_argument("--checkpoint", type=str, default=None, help="Checkpoint path to evaluate.")
+    parser.add_argument("--model-type", type=str, choices=["yolop", "yolov8p"], default=None)
+    parser.add_argument("--cfg-path", type=str, default=None, help="Model cfg path.")
+    parser.add_argument("--device", type=str, default=None)
+    parser.add_argument("--images-dir", type=str, default=None)
+    parser.add_argument("--detection-annotations-dir", type=str, default=None)
+    parser.add_argument("--segmentation-annotations-dir", type=str, default=None)
+    parser.add_argument("--drivable-annotations-dir", type=str, default=None)
+    parser.add_argument("--dataset-type", type=str, default=None)
+    parser.add_argument("--batch-size", type=int, default=None)
+    parser.add_argument("--output-dir", type=str, default="eval_outputs")
+    parser.add_argument("--stats-iou-threshold", type=float, default=0.5)
+    parser.add_argument("--max-visualizations", type=int, default=50)
+    parser.add_argument("--visualize", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument("--early-stop", action=argparse.BooleanOptionalAction, default=False)
+    parser.add_argument("--eval-weather-grouping", action=argparse.BooleanOptionalAction, default=True)
+    return parser.parse_args()
+
+if __name__ == "__main__":
+    args = parse_args()
+
+    if args.config:
+        model_kwargs, dataset_kwargs = _load_kwargs_from_config(args.config)
+    else:
+        model_kwargs = _default_model_kwargs()
+        dataset_kwargs = _default_dataset_kwargs()
+
+    if args.checkpoint is not None:
+        model_kwargs["model_path"] = args.checkpoint
+    if args.model_type is not None:
+        model_kwargs["model_type"] = args.model_type
+    if args.cfg_path is not None:
+        model_kwargs["cfg_path"] = args.cfg_path
+    if args.device is not None:
+        model_kwargs["device"] = args.device
+
+    dataset_overrides = {
+        "images_dir": args.images_dir,
+        "detection_annotations_dir": args.detection_annotations_dir,
+        "segmentation_annotations_dir": args.segmentation_annotations_dir,
+        "drivable_annotations_dir": args.drivable_annotations_dir,
+        "dataset_type": args.dataset_type,
+        "batch_size": args.batch_size,
+    }
+    for key, value in dataset_overrides.items():
+        if value is not None:
+            dataset_kwargs[key] = value
+
     model, device, dataloader = initialize_eval_pipeline(
         model_kwargs, dataset_kwargs
     )
@@ -532,9 +624,10 @@ if __name__ == "__main__":
         model=model,
         dataloader=dataloader,
         device=device,
-        output_dir="eval_outputs-detections-1",
-        visualize=True,
-        eval_weather_grouping=True,
-        early_stop=False,
-        max_visualizations=50  # Limit to 50 images to avoid too many files
+        output_dir=args.output_dir,
+        visualize=args.visualize,
+        eval_weather_grouping=args.eval_weather_grouping,
+        early_stop=args.early_stop,
+        max_visualizations=args.max_visualizations,
+        stats_iou_threshold=args.stats_iou_threshold,
     )
