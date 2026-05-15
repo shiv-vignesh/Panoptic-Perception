@@ -542,6 +542,9 @@ class BDDPreprocessor:
         batch_image_paths = []
         batch_scene_attributes = []
         batch_lane_seg_masks = []
+        batch_transmission = []
+        batch_fog_applied = []
+        batch_beta = []
 
         for batch_idx, batch_items in enumerate(batch):
             image = batch_items['image']
@@ -585,6 +588,13 @@ class BDDPreprocessor:
             if batch_items.get('lane_seg_mask') is not None:
                 batch_lane_seg_masks.append(batch_items['lane_seg_mask'])
 
+            if batch_items.get('transmission_target') is not None:
+                batch_transmission.append(batch_items['transmission_target'])
+            if batch_items.get('fog_applied') is not None:
+                batch_fog_applied.append(batch_items['fog_applied'])
+            if batch_items.get('beta') is not None:
+                batch_beta.append(batch_items['beta'])
+
         batch_images_tensor = torch.stack(batch_images, dim=0)
         batch_clean_images = torch.stack(batch_clean_images, dim=0) if batch_clean_images else None
         batch_targets_tensor = torch.cat(batch_targets, dim=0) if batch_targets else None
@@ -611,7 +621,10 @@ class BDDPreprocessor:
             "lane_seg_masks": batch_lane_seg_masks,
             "lane_categories": batch_lane_categories_tensor,
             "image_paths":batch_image_paths,
-            "scene_attributes":batch_scene_attributes
+            "scene_attributes":batch_scene_attributes,
+            "transmission_targets": torch.stack(batch_transmission, dim=0) if batch_transmission else None,
+            "fog_applied": torch.stack(batch_fog_applied, dim=0) if batch_fog_applied else None,
+            "betas": torch.stack(batch_beta, dim=0) if batch_beta else None,
         }
     
     def prepare_inference(self, image_path=None):
@@ -1055,15 +1068,13 @@ class FoggyBDD100KDataset(BDD100KDataset):
         image_id = self.image_ids[index]
         depth_map_arr = None
 
-        # # Try cached .npy first
-        # if image_id in self._cached_depth_stems:
-        #     depth_map_path = os.path.join(self.depth_map_dir, self.dataset_type, f"{image_id}.npy")
-        #     if os.path.exists(depth_map_path):
-        #         depth_map_arr = np.load(str(depth_map_path))
-
-        # Fall back to on-the-fly depth estimation
-        # if depth_map_arr is None:
-        #     depth_map_arr = self.depth_estimator.estimate(image)
+        # Try cached .npy first (produced by scripts/utils/precompute_depth.py)
+        if self.depth_map_dir and image_id in self._cached_depth_stems:
+            depth_map_path = os.path.join(
+                self.depth_map_dir, self.dataset_type, f"{image_id}.npy"
+            )
+            if os.path.exists(depth_map_path):
+                depth_map_arr = np.load(depth_map_path)
 
         return image, depth_map_arr, bboxes, class_labels, scene_attributes, seg, drivable, lane_polys, image_path
     
@@ -1081,7 +1092,14 @@ class FoggyBDD100KDataset(BDD100KDataset):
         return self.variants[chosen_idx]        
     
     def _apply_degradation(self, image:np.ndarray, depth_map_arr:np.ndarray, beta, gamma):
-        """Apply fog and/or darkness to the raw image. Returns degraded uint8 RGB."""
+        """Apply fog and/or darkness. Returns (degraded_uint8_rgb, transmission, depth).
+
+        transmission and depth are float32 (H, W) aligned with `image`, or None if
+        no fog was applied. Transmission is the physical t(x) = exp(-beta * d * max_d),
+        which is the supervision target for the auxiliary transmission head.
+        """
+        transmission = None
+        depth_out = None
         if beta is not None and gamma is not None:
             params = FogParameters(
                 beta=beta,
@@ -1090,7 +1108,7 @@ class FoggyBDD100KDataset(BDD100KDataset):
                 atmospheric_light_min_pixels=self.atmospheric_light_min_pixels,
                 atmospheric_light=np.array(self.atmospheric_light) if self.atmospheric_light is not None else None,
             )
-            image, _, _ = apply_nighttime_fog(
+            image, depth_out, transmission = apply_nighttime_fog(
                 image_rgb=image,
                 fog_generator=self.fog_generator,
                 fog_params=params,
@@ -1107,7 +1125,7 @@ class FoggyBDD100KDataset(BDD100KDataset):
                 atmospheric_light_min_pixels=self.atmospheric_light_min_pixels,
                 atmospheric_light=np.array(self.atmospheric_light) if self.atmospheric_light is not None else None,
             )
-            image, _, _ = self.fog_generator.generate(
+            image, depth_out, transmission = self.fog_generator.generate(
                 image_rgb=image,
                 params=params,
                 precomputed_depth=depth_map_arr,
@@ -1115,7 +1133,7 @@ class FoggyBDD100KDataset(BDD100KDataset):
         elif gamma is not None:
             image = self.lowlight_generator.apply(image, gamma)
 
-        return image
+        return image, transmission, depth_out
 
     def prepare_training_sample(self, index):
         image, depth_map_arr, bboxes, class_labels, \
@@ -1152,11 +1170,32 @@ class FoggyBDD100KDataset(BDD100KDataset):
 
         clean_image = image.copy()
 
+        transmission_target = None
+        beta_used = 0.0
+        fog_applied_flag = 0.0
+
         if apply_fog:
-            image_id = self.image_ids[index]
-            depth_map_arr = self.depth_estimator.estimate(image)
+            # Resize cached depth to match augmented image. If no cache, estimate
+            # on-the-fly from the augmented image (slow path — only as fallback).
+            target_h, target_w = image.shape[:2]
+            if depth_map_arr is not None:
+                if depth_map_arr.shape[:2] != (target_h, target_w):
+                    depth_map_arr = cv2.resize(
+                        depth_map_arr.astype(np.float32),
+                        (target_w, target_h),
+                        interpolation=cv2.INTER_LINEAR,
+                    )
+            else:
+                depth_map_arr = self.depth_estimator.estimate(image)
+
             beta, gamma = self._select_degradation(scene_attributes)
-            image = self._apply_degradation(image, depth_map_arr, beta, gamma)
+            image, transmission_target, _ = self._apply_degradation(
+                image, depth_map_arr, beta, gamma
+            )
+
+            if transmission_target is not None and beta is not None:
+                fog_applied_flag = 1.0
+                beta_used = float(beta)
 
         # Build lane targets from augmented polylines
         img_h, img_w = image.shape[:2]
@@ -1176,6 +1215,14 @@ class FoggyBDD100KDataset(BDD100KDataset):
         seg_tensor = torch.from_numpy(seg).long() if seg is not None else None
         drivable_tensor = torch.from_numpy(drivable).long() if drivable is not None else None
 
+        # Transmission target for the auxiliary head. All-ones when fog wasn't
+        # applied; loss should be masked by `fog_applied`.
+        img_h, img_w = image.shape[:2]
+        if transmission_target is None:
+            transmission_tensor = torch.ones((1, img_h, img_w), dtype=torch.float32)
+        else:
+            transmission_tensor = torch.from_numpy(transmission_target).float().unsqueeze(0)
+
         return {
             "image": image_tensor,
             "clean_image":clean_tensor,
@@ -1186,5 +1233,8 @@ class FoggyBDD100KDataset(BDD100KDataset):
             "lane_seg_mask": lane_seg_mask,
             "lane_categories": lane_categories,
             "image_path": image_path,
-            "scene_attributes": scene_attributes
+            "scene_attributes": scene_attributes,
+            "transmission_target": transmission_tensor,
+            "fog_applied": torch.tensor(fog_applied_flag, dtype=torch.float32),
+            "beta": torch.tensor(beta_used, dtype=torch.float32),
         }

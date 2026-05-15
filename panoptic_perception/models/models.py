@@ -10,6 +10,7 @@ from panoptic_perception.models.common import (
     ConvBlock, Focus, BottleneckCSP, SPP, Upsample, Detect, C2F, SPPF, DetectV8, LaneDetect
 )
 from panoptic_perception.models.utils import parse_model_config, initialize_weights, PanopticModelOutputs
+from panoptic_perception.models.transmission_head import TransmissionHead, transmission_loss
 from panoptic_perception.models.gdip import GDIP, MultiLevelGDIP, build_vision_encoder
 from panoptic_perception.models.denet import DENet
 from panoptic_perception.utils.detection_utils import DetectionLossCalculator
@@ -351,7 +352,8 @@ class BaseTaskModel(nn.Module):
 
 @ModelFactory.register_task_model("yolop")
 class YOLOP(BaseTaskModel):
-    def __init__(self, cfg: str, loss_weights: dict = None):
+    def __init__(self, cfg: str, loss_weights: dict = None,
+                 transmission_kwargs: dict | None = None):
         super(YOLOP, self).__init__()
 
         module_defs = parse_model_config(cfg)
@@ -377,6 +379,24 @@ class YOLOP(BaseTaskModel):
             segmentation_head_idx=self.segmentation_head_idx,
             lane_segmentation_head_idx=self.lane_segmentation_head_idx
         )
+
+        # Optional auxiliary transmission head for depth-guided fog training.
+        # Predicts t_hat(x) ∈ [0, 1] from a mid-level backbone feature; supervised
+        # against transmission_target produced by FoggyBDD100KDataset.
+        tk = transmission_kwargs or {}
+        self.transmission_enabled = bool(tk.get("enabled", False))
+        self.transmission_tap_layer = int(tk.get("tap_layer", 8))   # SPP output by default
+        self.transmission_loss_weight = float(tk.get("loss_weight", 0.1))
+        self._transmission_debug_logged = False
+        if self.transmission_enabled:
+            tap_channels = int(tk.get("tap_channels", 512))
+            self.transmission_head = TransmissionHead(
+                in_channels=tap_channels,
+                hidden_channels=int(tk.get("hidden_channels", 64)),
+            )
+            # Ensure the tap layer's output is captured in the forward cache.
+            if self.transmission_tap_layer not in self._cache_layer_idx:
+                self._cache_layer_idx = list(self._cache_layer_idx) + [self.transmission_tap_layer]
 
         # Initialize model weights
         initialize_weights(self)
@@ -474,10 +494,35 @@ class YOLOP(BaseTaskModel):
 
             if i in self._cache_layer_idx:
                 cache[i] = x
-                
+
             # print(f'Layer_idx: {i} - ModuleName: {self.module_names[i]} - TensorShape: {x.shape}')
 
-        
+        # Auxiliary transmission prediction (depth-guided fog inductive bias)
+        if self.transmission_enabled:
+            if not self._transmission_debug_logged:
+                print("[YOLOP transmission] layer roster (cached only):")
+                for layer_i in sorted(cache.keys()):
+                    marker = "  <-- TAP" if layer_i == self.transmission_tap_layer else ""
+                    print(f"  layer {layer_i:>2} | {self.module_names[layer_i]:<22} "
+                          f"| shape {tuple(cache[layer_i].shape)}{marker}")
+                if self.transmission_tap_layer not in cache:
+                    print(f"[YOLOP transmission] ERROR: tap_layer={self.transmission_tap_layer} "
+                          f"not in cache. Pick one of {sorted(cache.keys())}.")
+                else:
+                    tap_c = cache[self.transmission_tap_layer].shape[1]
+                    head_c = self.transmission_head.net[0].in_channels
+                    if tap_c != head_c:
+                        print(f"[YOLOP transmission] ERROR: tap channels {tap_c} "
+                              f"!= head in_channels {head_c}. Set "
+                              f"transmission_kwargs.tap_channels={tap_c} in your config.")
+                self._transmission_debug_logged = True
+
+            if self.transmission_tap_layer in cache:
+                tap_feat = cache[self.transmission_tap_layer]
+                model_outputs.transmission_pred = self.transmission_head(
+                    tap_feat, target_size=(height, width)
+                )
+
         if targets is not None:
 
             if model_outputs.detection_logits is not None and targets["detections"] is not None:
@@ -541,6 +586,16 @@ class YOLOP(BaseTaskModel):
                 # Apply multi-task loss weight
                 model_outputs.lane_segmentation_loss = lane_seg_loss * self.loss_weights.get("lane_segmentation", 0.0)
                 # print(f'Lane Segmentation Loss: {lane_seg_loss}')
+
+            if (model_outputs.transmission_pred is not None
+                    and targets.get("transmission_targets") is not None
+                    and targets.get("fog_applied") is not None):
+                t_loss = transmission_loss(
+                    model_outputs.transmission_pred,
+                    targets["transmission_targets"],
+                    targets["fog_applied"],
+                )
+                model_outputs.transmission_loss = t_loss * self.transmission_loss_weight
 
         return model_outputs
 

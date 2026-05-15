@@ -17,10 +17,17 @@ def create_model(model_kwargs: dict, loss_weights: dict = None):
     use_denet = model_kwargs.get("use_denet", False)
 
     assert os.path.exists(cfg_path), f'{cfg_path} does not exists'
+    transmission_kwargs = model_kwargs.get("transmission_kwargs")
     if model_type == "yolop":
-        model = YOLOP(cfg_path, loss_weights=loss_weights)
+        yolop_kwargs = {"loss_weights": loss_weights}
+        if transmission_kwargs is not None:
+            yolop_kwargs["transmission_kwargs"] = transmission_kwargs
+        model = YOLOP(cfg_path, **yolop_kwargs)
     elif model_type == "yolov8p":
         model = YOLOv8P(cfg_path, loss_weights=loss_weights)
+        if transmission_kwargs and transmission_kwargs.get("enabled"):
+            print("[warn] transmission_kwargs.enabled=true but YOLOv8P doesn't "
+                  "support transmission head yet — ignoring.")
 
     assert not (use_gdip and use_denet), "use_gdip and use_denet cannot both be True"
 

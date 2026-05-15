@@ -8,6 +8,7 @@ from collections import defaultdict
 import torch
 from torch import nn
 from torch.utils.data.dataloader import DataLoader
+from torch.utils.data import Subset
 
 import numpy as np
 
@@ -315,6 +316,19 @@ class Trainer:
                     mode=dataset_mode,
                 )
 
+            # Optional dataset truncation for fast smoke tests.
+            # Set "dataset_limit": N in dataset_kwargs (or "train_dataset_limit" /
+            # "val_dataset_limit" for per-split control). N <= 0 or absent = no limit.
+            limit_key = f"{dataset_type}_dataset_limit"
+            limit = int(dataset_kwargs.get(limit_key,
+                                           dataset_kwargs.get("dataset_limit", 0)))
+            if limit > 0 and limit < len(dataset):
+                self.logger.log_message(
+                    f"[Dataloader] {dataset_type} dataset truncated to {limit} "
+                    f"of {len(dataset)} samples (smoke-test mode)"
+                )
+                dataset = Subset(dataset, list(range(limit)))
+
             return DataLoader(
                 dataset,
                 batch_size=batch_size,
@@ -370,6 +384,14 @@ class Trainer:
                 apply_fog_prob=1.0,
                 depth_estimator=depth_estimator,
             )
+
+            foggy_limit = int(dataset_kwargs.get("val_dataset_limit",
+                                                 dataset_kwargs.get("dataset_limit", 0)))
+            if foggy_limit > 0 and foggy_limit < len(foggy_val_dataset):
+                self.logger.log_message(
+                    f"[Dataloader] foggy val truncated to {foggy_limit} samples"
+                )
+                foggy_val_dataset = Subset(foggy_val_dataset, list(range(foggy_limit)))
 
             self.val_foggy_dataloader = DataLoader(
                 foggy_val_dataset,
@@ -751,6 +773,10 @@ class Trainer:
 
         total_loss = 0.0
         ten_percent_batch_total_loss = 0
+        total_transmission_loss = 0.0
+        ten_percent_transmission_loss = 0.0
+        transmission_batches = 0
+        ten_percent_transmission_batches = 0
 
         epoch_training_time = 0.0
         ten_percent_training_time = 0.0
@@ -842,6 +868,13 @@ class Trainer:
             total_loss += loss.item()
             ten_percent_batch_total_loss += loss.item()
 
+            if model_outputs.transmission_loss is not None:
+                t_val = model_outputs.transmission_loss.item()
+                total_transmission_loss += t_val
+                ten_percent_transmission_loss += t_val
+                transmission_batches += 1
+                ten_percent_transmission_batches += 1
+
             epoch_training_time += (step_end_time - step_begin_time)
             ten_percent_training_time += (step_end_time - step_begin_time)
 
@@ -874,13 +907,22 @@ class Trainer:
                 self.logger.log_message(message=message)
 
                 # Log to WandB
-                self.wandb_logger.log_metrics({
+                wb_payload = {
                     "train/loss_10pct": average_loss,
                     "train/lr": current_lr,
-                    "train/avg_step_time": average_time
-                }, step=self.cur_epoch * self.total_train_batch + batch_idx)
+                    "train/avg_step_time": average_time,
+                }
+                if ten_percent_transmission_batches > 0:
+                    wb_payload["train/transmission_loss_10pct"] = (
+                        ten_percent_transmission_loss / ten_percent_transmission_batches
+                    )
+                self.wandb_logger.log_metrics(
+                    wb_payload, step=self.cur_epoch * self.total_train_batch + batch_idx
+                )
 
                 ten_percent_batch_total_loss = 0
+                ten_percent_transmission_loss = 0.0
+                ten_percent_transmission_batches = 0
                 ten_percent_training_time = 0.0
                 ten_percent_metric_per_grid = defaultdict(lambda:defaultdict(int))
                 
@@ -899,11 +941,16 @@ class Trainer:
                 current_lr = self.optimizer.param_groups[0]['lr']
 
         # Log epoch-level metrics to WandB
-        self.wandb_logger.log_metrics({
+        epoch_payload = {
             "train/epoch_loss": avg_epoch_loss,
             "train/epoch_time": epoch_training_time,
-            "train/epoch": self.cur_epoch
-        }, step=self.cur_epoch)
+            "train/epoch": self.cur_epoch,
+        }
+        if transmission_batches > 0:
+            epoch_payload["train/transmission_epoch_loss"] = (
+                total_transmission_loss / transmission_batches
+            )
+        self.wandb_logger.log_metrics(epoch_payload, step=self.cur_epoch)
                 
     
     def train_one_step(self, data_items:dict) -> PanopticModelOutputs:
@@ -918,24 +965,29 @@ class Trainer:
                 "drivable_area_seg": data_items.get("drivable_area_seg"),
                 "lane_seg": data_items.get("segmentation_masks"),
                 "detections": data_items["detections"],
-                "clean_images": data_items.get("clean_images")
-            }            
-        )        
-        
+                "clean_images": data_items.get("clean_images"),
+                "transmission_targets": data_items.get("transmission_targets"),
+                "fog_applied": data_items.get("fog_applied"),
+            }
+        )
+
         loss = torch.zeros(1, device=self.device)
-        
+
         if outputs.detection_loss is not None:
             loss += outputs.detection_loss
-            
+
         if outputs.drivable_segmentation_loss is not None:
             loss += outputs.drivable_segmentation_loss
-            
+
         if outputs.lane_segmentation_loss is not None:
             loss += outputs.lane_segmentation_loss
-            
+
         if isinstance(self.model, GDIPYolo) or isinstance(self.model, DENetYolo):
             if hasattr(outputs, "defogging_loss") and outputs.defogging_loss is not None:
                 loss += self.lambda_defog * outputs.defogging_loss
+
+        if outputs.transmission_loss is not None:
+            loss += outputs.transmission_loss
 
         loss.backward()
 
@@ -1008,6 +1060,8 @@ class Trainer:
         total_det_loss = 0.0
         total_drivable_loss = 0.0
         total_lane_loss = 0.0
+        total_transmission_loss = 0.0
+        transmission_batches = 0
         global_image_idx = 0
 
         conf_threshold = 0.001
@@ -1033,7 +1087,9 @@ class Trainer:
                         "drivable_area_seg": data_items.get("drivable_area_seg"),
                         "lane_seg": data_items.get("segmentation_masks"),
                         "detections": data_items["detections"],
-                        "clean_images": data_items.get("clean_images")
+                        "clean_images": data_items.get("clean_images"),
+                        "transmission_targets": data_items.get("transmission_targets"),
+                        "fog_applied": data_items.get("fog_applied"),
                     }
                 )
 
@@ -1102,6 +1158,10 @@ class Trainer:
                 if outputs.lane_segmentation_loss is not None:
                     total_lane_loss += outputs.lane_segmentation_loss.item()
                     total_val_loss += outputs.lane_segmentation_loss.item()
+
+                if outputs.transmission_loss is not None:
+                    total_transmission_loss += outputs.transmission_loss.item()
+                    transmission_batches += 1
 
                 # Process detection predictions - concatenate layer outputs and apply NMS
                 if outputs.detection_predictions is not None:
@@ -1272,6 +1332,10 @@ class Trainer:
         avg_det_loss = total_det_loss / num_batches if num_batches > 0 else 0.0
         avg_drivable_loss = total_drivable_loss / num_batches if num_batches > 0 else 0.0
         avg_lane_loss = total_lane_loss / num_batches if num_batches > 0 else 0.0
+        avg_transmission_loss = (
+            total_transmission_loss / transmission_batches
+            if transmission_batches > 0 else 0.0
+        )
         avg_total_loss = (total_det_loss + total_drivable_loss + total_lane_loss) / num_batches
 
         # Detection metrics
@@ -1385,6 +1449,7 @@ class Trainer:
             f"{metric_prefix}/detection_loss": avg_det_loss,
             f"{metric_prefix}/drivable_loss": avg_drivable_loss,
             f"{metric_prefix}/lane_loss": avg_lane_loss,
+            f"{metric_prefix}/transmission_loss": avg_transmission_loss,
             f"{metric_prefix}/epoch": self.cur_epoch
         }
 

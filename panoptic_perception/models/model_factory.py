@@ -30,7 +30,15 @@ class ModelFactory:
             raise KeyError(f'Unknown Model Class: {model_type}')
         
         task_model_cls = cls._task_models[model_type]
-        task_model = task_model_cls(cfg_path, loss_weights=loss_weights)
+        task_kwargs = {"cfg": cfg_path, "loss_weights": loss_weights}
+        if "transmission_kwargs" in model_kwargs:
+            task_kwargs["transmission_kwargs"] = model_kwargs["transmission_kwargs"]
+        try:
+            task_model = task_model_cls(**task_kwargs)
+        except TypeError:
+            # Models that don't accept transmission_kwargs (e.g. YOLOv8P) fall back.
+            task_kwargs.pop("transmission_kwargs", None)
+            task_model = task_model_cls(**task_kwargs)
         
         enhancement = model_kwargs.get("enhancement")
         if enhancement is None:
