@@ -4,17 +4,18 @@
     "model_kwargs":{
         "model_type":"yolop",
         "cfg_path":"panoptic_perception/configs/models/yolo-768-1280-detection.cfg",
-        "device":"cuda",
-        "use_gdip":true,
-        "gdip_kwargs":{
-            "mode": "mgdip",
-            "encoder" : {
-                "type":"resnet18",
-                "latent_dim":256,
-                "pretrained":true,
-                "tap_layers":[5, 6, 7]
-            },
-            "visualize_intermediate":true
+        "device":"cuda:1",
+        "use_gdip": false,
+        "use_denet": true,
+        "denet_kwargs": {
+            "num_high": 3,
+            "gaussian_kernel_size": 5,
+            "num_channels": 3,
+            "channel_blocks": 64,
+            "channel_mask": 16,
+            "high_channels": 32,
+            "high_kernel_size": 3,
+            "visualize_intermediate": true
         }
     },
 
@@ -26,19 +27,20 @@
         "adverse_params": {
             "fog_betas": [0.008, 0.015, 0.025, 0.040],
             "darkness_gammas": [1.3, 1.5, 2.0],
+            "atmospheric_light": [0.9, 0.9, 0.9],
             "enable_fog_only": true,
             "enable_darkness_only": true,
             "enable_compound": true,
             "depth_backend": "heuristic",
             "depth_device": "cuda",
-            "onnx_backend_path": "/workspace/depth_anything_small_fp16.onnx",
+            "onnx_backend_path": "",
             "max_depth_meters": 150.0
         },
         "images_dir": "/workspace/data/100k/100k",
         "detection_annotations_dir": "/workspace/data/bdd100k_labels/100k",
         "segmentation_annotations_dir": "",
         "drivable_annotations_dir": "/workspace/data/drivable_maps/labels",
-        "train_batch_size": 4,
+        "train_batch_size": 8,
         "train_shuffle": true,
         "train_num_workers": 4,
         "train_preprocessor_kwargs":{
@@ -64,7 +66,7 @@
                 "copy_paste_prob": 0.0
             }
         },
-        "val_batch_size": 8,
+        "val_batch_size": 16,
         "val_shuffle": false,
         "val_num_workers": 4,
         "val_preprocessor_kwargs":{
@@ -114,7 +116,7 @@
     },
 
     "trainer_kwargs":{
-        "output_dir": "mgdip-yolov5p-768-1280-Heuristic-resumed",
+        "output_dir": "DENET-yolov5p-768-1280-Heuristic-HeavyFog",
         "eval_visualize_outputs":true,
         "is_training": true,
         "first_val_epoch": 0,
@@ -127,13 +129,13 @@
         "checkpoint_idx": 2,
         "gradient_accumulation_steps": 4,
         "lr_scheduler_start_epoch": 1,
-        "checkpoint_path": "/workspace/Panoptic-Perception/mgdip-yolov5p-768-1280-Heuristic/checkpoints/ckpt_3/ckpt-3.pt",
+        "checkpoint_path": "/workspace/Panoptic-Perception/yolop-detection-768x1280-new-anchors/best_model.pt",
         "reload_optimizer": false,
         "reload_optimizer_with_initial_lr": false,
         "compute_ssim": true,
         "lambda_defog":0.6,
 
-        "wandb_project": "GDIP-YOLOP-detection-3",
+        "wandb_project": "DENET-YOLOP-detection",
         "wandb_enabled": true,
         "use_ema": false,
         "ema_decay": 0.9999,

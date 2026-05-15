@@ -2,6 +2,7 @@ import torch
 import torch.nn as nn
 import torchvision.ops as ops
 
+import math
 from typing import List, Tuple
 from functools import lru_cache
 
@@ -449,3 +450,531 @@ class DetectV8(nn.Module):
         return torch.cat([x1.unsqueeze(-1), y1.unsqueeze(-1),
                           x2.unsqueeze(-1), y2.unsqueeze(-1),
                           cls_scores], dim=-1)
+        
+        
+# ------ CLRNet Lane Detection Modules ------
+
+# adapted from: https://github.com/Turoad/CLRNet/blob/main/clrnet/models/heads/clr_head.py
+
+class FeatureResize(nn.Module):
+    def __init__(self, size=(10, 25)):
+        super(FeatureResize, self).__init__()
+        self.size = size
+
+    def forward(self, x):
+        x = torch.nn.functional.interpolate(x, self.size)
+        return x.flatten(2)
+
+class SegDecoder(nn.Module):
+    '''
+    Optionaly seg decoder
+    '''
+    def __init__(self,
+                 image_height,
+                 image_width,
+                 num_class,
+                 prior_feat_channels=64,
+                 refine_layers=3):
+        super().__init__()
+        self.dropout = nn.Dropout2d(0.1)
+        self.conv = nn.Conv2d(prior_feat_channels * refine_layers, num_class, 1)
+        self.image_height = image_height
+        self.image_width = image_width
+
+    def forward(self, x):
+        x = self.dropout(x)
+        x = self.conv(x)
+        x = torch.nn.functional.interpolate(x,
+                          size=[self.image_height, self.image_width],
+                          mode='bilinear',
+                          align_corners=False)
+        return x
+
+class LaneROIGather(nn.Module):
+    
+    def __init__(self, feat_channels, num_priors, refine_layers,
+                fc_hidden_dim, sample_points, mid_channels=48):
+        super(LaneROIGather, self).__init__()
+
+        self.in_channels = feat_channels
+        self.num_priors = num_priors
+        
+        self.f_query = nn.Sequential(
+            nn.Conv1d(in_channels=num_priors,
+                      out_channels=num_priors,
+                      kernel_size=1,
+                      stride=1,
+                      padding=0, groups=num_priors),
+            nn.ReLU()
+        )
+
+        self.f_key = ConvBlock(
+            in_channels=feat_channels,
+            out_channels=feat_channels,
+            kernel_size=1,
+            stride=1,
+            padding=0,
+            batch_norm=True,
+            activation_func="relu"
+        )
+
+        self.f_value = ConvBlock(
+            in_channels=feat_channels,
+            out_channels=feat_channels,
+            kernel_size=1,
+            stride=1,
+            padding=0,
+            batch_norm=False,
+            activation=False
+        )
+        
+        self.W = nn.Conv1d(in_channels=num_priors,
+                           out_channels=num_priors,
+                           kernel_size=1,
+                           stride=1,
+                           padding=0,
+                           groups=num_priors)
+
+        self.resize = FeatureResize()
+        nn.init.constant_(self.W.weight, 0)
+        nn.init.constant_(self.W.bias, 0)
+        
+        self.feature_resize = FeatureResize()
+
+        self.convs = nn.ModuleList()
+        self.catconv = nn.ModuleList()
+        
+        for i in range(refine_layers):
+            self.convs.append(
+                ConvBlock(
+                    in_channels=feat_channels,
+                    out_channels=mid_channels,
+                    kernel_size=(9, 1),
+                    padding=(4, 0)
+                )
+            )
+            
+            self.catconv.append(
+                ConvBlock(
+                    in_channels=mid_channels * (i + 1),
+                    out_channels=feat_channels,
+                    kernel_size=(9, 1),
+                    padding=(4, 0)
+                )
+            )
+            
+        self.fc = nn.Linear(sample_points * fc_hidden_dim, fc_hidden_dim)
+        self.fc_norm = nn.LayerNorm(fc_hidden_dim)
+        
+    def roi_feat(self, prior_features_stages, layer_idx) -> torch.Tensor:
+
+        feats = [] #accumulate features , [layer_1] [layer_1, layer_2] [layer_1, layer_2, layer_3]
+        for i, feature in enumerate(prior_features_stages):
+            feat_trans = self.convs[i](feature) #(192, 64, 36, 1) -> #(192, 48, 36, 1)
+            feats.append(feat_trans)
+        
+        cat_feat = torch.cat(feats, dim=1) 
+        cat_feat = self.catconv[layer_idx](cat_feat) #(192, 48, 36, 1) -> (192, 64, 36, 1)
+
+        return cat_feat
+        
+    def forward(self, prior_feature_stages:List[torch.Tensor], x:List[torch.Tensor], layer_index:int):
+        '''
+        Args:
+            prior_feature_stages: prior feature, shape: (Batch * num_priors, prior_feat_channel, sample_point, 1)
+            x: feature map
+            layer_index: currently on which layer to refine
+        Return: 
+            roi: prior features with gathered global information, shape: (Batch, num_priors, fc_hidden_dim)
+        '''
+        
+        prior_feature_stages = self.roi_feat(prior_feature_stages, layer_index)
+        batch_size = x.shape[0]
+        
+        # torch.Size([192, 64, 36, 1]) -> torch.Size([192, 2304])
+        prior_feature_stages = prior_feature_stages.contiguous().view(batch_size * self.num_priors, -1)
+
+        # torch.Size([192, 2304]) -> torch.Size([192, 64])
+        prior_feature_stages = torch.nn.functional.relu(self.fc_norm(self.fc(prior_feature_stages)))
+        prior_feature_stages = prior_feature_stages.view(batch_size, self.num_priors, -1) #torch.Size([1, 192, 64])
+
+        query = prior_feature_stages
+
+        # torch.Size([1, 64, 20, 20]) -> torch.Size([1, 64, 20, 20]) -> torch.Size([1, 64, 250])
+        value = self.resize(self.f_value(x))
+        query = self.f_query(query) # (bs, 192, 64)
+        key = self.resize(self.f_key(x)) #(bs, 64, 250)
+        
+        sim_map = torch.bmm(query, key) #(bs, 192, 250)
+        sim_map = (self.in_channels**-.5) * sim_map
+        
+        sim_map = torch.nn.functional.softmax(sim_map, dim=-1)
+        
+        context = torch.bmm(sim_map, value.permute(0, 2, 1)) #(bs, 192, 64)
+        context = self.W(context)
+        
+        prior_feature_stages = prior_feature_stages + torch.nn.functional.dropout(context, p=0.1, training=self.training)
+        return prior_feature_stages
+
+class LaneDetect(nn.Module):
+    def __init__(self, 
+                in_channels:List[int],
+                img_h: int = 768,
+                img_w: int = 1280,
+                num_points: int = 72,
+                num_priors: int = 192,
+                feat_channels: int = 64,
+                sample_points: int = 36,
+                refine_layers: int = 3,
+                num_fc: int = 2,
+                num_classes:int = 2,
+                num_categories: int = 4,
+                use_seg_decoder:bool = True):
+        super(LaneDetect, self).__init__()
+        
+        self.img_h = img_h
+        self.img_w = img_w
+        self.n_strips = num_points - 1
+        self.n_offsets = num_points
+        self.num_priors = num_priors
+        self.sample_points = sample_points
+        self.refine_layers = refine_layers
+        self.feat_channels = feat_channels
+        self.num_categories = num_categories
+        self.use_seg_decoder = use_seg_decoder
+        
+        # -- Fixed buffers --
+        self.register_buffer(
+            'sample_x_indexs',
+            (torch.linspace(0, 1, steps=sample_points) * self.n_strips).long()
+        ) # torch.Size([36])
+
+        self.register_buffer(
+            'prior_feat_ys',
+            torch.flip(1 - torch.linspace(0, 1, steps=sample_points), dims=[-1])
+        ) # self.prior_feat_ys torch.Size([36])
+        
+        self.register_buffer(
+            'prior_ys',
+            torch.linspace(1, 0, steps=self.n_offsets)
+        )        
+        
+        # -- Channel projection (FPN channels -> 64) --
+        self.channel_projections = nn.ModuleList([
+            nn.Sequential(
+                nn.Conv2d(ch, feat_channels, 1, bias=False),
+                nn.BatchNorm2d(feat_channels),
+                nn.SiLU(inplace=True)
+            ) for ch in in_channels
+        ])
+        
+        self._init_prior_embeddings()
+
+        init_priors, priors_on_featmap = self._generate_priors_from_embeddings()
+        self.register_buffer('priors', init_priors)
+        self.register_buffer('priors_on_featmap', priors_on_featmap)
+        
+        # -- ROIGather --
+        self.roi_gather = LaneROIGather(
+            feat_channels, num_priors, refine_layers,
+            fc_hidden_dim=feat_channels,
+            sample_points=sample_points
+        )
+        
+        self.seg_decoder = None
+        if self.use_seg_decoder:
+            self.seg_decoder = SegDecoder(
+                image_height=img_h,
+                image_width=img_w, 
+                num_class=num_classes,
+                prior_feat_channels=self.feat_channels,
+                refine_layers=self.refine_layers
+            )
+        
+        # -- Classification branch --
+        cls_modules = []
+        for _ in range(num_fc):
+            cls_modules.extend([
+                nn.Linear(feat_channels, feat_channels),
+                nn.LayerNorm(feat_channels),
+                nn.SiLU(inplace=True)
+            ])
+        self.cls_modules = nn.Sequential(*cls_modules)
+        self.cls_layers = nn.Linear(feat_channels, 2)
+        
+        # -- Regression branch --
+        reg_modules = []
+        for _ in range(num_fc):
+            reg_modules.extend([
+                nn.Linear(feat_channels, feat_channels),
+                nn.LayerNorm(feat_channels),
+                nn.SiLU(inplace=True)
+            ])
+        self.reg_modules = nn.Sequential(*reg_modules)
+        self.reg_layers = nn.Linear(feat_channels, self.n_offsets + 1 + 2 + 1)
+        
+        # -- Category branch (BDD100K addition) --
+        self.category_layers = nn.Linear(feat_channels, num_categories)
+        self._init_weights()
+
+    def _init_weights(self):
+        for m in self.cls_layers.parameters():
+            nn.init.normal_(m, mean=0., std=1e-3)
+        for m in self.reg_layers.parameters():
+            nn.init.normal_(m, mean=0., std=1e-3)
+        for m in self.category_layers.parameters():
+            nn.init.normal_(m, mean=0., std=1e-3)        
+        
+    def _init_prior_embeddings(self):
+        
+        # [start_y, start_x, theta] -> all normalize
+        self.prior_embeddings = nn.Embedding(self.num_priors, 3)
+        
+        bottom_priors_nums = self.num_priors * 3 // 4
+        left_priors_nums, _ = self.num_priors // 8, self.num_priors // 8
+
+        strip_size = 0.5 / (left_priors_nums // 2 - 1)
+        bottom_strip_size = 1 / (bottom_priors_nums // 4 + 1)
+        for i in range(left_priors_nums):
+            nn.init.constant_(self.prior_embeddings.weight[i, 0],
+                              (i // 2) * strip_size)
+            nn.init.constant_(self.prior_embeddings.weight[i, 1], 0.)
+            nn.init.constant_(self.prior_embeddings.weight[i, 2],
+                              0.16 if i % 2 == 0 else 0.32)
+
+        for i in range(left_priors_nums,
+                       left_priors_nums + bottom_priors_nums):
+            nn.init.constant_(self.prior_embeddings.weight[i, 0], 0.)
+            nn.init.constant_(self.prior_embeddings.weight[i, 1],
+                              ((i - left_priors_nums) // 4 + 1) *
+                              bottom_strip_size)
+            nn.init.constant_(self.prior_embeddings.weight[i, 2],
+                              0.2 * (i % 4 + 1))
+
+        for i in range(left_priors_nums + bottom_priors_nums, self.num_priors):
+            nn.init.constant_(
+                self.prior_embeddings.weight[i, 0],
+                ((i - left_priors_nums - bottom_priors_nums) // 2) *
+                strip_size)
+            nn.init.constant_(self.prior_embeddings.weight[i, 1], 1.)
+            nn.init.constant_(self.prior_embeddings.weight[i, 2],
+                              0.68 if i % 2 == 0 else 0.84)        
+                        
+    def _generate_priors_from_embeddings(self):
+        """
+        Convert 3-param embeddings into full prior vectors with 72 x-coordinates.
+        """
+        predictions = self.prior_embeddings.weight  # (192, 3)
+
+        priors = predictions.new_zeros(
+            (self.num_priors, 2 + 2 + 2 + self.n_offsets)
+        )
+        priors[:, 2:5] = predictions.clone()
+
+        start_x = priors[:, 3].unsqueeze(1).repeat(1, self.n_offsets)
+        start_y = priors[:, 2].unsqueeze(1).repeat(1, self.n_offsets)
+        theta = priors[:, 4].unsqueeze(1).repeat(1, self.n_offsets)
+        ys = self.prior_ys.repeat(self.num_priors, 1)
+
+        priors[:, 6:] = (
+            start_x * (self.img_w - 1) +
+            ((1 - ys - start_y) * self.img_h /
+            torch.tan(theta * torch.pi + 1e-5))
+        ) / (self.img_w - 1)
+
+        priors_on_featmap = priors[..., 6 + self.sample_x_indexs].clone()
+        return priors, priors_on_featmap
+    
+    def pool_prior_features(self, batch_features, num_priors, prior_xs):
+        """
+        Sample features along each anchor's x-positions using grid_sample.
+
+        Args:
+            batch_features: (B, feat_channels, H_feat, W_feat)
+            prior_xs: (B, num_priors, sample_points) normalized x-coords [0,1]
+
+        Returns:
+            (B * num_priors, feat_channels, sample_points, 1)
+        """
+        batch_size = batch_features.shape[0]
+        # (bs, 192, 36) -> (bs, 192, 36, 1)
+        prior_xs = prior_xs.view(batch_size, num_priors, -1, 1)
+        
+        # self.prior_feat_ys - torch.Size([36])
+        # prior_ys - torch.Size([bs, 192, 36, 1])
+        prior_ys = self.prior_feat_ys.repeat(batch_size * num_priors).view(
+            batch_size, num_priors, -1, 1
+        ) 
+
+        # Convert [0,1] -> [-1,1] for grid_sample
+        grid_xs = prior_xs * 2.0 - 1.0
+        grid_ys = prior_ys * 2.0 - 1.0
+        grid = torch.cat((grid_xs, grid_ys), dim=-1)  # (B, 192, 36, 2)
+
+        # Total: 192 × 36 = 6,912 bilinear lookups
+        # Each lookup returns 64 channel values
+        # Output: (bs, 64, 192, 36)
+            # For each of these 36 coordinates, grid_sample does bilinear interpolation on the 20x20 feature map and returns all 64 channels
+        feature = torch.nn.functional.grid_sample(
+            batch_features, grid, align_corners=True
+        ).permute(0, 2, 1, 3)
+
+        feature = feature.reshape(
+            batch_size * num_priors, self.feat_channels, self.sample_points, 1
+        )
+        return feature
+    
+    def forward(self, features: List[torch.Tensor], image_size):
+        """
+        Args:
+            features: list of 3 FPN feature maps [P3, P4, P5]
+                    shapes: [(B,256,H/8,W/8), (B,512,H/16,W/16), (B,512,H/32,W/32)]
+
+        Returns:
+            dict with 'predictions_lists' (per-stage) and 'category_logits'
+        """    
+        
+        if image_size and image_size != (self.img_h, self.img_w):
+            self.img_h = image_size[0]
+            self.img_w = image_size[1]
+            
+            if self.use_seg_decoder and self.training:
+                self.seg_decoder.image_height = self.img_h
+                self.seg_decoder.image_width = self.img_w
+
+        # Project all FPN features to feat_channels (64)
+        batch_features = []
+        for i, feat in enumerate(features):
+            batch_features.append(self.channel_projections[i](feat))
+            
+        # Process coarse -> fine (P5 -> P4 -> P3)
+        batch_features.reverse()
+        batch_size = batch_features[-1].shape[0]
+        
+        if self.training:
+            # Priors: torch.Size([192, 78]) Priors_on_featmap: torch.Size([192, 36])
+            self.priors, self.priors_on_featmap = self._generate_priors_from_embeddings()
+
+        priors = self.priors.repeat(batch_size, 1, 1) #torch.Size([bs, 192, 78])
+        priors_on_featmap = self.priors_on_featmap.repeat(batch_size, 1, 1) #torch.Size([bs, 192, 36])
+
+        predictions_lists = []
+        prior_features_stages = [] # iterative refine
+
+        for stage in range(self.refine_layers):
+            num_priors = priors_on_featmap.shape[1]
+            prior_xs = torch.flip(priors_on_featmap, dims=[2])
+
+            batch_prior_features = self.pool_prior_features(
+                batch_features[stage], num_priors, prior_xs
+            ) 
+
+            #List[(bs, 64, 192, 36)]
+            prior_features_stages.append(batch_prior_features)
+
+            # # ROIGather: cross-attention
+            fc_features = self.roi_gather(
+                prior_features_stages, batch_features[stage], stage
+            ) # (bs, 192, 64)
+            
+            # (bs * 192, 64)
+            fc_features = fc_features.view(num_priors, batch_size, -1).reshape(batch_size * num_priors, self.feat_channels)
+            
+            cls_features = fc_features.clone()
+            reg_features = fc_features.clone()
+            for cls_layer in self.cls_modules:
+                cls_features = cls_layer(cls_features)
+            for reg_layer in self.reg_modules:
+                reg_features = reg_layer(reg_features)
+                
+            cls_logits = self.cls_layers(cls_features) ## (bs * 192, 2)
+            reg = self.reg_layers(reg_features) # (bs * 192, 76)
+            
+            cls_logits = cls_logits.reshape(
+                batch_size, -1, cls_logits.shape[-1]
+            ) # (bs , 192, 2)
+            reg = reg.reshape(batch_size, -1, reg.shape[-1]) # (bs , 192, 76)
+            
+            predictions = priors.clone() #(bs, 192, 78)
+            predictions[:, :, :2] = cls_logits
+            
+            predictions[:, :, 2:5] += reg[:, :, :3] # # also reg theta angle here
+            predictions[:, :, 5] = reg[:, :, 3] # length
+            
+            def trans_tensor(t):
+                return t.unsqueeze(2).clone().repeat(1, 1, self.n_offsets)
+            
+            predictions[..., 6:] = (
+                trans_tensor(predictions[..., 3]) * (self.img_w - 1) +
+                ((1 - self.prior_ys.repeat(batch_size, num_priors, 1) -
+                  trans_tensor(predictions[..., 2])) * self.img_h /
+                 torch.tan(trans_tensor(predictions[..., 4]) * math.pi + 1e-5))) / (self.img_w - 1)
+
+            prediction_lines = predictions.clone()
+            predictions[..., 6:] += reg[..., 4:]
+
+            predictions_lists.append(predictions) #(bs, 192, 78)
+
+            if stage != self.refine_layers - 1:
+                priors = prediction_lines.detach().clone()
+                priors_on_featmap = priors[..., 6 + self.sample_x_indexs]
+
+        seg_logits = None
+        if self.use_seg_decoder and self.training:
+            target_size = batch_features[-1].shape[2:]
+            seg_features = torch.cat([
+                torch.nn.functional.interpolate(feat, size=target_size,
+                                                mode='bilinear', align_corners=False)
+                for feat in batch_features
+            ], dim=1)
+            seg_logits = self.seg_decoder(seg_features)
+
+        return predictions_lists, seg_logits
+
+    def activation(self, output:List[torch.Tensor]):
+        """
+        Apply activations to raw lane detection logits (pre-NMS).
+        output: List[(bs, 192, 78)] per refinement stage
+        Returns: (bs, 192, 78) from final stage, with softmax on cls.
+
+        Note: x-offset and length scaling happens in lane_nms / predictions_to_pred,
+        matching the official CLRNet get_lanes flow.
+        """
+        predictions = output[-1]                                       # (bs, 192, 78) final stage
+        activated = predictions.clone()
+        activated[:, :, :2] = torch.softmax(predictions[:, :, :2], dim=-1)  # bg/fg probs
+        return activated
+
+    def predictions_to_pred(self, predictions):
+        """
+        Convert NMS-surviving predictions to pixel-space lane coordinates.
+        predictions: (K, 78) — [bg, fg, start_y, start_x, theta, length, x0..x71]
+                     cls already softmaxed, geometry in normalized space.
+        Returns: list of (valid_points, 2) arrays in pixel coords [(x, y), ...].
+        """
+        lanes = []
+        for lane in predictions:
+            lane_xs = lane[6:]  # (72,) normalized x
+            start_y = lane[2]
+            length = int(torch.round(lane[5] * self.n_strips).item())
+
+            if length == 0:
+                continue
+
+            # start index in the 72-point grid
+            start = min(max(0, int(torch.round(start_y * self.n_strips).item())),
+                        self.n_strips)
+            end = min(start + length + 1, self.n_offsets)
+
+            xs_px = lane_xs[start:end] * (self.img_w - 1)
+            ys_px = self.prior_ys[start:end] * (self.img_h - 1)
+
+            # filter invalid points
+            valid = xs_px >= 0
+            if valid.sum() < 2:
+                continue
+
+            points = torch.stack([xs_px[valid], ys_px[valid]], dim=1)  # (P, 2)
+            lanes.append(points)
+
+        return lanes

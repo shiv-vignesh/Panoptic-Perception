@@ -10,7 +10,7 @@ import math
 
 
 def random_perspective(
-    img, seg, drivable, labels,
+    img, seg, drivable, labels, lane_polys=None,
     degrees=10, translate=0.1, scale=0.1, shear=10
 ):
     h, w = img.shape[:2]
@@ -82,7 +82,29 @@ def random_perspective(
 
         labels = np.array(new_labels) if new_labels else np.zeros((0,5))
 
-    return img, seg, drivable, labels
+    # --- WARP LANE POLYLINES ---
+    if lane_polys is not None:
+        new_lane_polys = []
+        for poly in lane_polys:
+            pts = poly["points"]
+            if len(pts) < 2:
+                continue
+            ones = np.ones((pts.shape[0], 1))
+            pts_homo = np.hstack([pts, ones])  # (N, 3)
+            pts_t = (M @ pts_homo.T).T[:, :2]  # (N, 2)
+
+            # Clip to image bounds
+            pts_t[:, 0] = np.clip(pts_t[:, 0], 0, w - 1)
+            pts_t[:, 1] = np.clip(pts_t[:, 1], 0, h - 1)
+
+            if len(pts_t) >= 2:
+                new_lane_polys.append({
+                    "points": pts_t.astype(np.float32),
+                    "category": poly["category"]
+                })
+        lane_polys = new_lane_polys
+
+    return img, seg, drivable, labels, lane_polys
 
 def augment_hsv(img, hgain=0.5, sgain=0.5, vgain=0.5):
     """
@@ -114,7 +136,8 @@ def augment_hsv(img, hgain=0.5, sgain=0.5, vgain=0.5):
     # Convert back to BGR and update in-place
     cv2.cvtColor(img_hsv, cv2.COLOR_HSV2BGR, dst=img)
 
-def flip_horizontal(img, seg, drivable, labels):
+def flip_horizontal(img, seg, drivable, labels, lane_polys=None):
+    w = img.shape[1]
     img = np.fliplr(img).copy()
     if seg is not None:
         seg = np.fliplr(seg).copy()
@@ -122,9 +145,15 @@ def flip_horizontal(img, seg, drivable, labels):
         drivable = np.fliplr(drivable).copy()
     if len(labels):
         labels[:,1] = 1 - labels[:,1]
-    return img, seg, drivable, labels
 
-def letterbox_with_masks(img, seg, drivable, labels, new_shape=(640,640), color=(114,114,114)):
+    if lane_polys is not None:
+        for poly in lane_polys:
+            poly["points"][:, 0] = w - 1 - poly["points"][:, 0]
+
+    return img, seg, drivable, labels, lane_polys
+
+def letterbox_with_masks(img, seg, drivable, labels, lane_polys=None,
+                         new_shape=(640,640), color=(114,114,114)):
     """
     Letterbox resize for image, segmentation mask, drivable mask, and bounding boxes.
     Maintains aspect ratio by padding.
@@ -193,7 +222,13 @@ def letterbox_with_masks(img, seg, drivable, labels, new_shape=(640,640), color=
         labels[:,3] /= new_w  # w
         labels[:,4] /= new_h  # h
 
-    return img, seg, drivable, labels
+    # Update lane polylines (pixel coords)
+    if lane_polys is not None:
+        for poly in lane_polys:
+            poly["points"][:, 0] = poly["points"][:, 0] * r + left
+            poly["points"][:, 1] = poly["points"][:, 1] * r + top
+
+    return img, seg, drivable, labels, lane_polys
 
 def apply_salt_pepper(img, salt_prob=0.01, pepper_prob=0.01):
     """
@@ -230,7 +265,8 @@ def apply_salt_pepper(img, salt_prob=0.01, pepper_prob=0.01):
 
 
 def mixup_augmentation(img1, labels1, img2, labels2, seg1=None, seg2=None,
-                       drivable1=None, drivable2=None, alpha=0.5):
+                       drivable1=None, drivable2=None, alpha=0.5,
+                       lane_polys1=None, lane_polys2=None):
     """
     MixUp augmentation: Blend two images and concatenate their labels.
 
@@ -271,7 +307,16 @@ def mixup_augmentation(img1, labels1, img2, labels2, seg1=None, seg2=None,
     else:
         mixed_drivable = drivable1 if drivable1 is not None else drivable2
 
-    return mixed_img, mixed_labels, mixed_seg, mixed_drivable
+    # Concatenate lane polys from both images (both are visible in blend)
+    mixed_lane_polys = None
+    if lane_polys1 is not None or lane_polys2 is not None:
+        mixed_lane_polys = []
+        if lane_polys1 is not None:
+            mixed_lane_polys.extend(lane_polys1)
+        if lane_polys2 is not None:
+            mixed_lane_polys.extend(lane_polys2)
+
+    return mixed_img, mixed_labels, mixed_seg, mixed_drivable, mixed_lane_polys
 
 
 def copy_paste_instances(img, labels, source_img, source_labels, target_classes=[1, 3], max_instances=3):
@@ -358,13 +403,14 @@ def copy_paste_instances(img, labels, source_img, source_labels, target_classes=
     return img, np.array(labels_list) if labels_list else np.zeros((0, 5))
 
 
-def apply_augmentations(img, seg, drivable, labels, params, img_size=(640, 640)):
+def apply_augmentations(img, seg, drivable, labels, params, img_size=(640, 640),
+                        lane_polys=None):
 
     # -----------------------------------------
     # 1) GEOMETRIC AUG (on original size)
     # -----------------------------------------
-    img, seg, drivable, labels = random_perspective(
-        img, seg, drivable, labels,
+    img, seg, drivable, labels, lane_polys = random_perspective(
+        img, seg, drivable, labels, lane_polys=lane_polys,
         degrees=params.get("degrees", 10),
         translate=params.get("translate", 0.1),
         scale=params.get("scale", 0.1),
@@ -388,12 +434,15 @@ def apply_augmentations(img, seg, drivable, labels, params, img_size=(640, 640))
     # 4) HORIZONTAL FLIP
     # -----------------------------------------
     if random.random() < params.get("flip_prob", 0.5):
-        img, seg, drivable, labels = flip_horizontal(img, seg, drivable, labels)
+        img, seg, drivable, labels, lane_polys = flip_horizontal(
+            img, seg, drivable, labels, lane_polys=lane_polys
+        )
 
     # -----------------------------------------
     # 5) LETTERBOX RESIZE (after augmentations)
     # -----------------------------------------
-    # img_size = params.get("img_size", (640, 640))
-    img, seg, drivable, labels = letterbox_with_masks(img, seg, drivable, labels, new_shape=img_size)
+    img, seg, drivable, labels, lane_polys = letterbox_with_masks(
+        img, seg, drivable, labels, lane_polys=lane_polys, new_shape=img_size
+    )
 
-    return img, seg, drivable, labels
+    return img, seg, drivable, labels, lane_polys

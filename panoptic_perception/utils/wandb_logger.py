@@ -6,6 +6,8 @@ import wandb
 from typing import Dict, Any, Optional
 import torch
 
+import yaml, json
+import tempfile, os
 
 class WandBLogger:
     """Weights & Biases logger for experiment tracking."""
@@ -41,6 +43,14 @@ class WandBLogger:
                 print(f"WandB initialization failed: {e}")
                 print(f"  Continuing without WandB logging")
                 self.enabled = False
+
+    def update_config(self, config: Dict[str, Any]):
+        if not self.enabled:
+            return
+        try:
+            wandb.config.update(config, allow_val_change=True)
+        except Exception as e:
+            print(f"WandB config update failed: {e}")
 
     def log_metrics(self, metrics: Dict[str, Any], step: Optional[int] = None, commit: bool = True):
         """
@@ -179,3 +189,32 @@ class WandBLogger:
             wandb.finish()
         except Exception as e:
             print(f"WandB finish failed: {e}")
+
+    def log_config(self, config:dict, filename:str = "config.yaml"):
+        
+        if not self.enabled:
+            return
+        
+        try:
+            root, extension = os.path.splitext(filename)
+            with tempfile.NamedTemporaryFile(mode="w", suffix=extension, delete=False) as f:
+                if extension == "yaml":
+                    yaml.dump(config, f, default_flow_style=False, sort_keys=False)                
+                elif filename.endswith(".json"):
+                    json.dump(config, f)
+                    
+                tmp_path = f.name
+                
+            artifact = wandb.Artifact(
+                name=f"config-{self.run.id}",
+                type="config"
+            )
+            
+            artifact.add_file(tmp_path, name=filename)
+            wandb.log_artifact(artifact)
+            os.unlink(tmp_path)
+        
+        except Exception as e:
+            print(f"WandB config logging failed: {e}")
+                
+        

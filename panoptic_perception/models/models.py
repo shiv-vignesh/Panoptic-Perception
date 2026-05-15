@@ -1,5 +1,5 @@
 import os, ast
-from typing import Tuple, Optional, Union
+from typing import Tuple, Optional, Union, Protocol, runtime_checkable
 
 import torch
 import torch.nn as nn
@@ -7,12 +7,15 @@ import torch.nn as nn
 from torchmetrics.image import StructuralSimilarityIndexMeasure
 
 from panoptic_perception.models.common import (
-    ConvBlock, Focus, BottleneckCSP, SPP, Upsample, Detect, C2F, SPPF, DetectV8
+    ConvBlock, Focus, BottleneckCSP, SPP, Upsample, Detect, C2F, SPPF, DetectV8, LaneDetect
 )
 from panoptic_perception.models.utils import parse_model_config, initialize_weights, PanopticModelOutputs
 from panoptic_perception.models.gdip import GDIP, MultiLevelGDIP, build_vision_encoder
+from panoptic_perception.models.denet import DENet
 from panoptic_perception.utils.detection_utils import DetectionLossCalculator
+from panoptic_perception.utils.lane_utils import LaneDetectionLossCalculator
 from panoptic_perception.utils.segmentation_utils import SegmentationLossCalculator
+from panoptic_perception.models.model_factory import ModelFactory
 
 def create_modules(module_defs: list,
                    segmentation_head_idx: int = -1,
@@ -75,7 +78,10 @@ def create_modules(module_defs: list,
 
         # -- BOTTLENECKCSP -----------------------------------------------------
         elif mtype == "BottleneckCSP":
-            in_ch = output_channels[-1] if len(output_channels) > 0 else int(module_def["in_channels"])
+            if route[0] != -1:
+                in_ch = int(module_def["in_channels"])
+            else:
+                in_ch = output_channels[-1] if len(output_channels) > 0 else int(module_def["in_channels"])
             out_ch = int(module_def["out_channels"])
             n = int(module_def["num_bottlenecks"])
             residual = str(module_def.get("residual", "True")) == "True"
@@ -135,6 +141,10 @@ def create_modules(module_defs: list,
             channels = [output_channels[r] if r != -1 else output_channels[-1] for r in route]
 
             module = Detect(anchors, num_classes, channels)
+
+            #placeholder - adding output channels to keep index aligned,
+            # to ensure downstream layer will use the right channel value
+            output_channels.append(0)
         
         elif mtype == "DetectV8":
             num_classes = int(module_def.get("num_classes"))
@@ -142,6 +152,33 @@ def create_modules(module_defs: list,
             reg_max = int(module_def.get("reg_max", 16))
 
             module = DetectV8(num_classes, channels, reg_max=reg_max)
+
+            #placeholder - adding output channels to keep index aligned,
+            # to ensure downstream layer will use the right channel value
+            output_channels.append(0)            
+            
+        elif mtype == "LaneDetect":
+
+            num_points = int(module_def.get("num_points", 72))
+            num_priors = int(module_def.get("num_priors", 192))
+            feat_channels = int(module_def.get("feat_channels", 64))
+            sample_points = int(module_def.get("sample_points", 36))
+            refine_layers = int(module_def.get("refine_layers", 3))
+
+            channels = [output_channels[r] if r != -1 else output_channels[-1] for r in route]
+            
+            assert all([ch > 0 for ch in channels]), \
+                f'LaneDetect: invalid channel dims {channels} from route={route}. ' \
+                f'A routed layer may not have appended to output_channels (len={len(output_channels)})'
+
+            module = LaneDetect(
+                in_channels=channels,
+                num_points=num_points,
+                num_priors=num_priors,
+                feat_channels=feat_channels,
+                sample_points=sample_points,
+                refine_layers=refine_layers
+            )
 
         module_list.append(module)
         routes.append(route)
@@ -156,21 +193,174 @@ def create_modules(module_defs: list,
 
     return nn.ModuleList(module_list), routes, module_names, _cache_layer_idx
 
-class YOLOP(nn.Module):
-    def __init__(self, cfg: str, img_size: int = 416, num_classes: int = 80,
-                 loss_weights: dict = None):
+class BaseTaskModel(nn.Module):
+    def __init__(self):
+        super(BaseTaskModel, self).__init__()
+        
+        self.module_list : nn.ModuleList = None
+        self._frozen_layer_indices: list[int] = []
+
+        self.detection_head_idx : int = -1
+        self.segmentation_head_idx : int = -1
+        self.lane_segmentation_head_idx : int = -1
+
+    def _freeze_bn(self, module):
+        """
+        Freeze BatchNorm layers in frozen modules by setting them to eval mode
+        This prevents running_mean and running_var from updating        
+        """
+        for child in module.modules():
+            if isinstance(child, (nn.BatchNorm2d, nn.BatchNorm1d, nn.SyncBatchNorm)):
+                child.eval()
+                # Also ensure BN params don't get gradients
+                child.weight.requires_grad = False
+                child.bias.requires_grad = False
+
+
+    @staticmethod
+    def _freeze_bn_hook(module, input):
+        for idx in module._frozen_layer_indices:
+            for child in module.module_list[idx].modules():
+                if isinstance(child, (nn.BatchNorm2d, nn.BatchNorm1d, nn.SyncBatchNorm)):
+                    child.eval()
+
+    def get_param_groups(self, optimizer_kwargs:dict=None):
+        
+        groups = optimizer_kwargs.get("groups", {})
+        dcn_lr_mult = optimizer_kwargs.get("dcn_lr_mult", 0.1)  # DCN offset LR = base_lr * 0.1
+
+        return self.configure_param_groups(groups, dcn_lr_mult)
+
+    def configure_param_groups(self, groups:dict, dcn_lr_mult:float=0.1):
+        """
+        Configure parameter groups for training with selective freezing.
+        - Grouping done based on the layer_index start and end
+        
+        For frozen layers:
+        - Sets requires_grad = False for all parameters
+        - Sets BatchNorm layers to eval mode to prevent running stats from updating
+
+        For trainable layers:
+        - Sets requires_grad = True
+        - Returns parameters in param_groups for optimizer
+        """
+        
+        if not groups:
+            return [{
+                "params": list(self.parameters()),
+                "name": self.__class__.__name__,
+                "lr_scale":1.0
+            }]
+        
+        param_groups, frozen_layers, dcn_offset_params, dcn_conv_params = self._build_param_groups(groups)        
+
+        # Add DCN parameter groups with lower learning rates
+        if dcn_offset_params:
+            param_groups.append({
+                "params": dcn_offset_params,
+                "name": "dcn_offset",
+                "lr_scale": dcn_lr_mult  # e.g., 0.1 = 10x lower LR
+            })
+
+        if dcn_conv_params:
+            param_groups.append({
+                "params": dcn_conv_params,
+                "name": "dcn_conv",
+                "lr_scale": dcn_lr_mult * 5  # e.g., 0.5 = 2x lower LR
+            })
+            
+        if frozen_layers:        
+            for idx in frozen_layers:
+                self._freeze_bn(self.module_list[idx])
+            
+            self._frozen_layer_indices = frozen_layers
+            self.register_forward_pre_hook(self._freeze_bn_hook)
+        
+        return param_groups
+
+    def _build_param_groups(self, groups:dict):
+        
+        param_groups = []
+        frozen_layers = []
+
+        # Collect DCN parameters separately
+        dcn_offset_params = []
+        dcn_conv_params = []        
+
+        for group_name in groups:
+            group = groups[group_name]["group"]
+            trainable = groups[group_name]["trainable"]
+            lr_scale = groups[group_name].get("lr_scale", 1.0)
+            
+            layer_indices = self._get_layer_indices(group)
+
+            regular_params = []
+            for idx in layer_indices:                
+                
+                for name, param in self.module_list[idx].named_parameters():
+                    if 'offset_conv' in name:
+                        dcn_offset_params.append(param)
+                    elif 'deform_conv' in name:
+                        dcn_conv_params.append(param)
+                    else:
+                        regular_params.append(param)
+
+                    param.requires_grad = trainable
+
+                if not trainable:
+                    frozen_layers.append(idx)
+
+            if regular_params:
+                param_groups.append({"params": regular_params, "name": group_name, "lr_scale": lr_scale, "trainable": trainable})
+        
+        return param_groups, frozen_layers, dcn_offset_params, dcn_conv_params
+    
+    def _get_layer_indices(self, group:list):
+
+        last_layer_index = len(self.module_list) - 1
+        layer_indices = []
+
+        if len(group) == 2:
+            start_idx, end_idx = group
+            if start_idx > last_layer_index and end_idx > last_layer_index:
+                return layer_indices
+            layer_indices = list(range(start_idx, end_idx+1))
+
+        elif len(group) == 1:
+            idx = group[0]
+            if idx > last_layer_index:
+                return layer_indices
+            layer_indices = [idx]
+
+        return layer_indices
+    
+    def forward(self, x, targets=None):
+        raise NotImplementedError(f"{self.__class__.__name__} forward not callable")
+
+    def get_active_tasks(self):
+
+        tasks = []
+        if self.detection_head_idx != -1:
+            tasks.append("Detection, ")
+        if self.segmentation_head_idx != -1:
+            tasks.append("Drivable Segmentation, ")
+        if self.lane_segmentation_head_idx != -1:
+            tasks.append("Lane Segmentation")            
+
+        tasks = 'Tasks: '.join(tasks)    
+
+@ModelFactory.register_task_model("yolop")
+class YOLOP(BaseTaskModel):
+    def __init__(self, cfg: str, loss_weights: dict = None):
         super(YOLOP, self).__init__()
 
         module_defs = parse_model_config(cfg)
-
-        #TODO, unused vars: remove
-        self.img_size = img_size
-        self.num_classes = num_classes
 
         # Multi-task loss weights (detection prioritized by default)
         self.loss_weights = loss_weights or {
             "detection": 1.0,
             "drivable_segmentation": 1.0,
+            "lane_detection":1.0,
             "lane_segmentation": 0.0
         }
 
@@ -181,7 +371,7 @@ class YOLOP(nn.Module):
             self.lane_segmentation_head_idx = int(module_defs[0].get('lane_segmentation_head_idx', -1))
             self.detection_head_idx = int(module_defs[0].get('detection_head_idx', -1))
 
-        self.in_channels = self.module_defs[0].get('in_channels', 3)
+        self.in_channels = int(self.module_defs[0].get('in_channels', 3))
         self.module_list, self.routes, self.module_names, self._cache_layer_idx = create_modules(
             self.module_defs,
             segmentation_head_idx=self.segmentation_head_idx,
@@ -195,13 +385,13 @@ class YOLOP(nn.Module):
         
         cache = {} # Cache for layer outputs
         _, _, height, width = x.shape
-        
+
         model_outputs = PanopticModelOutputs()
 
         for i, (module, route) in enumerate(zip(self.module_list, self.routes)):
             if route == -1:
                 x = module(x)  # single previous layer route
-            
+
             elif len(route) == 1:
                 # single previous layer route
                 if route[0] == -1:
@@ -226,7 +416,7 @@ class YOLOP(nn.Module):
                         assert x.shape == cache[r].shape, f"Residual Add Expects Tensors of Same Size, Found: {x.shape} and {cache[r].shape}"
 
                         x = x + cache[r]
-                
+
                 elif self.module_names[i] == "Detect":
                     inputs = []
                     for r in route:
@@ -234,16 +424,32 @@ class YOLOP(nn.Module):
                             continue
                         assert r in cache, f"Output for layer {r} not found in cache."
                         inputs.append(cache[r])
-                    
+
                     detection_outputs  = module(inputs, image_size=(height, width))
                     model_outputs.detection_logits = detection_outputs
-                    
+
                     if not self.training:
                         model_outputs.detection_predictions = module.activation(detection_outputs)
 
                     # for detection in detection_outputs:
                     #     print(f'Layer: {i} - Module Name: {self.module_names[i]} - prediction shape: {detection.shape}')
                 
+                elif self.module_names[i] == "LaneDetect":
+                    inputs = []
+                    for r in route:
+                        if r == -1:
+                            continue
+                        assert r in cache, f"Output for layer {r} not found in cache."
+                        inputs.append(cache[r])
+    
+                    #(bs, 192, 78)
+                    lane_detection_outputs, seg_logits = module(inputs, image_size=(height, width))
+                    model_outputs.lane_detection_logits = lane_detection_outputs
+                    model_outputs.lane_seg_logits = seg_logits
+
+                    if not self.training:
+                        model_outputs.lane_detection_predictions = module.activation(lane_detection_outputs)
+
                 else: #TODO, future modules
                     pass # concatenate multiple previous layers
 
@@ -289,7 +495,29 @@ class YOLOP(nn.Module):
 
                 # Apply multi-task loss weight
                 model_outputs.detection_loss = det_loss * self.loss_weights.get("detection", 1.0)
-                # print(f'Detection Loss: {det_loss}')
+
+            if model_outputs.lane_detection_logits is not None and targets["lanes_detections"] is not None:
+                output_name = "lanes_detections"
+                assert output_name in targets, f"Target for {output_name} not provided."
+
+                lane_det_loss, lane_det_loss_items = LaneDetectionLossCalculator.compute_lane_det_loss(
+                    model_outputs.lane_detection_logits,
+                    targets["lanes_detections"],
+                    img_w=width,
+                    img_h=height
+                )
+                
+                model_outputs.lane_detection_loss = lane_det_loss * self.loss_weights.get("lane_detection", 1.0)
+                model_outputs.lane_detection_loss_items = lane_det_loss_items                
+
+                if model_outputs.lane_seg_logits is not None and targets["lane_seg_masks"] is not None:
+                    seg_loss = torch.nn.functional.nll_loss(
+                        torch.nn.functional.log_softmax(model_outputs.lane_seg_logits, dim=1),
+                        targets["lane_seg_masks"].long()
+                    )
+
+                    model_outputs.lane_detection_loss += seg_loss * self.loss_weights.get("lane_seg", 1.0)
+                    model_outputs.lane_detection_loss_items["lane_seg_loss"] = seg_loss.item()
 
             if model_outputs.drivable_segmentation_logits is not None and targets["drivable_area_seg"] is not None:
                 output_name = "drivable_area_seg"
@@ -316,7 +544,8 @@ class YOLOP(nn.Module):
 
         return model_outputs
 
-class YOLOv8P(nn.Module):
+@ModelFactory.register_task_model("yolov8p")
+class YOLOv8P(BaseTaskModel):
     def __init__(self, cfg:str, loss_weights: dict = None):
         super(YOLOv8P, self).__init__()
         
@@ -324,6 +553,7 @@ class YOLOv8P(nn.Module):
         # Multi-task loss weights (detection prioritized by default)
         self.loss_weights = loss_weights or {
             "detection": 1.0,
+            "lane_detection":1.0,
             "drivable_segmentation": 1.0,
             "lane_segmentation": 0.0
         }
@@ -334,8 +564,7 @@ class YOLOv8P(nn.Module):
             self.detection_head_idx = int(module_defs[0].get('detection_head_idx', -1))
             self.segmentation_head_idx = int(module_defs[0].get('segmentation_head_idx', -1))
             self.lane_segmentation_head_idx = int(module_defs[0].get('lane_segmentation_head_idx', -1))
-            
-            
+
         self.in_channels = int(self.module_defs[0].get("in_channels", 3))
         self.module_list, self.routes, self.module_names, self._cache_layer_idx = create_modules(
             self.module_defs,
@@ -423,9 +652,25 @@ class YOLOv8P(nn.Module):
                                 model_outputs.strides
                             ) #torch.Tensor (B, 8400, 4+C)
                 
+                elif self.module_names[i] == "LaneDetect":
+                    inputs = []
+                    for r in route:
+                        if r == -1:
+                            continue
+                        assert r in cache, f"Output for layer {r} not found in cache."
+                        inputs.append(cache[r])
+    
+                    #(bs, 192, 78)
+                    lane_detection_outputs, seg_logits = module(inputs, image_size=(height, width))
+                    model_outputs.lane_detection_logits = lane_detection_outputs
+                    model_outputs.lane_seg_logits = seg_logits
+
+                    if not self.training:
+                        model_outputs.lane_detection_predictions = module.activation(lane_detection_outputs)
+
                 else: #TODO, future modules
-                    pass # concatenate multiple previous layers                
-            
+                    pass # concatenate multiple previous layers
+
             # Capture segmentation outputs
             if self.module_names[i] == "DrivableAreaSegmentation":
                 model_outputs.drivable_segmentation_logits = x
@@ -474,6 +719,29 @@ class YOLOv8P(nn.Module):
                 model_outputs.detection_loss = det_loss * self.loss_weights.get("detection", 1.0)
                 # print(f'Detection Loss: {det_loss}')
 
+            if model_outputs.lane_detection_logits is not None and targets.get("lanes_detections") is not None:
+                output_name = "lanes_detections"
+                assert output_name in targets, f"Target for {output_name} not provided."
+
+                lane_det_loss, lane_det_loss_items = LaneDetectionLossCalculator.compute_lane_det_loss(
+                    model_outputs.lane_detection_logits,
+                    targets["lanes_detections"],
+                    img_w=width,
+                    img_h=height
+                )
+
+                model_outputs.lane_detection_loss = lane_det_loss * self.loss_weights.get("lane_detection", 1.0)
+                model_outputs.lane_detection_loss_items = lane_det_loss_items
+
+                if model_outputs.lane_seg_logits is not None and targets["lane_seg_masks"] is not None:
+                    seg_loss = torch.nn.functional.nll_loss(
+                        torch.nn.functional.log_softmax(model_outputs.lane_seg_logits, dim=1),
+                        targets["lane_seg_masks"].long()
+                    )
+
+                    model_outputs.lane_detection_loss += seg_loss * self.loss_weights.get("lane_seg", 1.0)
+                    model_outputs.lane_detection_loss_items["lane_seg_loss"] = seg_loss.item()
+
             if model_outputs.drivable_segmentation_logits is not None and targets["drivable_area_seg"] is not None:
                 output_name = "drivable_area_seg"
                 assert output_name in targets, f"Target for {output_name} not provided."
@@ -484,7 +752,7 @@ class YOLOv8P(nn.Module):
                 # Apply multi-task loss weight
                 model_outputs.drivable_segmentation_loss = drivable_seg_loss * self.loss_weights.get("drivable_segmentation", 0.2)
                 # print(f'Drivable Area Segmentation Loss: {drivable_seg_loss}')
-                
+
             if model_outputs.lane_segmentation_logits is not None:
                 output_name = "lane_seg"
                 assert output_name in targets, f"Target for {output_name} not provided."
@@ -499,7 +767,50 @@ class YOLOv8P(nn.Module):
 
         return model_outputs
 
-class GDIPYolo(nn.Module):
+class BaseEnhancementModel(nn.Module):
+    def __init__(self):
+        super(BaseEnhancementModel, self).__init__()
+
+        self.task_network : BaseTaskModel = None
+        self.enhanced_image : torch.Tensor = None
+    
+    def _get_enhancement_param_groups(self, optimizer_kwargs:dict) -> list[dict]:
+        raise NotImplementedError
+
+    def _get_loggable_artifacts(self):
+        """Each subclass overrides this."""
+        raise NotImplementedError
+
+    def get_param_groups(self, optimizer_kwargs:dict) -> list[dict]:
+        groups = optimizer_kwargs.get("groups", {})
+        dcn_lr_mult = optimizer_kwargs.get("dcn_lr_mult", 0.1)  # DCN offset LR = base_lr * 0.1
+
+        param_groups = self.task_network.configure_param_groups(groups, dcn_lr_mult)
+        param_groups.extend(self._get_enhancement_param_groups(optimizer_kwargs))
+
+        return param_groups
+
+    def remap_checkpoint_keys(self, state_dict: dict) -> dict:
+        sample_key = next(iter(state_dict), "")
+        if not sample_key.startswith("task_network."):
+            return {f"task_network.{k}": v for k, v in state_dict.items()}
+        return state_dict
+    
+    def get_active_tasks(self):
+        
+        tasks = []
+        if self.task_network.detection_head_idx != -1:
+            tasks.append("Detection, ")
+        if self.task_network.segmentation_head_idx != -1:
+            tasks.append("Drivable Segmentation, ")
+        if self.task_network.lane_segmentation_head_idx != -1:
+            tasks.append("Lane Segmentation")
+
+        tasks = 'Tasks: '.join(tasks)    
+        return tasks
+
+@ModelFactory.register_enhancement("gdip-yolo")
+class GDIPYolo(BaseEnhancementModel):
     def __init__(self, task_network:Union[YOLOP, YOLOv8P], gdip_kwargs:dict):
         super(GDIPYolo, self).__init__()
 
@@ -540,10 +851,11 @@ class GDIPYolo(nn.Module):
             )
             
         self.vis_intermediate = gdip_kwargs.get("visualize_intermediate", True)
-        
+
         self.ssim = StructuralSimilarityIndexMeasure(data_range=1.0)
             
-    def forward(self, x:torch.Tensor, targets=None, store_enhanced_image:bool = True, compute_ssim:bool = True):
+    def forward(self, x:torch.Tensor, targets=None, 
+                store_enhanced_image:bool = True, compute_ssim:bool = True)  -> PanopticModelOutputs:
 
         if self.gdip_mode == "gdip":
             latent = self.vision_encoder(x)
@@ -572,6 +884,116 @@ class GDIPYolo(nn.Module):
             outputs.defogging_loss = defogging_loss
 
         return outputs
+
+    @classmethod
+    def from_config(cls, task_network, **kwargs:dict):
+        if "gdip_kwargs" not in kwargs: raise KeyError(f'gdip_kwargs not present in {kwargs.keys()}')
+        return cls(task_network, kwargs["gdip_kwargs"])
+    
+    def _get_enhancement_param_groups(self, optimizer_kwargs):
+        
+        gdip_groups = optimizer_kwargs.get("gdip_groups", {})
+
+        param_groups = []
+        if not gdip_groups:
+            # Default: train both GDIP components with lr_scale=1.0
+            param_groups.append({"params": list(self.vision_encoder.parameters()), 
+                                "name": "vision_encoder", 
+                                "lr_scale": 1.0})
+            param_groups.append({"params": list(self.gdip_module.parameters()), 
+                                "name": "gdip_module", 
+                                "lr_scale": 1.0})
+        else:
+            for component_name, cfg in gdip_groups.items():
+                component = getattr(self, component_name)
+                trainable = cfg["trainable"]
+
+                for p in component.parameters():
+                    p.requires_grad = trainable
+
+                if trainable:
+                    param_groups.append({
+                        "params": list(component.parameters()),
+                        "name": component_name,
+                        "lr_scale": cfg.get("lr_scale", 1.0)
+                    })
+                    
+        return param_groups
+    
+    def _get_loggable_artifacts(self):
+        
+        artifacts = {}
+        if self.enhanced_image is not None:
+            artifacts["enhanced_image"] = self.enhanced_image
+        if self.gates is not None:
+            artifacts["gates"] = self.gates
+        return artifacts
+
+@ModelFactory.register_enhancement("denet-yolo")
+class DENetYolo(BaseEnhancementModel):
+    def __init__(self, task_network:Union[YOLOP, YOLOv8P], denet_kwargs:dict):
+        super(DENetYolo, self).__init__()
+        
+        self.task_network = task_network
+        self.enhanced_image = None
+        
+        self.denet = DENet(
+            num_high=denet_kwargs.get("num_high", 3),
+            gaussian_kernel_size=denet_kwargs.get("gaussian_kernel_size", 5),
+            num_channels=denet_kwargs.get("num_channels", 3),
+            channel_blocks=denet_kwargs.get("channel_blocks", 64),
+            channel_mask=denet_kwargs.get("channel_mask", 16),
+            up_kernel_size=denet_kwargs.get("up_kernel_size", 1),
+            high_channels=denet_kwargs.get("high_channels", 32),
+            high_kernel_size=denet_kwargs.get("high_kernel_size", 3)
+        )
+        
+        self.vis_intermediate = denet_kwargs.get("visualize_intermediate", True)
+        self.ssim = StructuralSimilarityIndexMeasure(data_range=1.0)
+        
+    def forward(self, x:torch.Tensor, targets=None, store_enhanced_image:bool = True, 
+                compute_ssim:bool = True)  -> PanopticModelOutputs:
+        
+        assert x.shape[1] == self.denet.num_channels, f'Image Input Channels does not match, DENet Expected: {self.denet.num_channels}'
+        enhanced_image = self.denet(x)
+
+        assert enhanced_image.shape == x.shape, f'Enhanced Image and Input Image Shape Mismatch, {enhanced_image.shape} and {x.shape}'
+
+        if store_enhanced_image:
+            self.enhanced_image = enhanced_image.detach()
+            
+        defogging_loss = None
+        if compute_ssim and targets is not None and targets.get("clean_images") is not None:
+            ssim_val = self.ssim(enhanced_image, targets["clean_images"])
+            defogging_loss = 1. - ssim_val
+
+        outputs = self.task_network(enhanced_image, targets)
+
+        if defogging_loss is not None:
+            outputs.defogging_loss = defogging_loss
+
+        return outputs
+    
+    @classmethod
+    def from_config(cls, task_network, **kwargs:dict):
+        if "denet_kwargs" not in kwargs: raise KeyError(f'denet_kwargs not present in {kwargs.keys()}')
+        return cls(task_network, kwargs["denet_kwargs"])
+    
+    def _get_enhancement_param_groups(self, optimizer_kwargs):
+
+        return [{
+                "params": list(self.denet.parameters()), 
+                "name": self.denet.__class__.__name__, 
+                "lr_scale": 1.0
+            }]
+        
+    def _get_loggable_artifacts(self):
+
+        artifacts = {}
+        if self.enhanced_image is not None:
+            artifacts["enhanced_image"] = self.enhanced_image
+
+        return artifacts
     
 def get_model_param_groups(model:Optional[Union[YOLOP, YOLOv8P]], groups:dict, dcn_lr_mult:float=0.1, allow_empty:bool=False):
     """
