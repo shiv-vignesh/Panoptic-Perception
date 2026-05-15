@@ -665,13 +665,41 @@ class BDD100KDataset(Dataset):
     def __len__(self):
         return len(self.image_ids)
 
+    @staticmethod
+    def _existing_split_file(root_dir, split, filenames):
+        if not root_dir:
+            return None
+
+        split_dir = os.path.join(root_dir, split)
+        if not os.path.isdir(split_dir):
+            return None
+
+        for filename in filenames:
+            path = os.path.join(split_dir, filename)
+            if os.path.exists(path):
+                return path
+
+        return None
+
     def _load_raw(self, index):
         """Load raw image and annotations without augmentation for mosaic/mixup."""
         image_id = self.image_ids[index]
 
         image_path = os.path.join(self.images_dir, self.dataset_type, f"{image_id}.jpg")
-        seg_path = os.path.join(self.segmentation_annotations_dir, self.dataset_type, f"{image_id}_train_id.png")
-        drivable_path = os.path.join(self.drivable_annotations_dir, self.dataset_type, f"{image_id}_drivable_id.png")
+        seg_path = self._existing_split_file(
+            self.segmentation_annotations_dir,
+            self.dataset_type,
+            [
+                f"{image_id}_train_id.png",
+                f"{image_id}_{self.dataset_type}_id.png",
+                f"{image_id}.png",
+            ],
+        )
+        drivable_path = self._existing_split_file(
+            self.drivable_annotations_dir,
+            self.dataset_type,
+            [f"{image_id}_drivable_id.png", f"{image_id}.png"],
+        )
 
         assert os.path.exists(image_path), f"Image path {image_path} does not exist."
 
@@ -681,11 +709,11 @@ class BDD100KDataset(Dataset):
 
         # Load masks
         seg = None
-        if os.path.exists(seg_path):
+        if seg_path is not None:
             seg = cv2.imread(seg_path, cv2.IMREAD_GRAYSCALE)
 
         drivable = None
-        if os.path.exists(drivable_path):
+        if drivable_path is not None:
             drivable = cv2.imread(drivable_path, cv2.IMREAD_GRAYSCALE)
             #merge alternative to drivable
             drivable[drivable == 2] = 1
@@ -694,10 +722,20 @@ class BDD100KDataset(Dataset):
         bboxes = []
         class_labels = []
         lane_polys = []
+        scene_attributes = None
 
-        det_path = os.path.join(self.detection_annotations_dir, self.dataset_type, f"{image_id}.json")
-        if self.mode != DatasetMode.INFER:
-            assert os.path.exists(det_path), f"Detection path {det_path} does not exist."
+        det_path = self._existing_split_file(
+            self.detection_annotations_dir,
+            self.dataset_type,
+            [f"{image_id}.json"],
+        )
+        if self.mode == DatasetMode.TRAIN:
+            assert det_path is not None, (
+                f"Detection path {os.path.join(self.detection_annotations_dir, self.dataset_type, f'{image_id}.json')} "
+                "does not exist."
+            )
+
+        if det_path is not None and self.mode != DatasetMode.INFER:
             bboxes, class_labels, scene_attributes = self.preprocessor.load_detection(det_path)
             lane_polys = self.preprocessor.load_lane_annotations(det_path)
 
