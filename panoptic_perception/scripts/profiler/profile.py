@@ -284,9 +284,7 @@ class Profiler:
 
     def compute_roofline(self, event_lists:List[KernelRecord], device:torch.device, dtype:torch.dtype, gpu_specs:GPUSpecs):
 
-        if device.type == "cpu":
-            roofline = "cpu_only_profile"
-
+        is_cpu_profile = device.type == "cpu" and gpu_specs is None
         dtype_bytes = torch.tensor([], dtype=dtype).element_size()
 
         if gpu_specs is None:
@@ -296,33 +294,31 @@ class Profiler:
             if record.call_count <= 0:
                 continue
 
-            flops = record.total_flops or 0
-
-            if record.gpu_time <= 0:
-                record.roofline = "cpu_only_profile"
-
-            gpu_time_per_call_s = (record.gpu_time * 1e-6) / record.call_count
-            cpu_time_per_call_s = (record.cpu_time * 1e-6) / record.call_count
-
             bytes_est = estimate_bytes(record, dtype_bytes)
             if bytes_est is None:
                 record.roofline = "no_estimator"
                 continue
 
             flops_per_call = (record.total_flops or 0) / record.call_count
-            achieved_tflops = (flops_per_call / 1e12) / gpu_time_per_call_s if flops_per_call else 0.0
-            achieved_bw_gbps = (bytes_est / 1e9) / gpu_time_per_call_s if bytes_est > 0 else 0.0
-            
             #arthematic intensity
             ai = flops_per_call / bytes_est if bytes_est > 0 else 0.0
-
             record.bytes_estimate = bytes_est
-            record.achieved_bandwidth_gbps = achieved_bw_gbps
-            record.achieved_tflops = achieved_tflops
             record.arithmetic_intensity = ai
 
-            record.gpu_time_per_call_s = gpu_time_per_call_s
+            cpu_time_per_call_s = (record.cpu_time * 1e-6) / record.call_count
             record.cpu_time_per_call_s = cpu_time_per_call_s
+
+            if is_cpu_profile and record.gpu_time <= 0:
+                record.roofline = "cpu_only_profile"
+                continue
+
+            gpu_time_per_call_s = (record.gpu_time * 1e-6) / record.call_count            
+            achieved_tflops = (flops_per_call / 1e12) / gpu_time_per_call_s if flops_per_call else 0.0
+            achieved_bw_gbps = (bytes_est / 1e9) / gpu_time_per_call_s if bytes_est > 0 else 0.0
+
+            record.gpu_time_per_call_s = gpu_time_per_call_s
+            record.achieved_bandwidth_gbps = achieved_bw_gbps
+            record.achieved_tflops = achieved_tflops
 
             ceiling = None
             ridge = None
@@ -332,10 +328,10 @@ class Profiler:
                     print(f'[WARN] cannot compute ceil for dtype: {_dtype_str}'\
                           f'Supported dtypes: {gpu_specs.peak_tflops_by_dtype.keys()}')
                     continue
-                
+
                 ceiling = min(gpu_specs.peak_tflops_by_dtype[_dtype_str], 
                               gpu_specs.peak_memory_bandwidth * ai / 1000)
-                
+
                 ridge = gpu_specs.peak_tflops_by_dtype[_dtype_str] * 1000 / gpu_specs.peak_memory_bandwidth  # in FLOPs/byte
 
             record.roofline_ratio = (achieved_tflops / ceiling) if ceiling and ceiling > 0 else 0.0
