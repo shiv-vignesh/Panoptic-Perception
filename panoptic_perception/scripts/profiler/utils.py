@@ -18,28 +18,33 @@ def get_cores_per_sm(major: int, minor: int) -> int:
     return mapping.get(major, {}).get(minor, 128)
 
 def get_pynvml_gpu_specs(device:torch.device) -> GPUSpecs:
-    
+
     specs = GPUSpecs()
     try:
         import pynvml
     except ImportError:
         raise
 
+    # torch.device("cuda") leaves index as None; resolve to a concrete int
+    # before handing to NVML / CUDA Runtime (both expect uint device IDs).
+    device_index = device.index if device.index is not None else torch.cuda.current_device()
+
     pynvml.nvmlInit()
     try:
-        handle = pynvml.nvmlDeviceGetHandleByIndex(device.index)
-        specs.name = pynvml.nvmlDeviceGetName(handle)
-        
+        handle = pynvml.nvmlDeviceGetHandleByIndex(device_index)
+        name = pynvml.nvmlDeviceGetName(handle)
+        specs.name = name.decode("utf-8") if isinstance(name, bytes) else name
+
         # Memory info
         mem_info = pynvml.nvmlDeviceGetMemoryInfo(handle)
         specs.memory_gb = round(mem_info.total / (1024**3), 2)
-        
+
         # Calculate Peak Memory Bandwidth (requires max memory clock & bus width)
         # Formula: (Memory Clock * 2 [for DDR] * Bus Width in bits) / 8 bits-per-byte / 1e9
         mem_clock_mhz = pynvml.nvmlDeviceGetMaxClockInfo(handle, pynvml.NVML_CLOCK_MEM)
         bus_width_bits = pynvml.nvmlDeviceGetMemoryBusWidth(handle)
         specs.peak_memory_bandwidth = round((mem_clock_mhz * 1e6 * 2 * bus_width_bits) / 8 / 1e9, 2)
-        
+
         # Max Graphics Clock needed for TFLOPS calculation
         max_gfx_clock_hz = pynvml.nvmlDeviceGetMaxClockInfo(handle, pynvml.NVML_CLOCK_GRAPHICS) * 1e6
 
@@ -51,7 +56,7 @@ def get_pynvml_gpu_specs(device:torch.device) -> GPUSpecs:
         cuda = ctypes.CDLL('libcudart.so' if torch.sys.platform != 'win32' else 'cudart64_120.dll')
         l2_size = ctypes.c_int()
         # 39 is the enum value for cudaDevAttrL2CacheSize
-        if cuda.cudaDeviceGetAttribute(ctypes.byref(l2_size), 39, device.index) == 0:
+        if cuda.cudaDeviceGetAttribute(ctypes.byref(l2_size), 39, device_index) == 0:
             specs.l2_cache_mb = round(l2_size.value / (1024**2), 2)
     except Exception:
         specs.l2_cache_mb = 0.0
