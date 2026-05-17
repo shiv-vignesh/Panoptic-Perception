@@ -88,12 +88,12 @@ def render_kernel_table(records: List[KernelRecord], top_n: int = 30, fmt: str =
             r.call_count,
             f"{(r.gpu_time or 0) / 1000:.2f}",                  # ms                 
             f"{(r.gpu_time or 0) / total_gpu * 100:.1f}%",
-            f"{r.arithmetic_intensity:.2f}" if r.arithmetic_intensity else "-",      
-            f"{r.achieved_tflops:.2f}" if r.achieved_tflops else "-",                
-            f"{r.achieved_bandwidth_gbps:.1f}" if r.achieved_bandwidth_gbps else "-",
-            f"{r.roofline_ceiling_tflops:.2f}" if r.roofline_ceiling_tflops else "-",
-            f"{r.roofline_ratio * 100:.0f}%" if r.roofline_ratio else "-",           
-            r.roofline or "-",          
+            f"{r.arithmetic_intensity:.2f}" if r.arithmetic_intensity is not None else "-",
+            f"{r.achieved_tflops:.2f}" if r.achieved_tflops is not None else "-",
+            f"{r.achieved_bandwidth_gbps:.1f}" if r.achieved_bandwidth_gbps is not None else "-",
+            f"{r.roofline_ceiling_tflops:.2f}" if r.roofline_ceiling_tflops is not None else "-",
+            f"{r.roofline_ratio * 100:.0f}%" if r.roofline_ratio is not None else "-",
+            r.roofline or "-",
         ])                   
    
     headers = ["kernel", "calls", "gpu_ms", "%t", "AI", "TFLOPS", "BW GB/s", "ceil", "roof_eff", "bound"]

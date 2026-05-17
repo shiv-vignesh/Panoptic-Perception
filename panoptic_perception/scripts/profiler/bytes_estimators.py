@@ -174,11 +174,13 @@ BYTES_ESTIMATORS: dict[str, EstimatorFn] = {
     "aten::_convolution":            estimate_bytes_conv2d,
     "aten::_slow_conv2d_forward":    estimate_bytes_conv2d,
     "aten::thnn_conv2d":             estimate_bytes_conv2d,
+    "aten::cudnn_convolution":       estimate_bytes_conv2d,
 
     # ---- COMPUTE: normalization ----
     "aten::batch_norm":              estimate_bytes_batchnorm,
     "aten::native_batch_norm":       estimate_bytes_batchnorm,
     "aten::_batch_norm_impl_index":  estimate_bytes_batchnorm,
+    "aten::cudnn_batch_norm":        estimate_bytes_batchnorm,
 
     # ---- COMPUTE: pooling ----
     "aten::max_pool2d":              estimate_bytes_pool2d,
