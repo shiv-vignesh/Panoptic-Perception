@@ -268,9 +268,15 @@ class Profiler:
 
         key_averages = prof.key_averages(group_by_input_shape=self.group_by_input_shape, group_by_stack_n=True)
         for evnt in key_averages:
+            # PyTorch 2.8 renamed self_cuda_time_total -> self_device_time_total
+            # (device-agnostic naming). Fall back for older versions.
+            gpu_time = getattr(evnt, "self_device_time_total", None)
+            if gpu_time is None:
+                gpu_time = getattr(evnt, "self_cuda_time_total", 0.0)
+
             kernel_record = KernelRecord(
                 name=evnt.key,
-                gpu_time=getattr(evnt, "self_cuda_time_total", 0.0),
+                gpu_time=gpu_time,
                 cpu_time=getattr(evnt, "self_cpu_time_total", 0.0),
                 cpu_mem_usage=evnt.self_cpu_memory_usage,
                 gpu_mem_usage=evnt.device_memory_usage,
