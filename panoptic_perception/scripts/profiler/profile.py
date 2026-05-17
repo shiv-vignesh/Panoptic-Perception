@@ -308,8 +308,11 @@ class Profiler:
             cpu_time_per_call_s = (record.cpu_time * 1e-6) / record.call_count
             record.cpu_time_per_call_s = cpu_time_per_call_s
 
-            if is_cpu_profile and record.gpu_time <= 0:
-                record.roofline = "cpu_only_profile"
+            if record.gpu_time <= 0:
+                # No CUDA kernel ran for this op: either CPU-only profile,
+                # or a metadata/view op (aten::view, aten::reshape, etc.)
+                # that doesn't launch device work even on GPU runs.
+                record.roofline = "cpu_only_profile" if is_cpu_profile else "no_gpu_kernel"
                 continue
 
             gpu_time_per_call_s = (record.gpu_time * 1e-6) / record.call_count            
@@ -324,9 +327,9 @@ class Profiler:
             ridge = None
             if gpu_specs:
                 _dtype_str = DTYPE_MAP[dtype]
-                if dtype not in gpu_specs.peak_tflops_by_dtype:
-                    print(f'[WARN] cannot compute ceil for dtype: {_dtype_str}'\
-                          f'Supported dtypes: {gpu_specs.peak_tflops_by_dtype.keys()}')
+                if _dtype_str not in gpu_specs.peak_tflops_by_dtype:
+                    print(f'[WARN] cannot compute ceil for dtype: {_dtype_str} '
+                          f'Supported dtypes: {list(gpu_specs.peak_tflops_by_dtype.keys())}')
                     continue
 
                 ceiling = min(gpu_specs.peak_tflops_by_dtype[_dtype_str], 
