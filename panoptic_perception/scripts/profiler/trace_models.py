@@ -46,6 +46,7 @@ class KernelRecord:
     achieved_tflops: float = None
     achieved_bandwidth_gbps: float = None
     roofline_ratio: float = None    
+    roofline_ceiling_tflops: float = None
 
     gpu_time_per_call_s: float = None
     cpu_time_per_call_s: float = None

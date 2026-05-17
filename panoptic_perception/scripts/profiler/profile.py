@@ -7,7 +7,7 @@ from collections import defaultdict
 
 from .trace_models import GPUSpecs, KernelRecord, ForwardError, ProfilerInfo, DTYPE_MAP
 from .bytes_estimators import estimate_bytes
-from .utils import get_pynvml_gpu_specs, get_cores_per_sm
+from .utils import get_pynvml_gpu_specs, get_cores_per_sm, render_kernel_table
 
 class Profiler:
     def __init__(self, 
@@ -335,6 +335,7 @@ class Profiler:
                 ridge = gpu_specs.peak_tflops_by_dtype[_dtype_str] * 1000 / gpu_specs.peak_memory_bandwidth  # in FLOPs/byte
 
             record.roofline_ratio = (achieved_tflops / ceiling) if ceiling and ceiling > 0 else 0.0
+            record.roofline_ceiling_tflops = ceiling if ceiling and ceiling > 0 else 0.0
             if ridge:            
                 if ai == 0:
                     record.roofline = "no_flops"
@@ -395,4 +396,6 @@ class Profiler:
         )
 
         self.compute_roofline(event_lists, device, dtype, gpu_specs)
+        render_table = render_kernel_table(event_lists)
+        print(render_table)
     

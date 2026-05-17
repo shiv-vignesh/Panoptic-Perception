@@ -1,5 +1,8 @@
 
-from .trace_models import GPUSpecs
+from .trace_models import GPUSpecs, KernelRecord
+
+from typing import List      
+from tabulate import tabulate         
 
 import torch
 import ctypes
@@ -67,3 +70,26 @@ def get_pynvml_gpu_specs(device:torch.device) -> GPUSpecs:
     specs.peak_tflops_by_dtype["fp16"] = round(fp32_tflops * 2, 2)
 
     return specs
+
+def render_kernel_table(records: List[KernelRecord], top_n: int = 30, fmt: str = "github") -> str:
+    """Top-N kernels by GPU time, with roofline diagnostics per row."""              
+    records = sorted(records, key=lambda r: r.gpu_time or 0, reverse=True)           
+    total_gpu = sum(r.gpu_time or 0 for r in records) or 1
+   
+    rows = []              
+    for r in records[:top_n]:
+        rows.append([      
+            r.name[:40],
+            r.call_count,
+            f"{(r.gpu_time or 0) / 1000:.2f}",                  # ms                 
+            f"{(r.gpu_time or 0) / total_gpu * 100:.1f}%",
+            f"{r.arithmetic_intensity:.2f}" if r.arithmetic_intensity else "-",      
+            f"{r.achieved_tflops:.2f}" if r.achieved_tflops else "-",                
+            f"{r.achieved_bandwidth_gbps:.1f}" if r.achieved_bandwidth_gbps else "-",
+            f"{r.roofline_ceiling_tflops:.2f}" if r.roofline_ceiling_tflops else "-",
+            f"{r.roofline_ratio * 100:.0f}%" if r.roofline_ratio else "-",           
+            r.roofline or "-",          
+        ])                   
+   
+    headers = ["kernel", "calls", "gpu_ms", "%t", "AI", "TFLOPS", "BW GB/s", "ceil", "roof_eff", "bound"]
+    return tabulate(rows, headers=headers, tablefmt=fmt)  
