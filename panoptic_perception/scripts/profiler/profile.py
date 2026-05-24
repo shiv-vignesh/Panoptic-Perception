@@ -301,6 +301,8 @@ class Profiler:
                 continue
 
             bytes_est = estimate_bytes(record, dtype_bytes)
+            print(record.name, bytes_est)
+            print()            
             if bytes_est is None:
                 record.roofline = "no_estimator"
                 continue

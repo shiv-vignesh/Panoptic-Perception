@@ -185,20 +185,80 @@ class Detect(nn.Module):
             self.convs.append(nn.Conv2d(in_ch, out_ch, 1, 1))
 
         self.stride = None
+        
+        # ----- ATSS ------
+        self._anchor_proposals : List[torch.Tensor] = None
+        self._proposal_shape = None 
+        
+        self._anchor_cxcy : List[torch.Tensor] = None
+        self._anchor_wh : List[torch.Tensor] = None
+        self._anchor_strides : List[torch.Tensor] = None
 
+    def _build_anchor_proposals(self, x):
+
+        proposals = []
+        proposals_cxcy = []
+        proposals_wh = []
+        proposals_strides = []
+        for i in range(self.num_layers):
+            stride = self.stride[i]
+            _, _, ny, nx = x[i].shape
+            na = self.anchors[i].shape[0]
+            device = x[i].device
+
+            yv, xv = torch.meshgrid(
+                torch.arange(ny, device=device),
+                torch.arange(nx, device=device),
+                indexing='ij'
+            )
+
+            centers = torch.stack([
+                (xv + 0.5) * stride, (yv + 0.5) * stride
+            ], dim=-1).float()
+            centers = centers.reshape(-1, 2)
+
+            # Anchor half-sizes: (na, 2)
+            half_wh = self.anchors[i].to(device) / 2
+
+            # Broadcast: centers (ny*nx, 1, 2) +/- half_wh (1, na, 2) → (ny*nx, na, 2)
+            x1y1 = centers.unsqueeze(1) - half_wh.unsqueeze(0)
+            x2y2 = centers.unsqueeze(1) + half_wh.unsqueeze(0)
+            boxes = torch.cat([x1y1, x2y2], dim=-1) # (ny*nx, na, 4)
+
+            # Flatten cell-major, anchor-minor: row0_col0_anch0, row0_col0_anch1, ...
+            boxes = boxes.reshape(-1, 4) # (ny*nx*na, 4)
+            proposals.append(boxes) 
+
+            _cxcy = (boxes[:, :2] + boxes[:, 2:]) / 2
+            _wh = boxes[:, 2:] - boxes[:, :2]
+            _anchor_stride = torch.full((boxes.shape[0],), float(self.stride[i].item()), device=device)
+
+            proposals_cxcy.append(_cxcy)
+            proposals_wh.append(_wh)
+            proposals_strides.append(_anchor_stride)
+
+        self._anchor_proposals = proposals
+        self._anchor_cxcy = proposals_cxcy
+        self._anchor_wh = proposals_wh
+        self._anchor_strides = proposals_strides
 
     def forward(self, x:List[torch.Tensor], image_size:Tuple[int,int]):
-
-        for i in range(self.num_layers):
-            bs, _, ny, nx = x[i].shape
-            x[i] = self.convs[i](x[i])
-            x[i] = x[i].view(bs, -1, self.num_outputs, ny, nx).permute(0,1,3,4,2).contiguous()
 
         if self.stride is None:
             self.stride = torch.tensor(
                 [image_size[0] // x[i].shape[2] for i in range(self.num_layers)],
                 device=x[0].device
             )
+
+        current_shape = tuple((xi.shape[2], xi.shape[3]) for xi in x)
+        if self._proposal_shape != current_shape:
+            self._build_anchor_proposals(x)
+            self._proposal_shape = current_shape
+
+        for i in range(self.num_layers):
+            bs, _, ny, nx = x[i].shape
+            x[i] = self.convs[i](x[i])
+            x[i] = x[i].view(bs, -1, self.num_outputs, ny, nx).permute(0,1,3,4,2).contiguous()
 
         return x
 

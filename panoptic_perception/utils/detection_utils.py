@@ -65,7 +65,7 @@ class DetectionHelper:
         return iou
     
     @staticmethod
-    def bbox_iou_pairwise(box1, box2, eps=1e-7):
+    def bbox_iou_pairwise(box1, box2, eps=1e-7) -> torch.Tensor:
         """
         Pairwise IoU between two sets of boxes (both in x1y1x2y2 format).
     
@@ -590,9 +590,8 @@ class DetectionLossCalculator:
                 # Classification loss (IoU-aware weighting)
                 nc = pred.shape[-1] - 5
                 if nc > 1:
-                    
                     cp = 1.0 - 0.5 * DetectionLossCalculator.label_smoothing
-                    cn = 0.5 * DetectionLossCalculator.label_smoothing                    
+                    cn = 0.5 * DetectionLossCalculator.label_smoothing
                     
                     t = torch.full_like(ps[:, 5:], device=device, fill_value=cn)
                     t[range(nt), tcls[i]] = cp
@@ -797,3 +796,508 @@ class DetectionLossCalculator:
 
         loss = 0.5 * lcls + 7.5 * lbox + 1.5 * ldfl
         return loss, {"lcls": lcls.item(), "lbox": lbox.item(), "ldfl": ldfl.item()}
+    
+
+# ----- ATSS -----
+# Truthful replication of https://github.com/sfzhang15/ATSS/tree/master
+
+class ATSS:
+
+    @staticmethod
+    def _check_center_constraint(anchor_centers:torch.Tensor,
+                                gt_bboxes:torch.Tensor,
+                                candidate_indices:torch.Tensor):
+        
+        """
+            anchor_centers - (total_anchors, 2)
+            gt_bboxes - (N_gt, 4)
+            candidate_indices - (N_gt, L * K) , L = len(level_sizes)
+        """
+
+        candidate_centers = anchor_centers[candidate_indices] #(N_gt, L * K, 2)
+
+        x1 = gt_bboxes[:, 0:1]
+        y1 = gt_bboxes[:, 1:2]
+        x2 = gt_bboxes[:, 2:3]
+        y2 = gt_bboxes[:, 3:4]
+
+        in_box = (
+            (candidate_centers[..., 0] >= x1) & (candidate_centers[..., 0] <= x2) &
+            (candidate_centers[..., 1] >= y1) & (candidate_centers[..., 1] <= y2) 
+        )
+
+        return in_box
+    
+    @staticmethod
+    def _match_targets_to_proposals(anchor_proposals:torch.Tensor, anchor_centers:torch.Tensor,
+                                    gt_centers:torch.Tensor, gt_bboxes:torch.Tensor, 
+                                    gt_labels:torch.Tensor,
+                                    level_sizes:List[int],
+                                    k:int=9):
+
+        # iou_matrix shape: (N_gt, A_anchors)
+        iou_pairwise = DetectionHelper.bbox_iou_pairwise(gt_bboxes, anchor_proposals)
+        if iou_pairwise.numel() == 0 or iou_pairwise.shape[0] == 0:
+            raise ValueError(
+                f"IOU Pairwise contains no elements or has no ground truth"
+            )
+
+        # dist_matrix shape: (N_gt, A_anchors)
+        dist_matrix = torch.cdist(gt_centers, anchor_centers, p=2)
+
+        candidate_indices = []
+        start_idx = 0
+        
+        for level_sz in level_sizes:
+            end_idx = start_idx + level_sz
+
+            level_dist = dist_matrix[:, start_idx:end_idx]
+            _, topk_idxs = torch.topk(level_dist, 
+                                    k=k, dim=1, largest=False)
+
+            # Convert local level index back to global anchor proposal index
+            candidate_indices.append(start_idx + topk_idxs)
+            start_idx = end_idx
+
+        # (N_gt, L * K) , L = len(level_sizes)
+        candidate_indices = torch.concat(candidate_indices, dim=1)
+        # (N_gt, L * K) 
+
+        assert iou_pairwise.shape[0] == candidate_indices.shape[0], \
+            f"Expected IOU Pairwise Matrix and indices to be same at dim=0, got: {iou_pairwise.shape[0]} and {candidate_indices.shape[0]}"
+        
+        candidate_ious = torch.gather(iou_pairwise, dim=1, index=candidate_indices)
+
+        # (N_gt, 1)
+        iou_mean = candidate_ious.mean(dim=1, keepdim=True)
+        iou_std = candidate_ious.std(dim=1, keepdim=True)
+        #unique dynamic threshold formula per individual object
+        adaptive_thresholds = iou_mean + iou_std 
+
+        # (N_gt, L * K) , L = len(level_sizes)
+        iou_filter = candidate_ious >= adaptive_thresholds 
+        in_box = ATSS._check_center_constraint(anchor_centers, gt_bboxes, candidate_indices)
+
+        accept = iou_filter & in_box #(N_gt, L * K)
+
+        matches = torch.full((anchor_proposals.shape[0],), -1, dtype=torch.long, device=gt_bboxes.device)
+        best_iou = torch.full((anchor_proposals.shape[0],), -1.0, device=gt_bboxes.device)
+        for gt_idx in range(gt_bboxes.shape[0]):
+            valid_candidate_mask = accept[gt_idx]
+            global_anchors_for_gt = candidate_indices[gt_idx][valid_candidate_mask]
+            global_anchor_ious_for_gt = iou_pairwise[gt_idx][global_anchors_for_gt]
+
+            is_better_match = global_anchor_ious_for_gt > best_iou[global_anchors_for_gt]
+            selected_anchor_ids = global_anchors_for_gt[is_better_match]
+
+            matches[selected_anchor_ids] = gt_idx
+            best_iou[selected_anchor_ids] = global_anchor_ious_for_gt[is_better_match]
+
+        clamped = matches.clamp(min=0)
+        matched_gt_bboxes = gt_bboxes[clamped]
+        matched_gt_labels = gt_labels[clamped]
+        pos_mask = matches >= 0
+
+        return matches, matched_gt_bboxes, matched_gt_labels, pos_mask
+
+    @staticmethod
+    def _prepare_targets(anchor_proposals:torch.Tensor, targets:torch.Tensor, 
+                        img_w, img_h, 
+                        batch_size:int, 
+                        level_sizes:List[int],
+                        device:torch.device):
+        
+        """
+            anchor_proposals - [A, 4]
+                A - sum(anchors_per_level)
+                4 - xyxy
+            targets - [N, 6]
+                [batch_idx, class_id, x_center, y_center, width, height]
+        """
+
+        anchor_centers = (anchor_proposals[:, :2] + anchor_proposals[:, 2:]) / 2
+        num_anchors = anchor_centers.shape[0]
+        num_coords = anchor_proposals.shape[1]
+
+        # per batch_idx -> matched_gt_labels: (A,) int
+        #   gathered gt class id at each anchor (garbage where pos_mask is False)        
+        batch_labels = torch.zeros(
+            (batch_size, num_anchors),
+            dtype=torch.long,
+            device=device
+        )  
+
+        # per batch_idx -> matched_gt_bboxes: (A, 4) float
+        #   gathered gt xyxy at each anchor (garbage where pos_mask is False)
+        batch_bboxes = torch.zeros(
+            (batch_size, num_anchors, num_coords),
+            dtype=torch.float32,
+            device=device
+        )  
+
+        # per batch_idx -> pos_mask: (A,) bool
+        # True if anchor was assigned a positive GT, False otherwise
+        # NO positives → loss skips this image's reg+cls
+        batch_pos_masks = torch.full(
+            (batch_size, num_anchors),
+            fill_value=False,
+            dtype=torch.bool,
+            device=device
+        )
+
+        # per batch_idx -> matches: (A,) int
+        # gt_idx in [0, M-1] for matched anchors, -1 for unmatched
+        batch_matches = torch.full(
+            (batch_size, num_anchors),
+            fill_value=-1,
+            dtype=torch.long,
+            device=device,
+        )
+
+        if targets.ndim != 2 or targets.shape[0] == 0:
+            return batch_labels, batch_bboxes, batch_pos_masks, batch_matches
+
+        for batch_idx in range(batch_size):
+            gt_bboxes = targets[targets[:, 0] == batch_idx][:, 2:] #(M, 4)
+            gt_labels = targets[targets[:, 0] == batch_idx][:, 1] # (M)
+
+            if gt_bboxes.numel() == 0:
+                continue
+
+            gt_x1 = (gt_bboxes[:, 0] - gt_bboxes[:, 2] / 2) * img_w
+            gt_y1 = (gt_bboxes[:, 1] - gt_bboxes[:, 3] / 2) * img_h
+            gt_x2 = (gt_bboxes[:, 0] + gt_bboxes[:, 2] / 2) * img_w
+            gt_y2 = (gt_bboxes[:, 1] + gt_bboxes[:, 3] / 2) * img_h
+
+            gt_bboxes = torch.stack([gt_x1, gt_y1, gt_x2, gt_y2], dim=-1) # (M, 4)
+            gt_centers = (gt_bboxes[:, :2] + gt_bboxes[:, 2:]) / 2
+
+            # Shapes same order as return 
+            # [A], [A, 4], [A], [A]
+            matches, matched_gt_bboxes, matched_gt_labels, pos_mask = \
+                ATSS._match_targets_to_proposals(
+                anchor_proposals, anchor_centers,
+                gt_centers, gt_bboxes,
+                gt_labels, level_sizes
+            )
+            
+            batch_labels[batch_idx] = matched_gt_labels
+            batch_bboxes[batch_idx] = matched_gt_bboxes
+            batch_pos_masks[batch_idx] = pos_mask
+            batch_matches[batch_idx] = matches
+        
+        return batch_labels, batch_bboxes, batch_pos_masks, batch_matches
+
+    @staticmethod
+    def subsample(anchor_proposals:List[torch.Tensor], targets:torch.Tensor, 
+                img_w, img_h, 
+                batch_size:int,
+                device:torch.device):
+        """
+        Args:
+            anchor_proposals List[torch.Tensor]: pre-computed (x, y) center locations per grid 
+                (x_grid + 0.5, y_grid + 0.5) * stride for every level of FPN.
+
+                Ensure x1y1x2y2 in pixel coordinates
+                e.g. [(20, 20, num_anch), 
+                      (40, 40, num_anch), 
+                      (80, 80, num_anch)] -> [(1200, 4), (4800, 4), (19200, 4)]
+
+            targets: ground truth from dataset 
+                (batch_idx, class_id, x_center, y_center, width, height)
+
+        Returns:
+                batch_labels - per batch_idx -> matched_gt_labels: (A,) int
+                            gathered gt class id at each anchor (garbage where pos_mask is False)      
+                batch_bboxes - per batch_idx -> matched_gt_bboxes: (A, 4) float
+                            gathered gt xyxy at each anchor (garbage where pos_mask is False)
+                batch_pos_mask - per batch_idx -> pos_mask: (A,) bool
+                            True if anchor was assigned a positive GT, False otherwise        
+
+                batch_matches - per batch_idx -> matches: (A,) int
+                            gt_idx in [0, M-1] for matched anchors, -1 for unmatched
+        """
+
+        # assert len(targets.shape) == 2 and targets.shape[-1] == 6, \
+        #     f'Supported targets shape (batch_size, 6), [(batch_idx, class_id, x_center, y_center, width, height)]'
+
+        level_sizes = []        
+        for anchor_proposal in anchor_proposals:
+            assert len(anchor_proposal.shape) == 2 and anchor_proposal.shape[-1] == 4, \
+                f'Expected Anchor Proposals must be size (num_anchors, 4), got: {anchor_proposal.shape}'
+            
+            num_anchors = anchor_proposal.shape[0]
+            level_sizes.append(num_anchors)
+
+        anchor_proposals = torch.cat(anchor_proposals, dim=0).to(device)
+        return ATSS._prepare_targets(
+            anchor_proposals, 
+            targets, 
+            img_w, img_h, 
+            batch_size, level_sizes, device
+        )
+
+    @staticmethod
+    def _validate_anchor_metadata(
+        anchor_cxcy: List[torch.Tensor],
+        anchor_wh: List[torch.Tensor],
+        anchor_strides: List[torch.Tensor],
+        expected_levels: int,
+        pred_anchor_counts: List[int],
+        device: torch.device | None = None
+    ):
+        """
+        Validates anchor metadata consistency across feature pyramid levels.
+        """
+
+        # 1. Level count check
+        if len(anchor_cxcy) != expected_levels:
+            raise ValueError(
+                f"anchor_cxcy has {len(anchor_cxcy)} levels, "
+                f"expected {expected_levels}"
+            )
+
+        if len(anchor_wh) != expected_levels:
+            raise ValueError(
+                f"anchor_wh has {len(anchor_wh)} levels, "
+                f"expected {expected_levels}"
+            )
+
+        if len(anchor_strides) != expected_levels:
+            raise ValueError(
+                f"anchor_strides has {len(anchor_strides)} levels, "
+                f"expected {expected_levels}"
+            )
+
+
+        for i, (cxcy, wh, stride) in enumerate(
+            zip(anchor_cxcy, anchor_wh, anchor_strides)
+        ):
+
+            # ---- shape checks ----
+            if cxcy.ndim != 2 or cxcy.shape[-1] != 2:
+                raise ValueError(
+                    f"Level {i}: anchor_cxcy expected (A, 2), got {tuple(cxcy.shape)}"
+                )
+
+            if wh.ndim != 2 or wh.shape[-1] != 2:
+                raise ValueError(
+                    f"Level {i}: anchor_wh expected (A, 2), got {tuple(wh.shape)}"
+                )
+
+            if stride.ndim != 1:
+                raise ValueError(
+                    f"Level {i}: anchor_strides expected (A,), got {tuple(stride.shape)}"
+                )
+
+            # ---- anchor count consistency ----
+            
+            A = pred_anchor_counts[i]
+
+            if cxcy.shape[0] != A:
+                raise ValueError(
+                    f"Level {i}: mismatch in anchor count between prediction anchors and cxcy"
+                    f"({A} vs {cxcy.shape[0]})"
+                )                
+
+            if wh.shape[0] != A:
+                raise ValueError(
+                    f"Level {i}: mismatch in anchor count between prediction anchors and  wh "
+                    f"({A} vs {wh.shape[0]})"
+                )
+
+            if stride.shape[0] != A:
+                raise ValueError(
+                    f"Level {i}: mismatch in anchor count between prediction anchors and stride "
+                    f"({A} vs {stride.shape[0]})"
+                )
+
+            # ---- device consistency ----
+            if device is not None:
+                if cxcy.device != device:
+                    raise ValueError(
+                        f"Level {i}: cxcy on {cxcy.device}, expected {device}"
+                    )
+                if wh.device != device:
+                    raise ValueError(
+                        f"Level {i}: wh on {wh.device}, expected {device}"
+                    )
+                if stride.device != device:
+                    raise ValueError(
+                        f"Level {i}: stride on {stride.device}, expected {device}"
+                    )
+
+        return True
+
+    @staticmethod
+    def compute_loss(outputs:List[torch.Tensor], targets:torch.Tensor,
+                    anchors_proposals:List[torch.Tensor], 
+                    anchor_cxcy:List[torch.Tensor],
+                    anchor_wh:List[torch.Tensor],
+                    anchor_strides:List[torch.Tensor],
+                    img_h, img_w, 
+                    batch_size:int,
+                    cls_loss_type:str="focal"):
+        
+        if len(outputs) == 0 or len(anchors_proposals) == 0:
+            raise ValueError(
+                f"Expected non-empty outputs and anchor proposals, "
+                f"got {len(outputs)} outputs and "
+                f"{len(anchors_proposals)} anchor sets."
+            )
+        
+        if len(outputs) != len(anchors_proposals):
+            raise ValueError(
+                f"Expected equal number of outputs and anchor proposal tensors, "
+                f"got {len(outputs)} outputs and "
+                f"{len(anchors_proposals)} anchor sets."
+            )
+
+
+        device = targets.device
+        batch_labels, batch_bboxes, batch_pos_masks, batch_matches = \
+            ATSS.subsample(
+                anchor_proposals=anchors_proposals,
+                targets=targets,
+                img_h=img_h,
+                img_w=img_w,
+                batch_size=batch_size,
+                device=device
+            )
+        
+        feature_dim = outputs[0].shape[-1]
+        def reshape_output(i: int, output:torch.Tensor):
+            if output.shape[0] != batch_size:
+                raise ValueError(
+                    f"Output tensor {i} has batch size "
+                    f"{output.shape[0]} != {batch_size}"
+                )
+
+            if output.shape[-1] != feature_dim:
+                raise ValueError(
+                    f"Output tensor {i} has feature dim "
+                    f"{output.shape[-1]} != {feature_dim}"
+                )
+            return output.permute(0, 2, 3, 1, 4) \
+                    .contiguous() \
+                    .view(batch_size, -1, output.shape[-1])
+        
+        reshaped_outputs = []
+        pred_anchor_counts = []
+        for i, output in enumerate(outputs):
+            output = reshape_output(i, output)
+            anchor_count = output.shape[1]
+            reshaped_outputs.append(output)
+            pred_anchor_counts.append(anchor_count)
+
+        outputs = torch.cat(
+            reshaped_outputs,
+            dim=1
+        )
+
+        ATSS._validate_anchor_metadata(
+            anchor_cxcy, 
+            anchor_wh,
+            anchor_strides,
+            len(pred_anchor_counts),
+            pred_anchor_counts,
+            device=device
+        )
+
+        anchor_cxcy = torch.cat(anchor_cxcy, dim=0) #(A, 2)
+        anchor_wh = torch.cat(anchor_wh, dim=0) #(A, 2)
+        anchor_strides = torch.cat(anchor_strides, 0) #(A,)
+        
+        lcls = torch.zeros(1, device=device)
+        lbox = torch.zeros(1, device=device)
+        lobj = torch.zeros(1, device=device)        
+
+        raw_xy = outputs[..., :2]
+        raw_wh = outputs[..., 2:4]
+        obj_logits = outputs[..., 4]
+        cls_logits = outputs[..., 5:]
+
+        #offset in (-1, 1) * scale to ± stride pixels + anchor cell center
+        pxy = (raw_xy.sigmoid() * 2 - 1) * anchor_strides[None, :, None] + anchor_cxcy[None, :, :]
+        # pwh: predicted size in pixels. (sigmoid*2)^2 ∈ [0, 4]
+        pwh = (raw_wh.sigmoid() * 2) ** 2 * anchor_wh[None, :, :]
+        pred_xyxy = torch.cat([pxy - pwh / 2, pxy + pwh / 2], dim=-1)   # (B, A, 4)
+
+        iou = DetectionHelper.bbox_iou(pred_xyxy[batch_pos_masks],
+                                       batch_bboxes[batch_pos_masks],
+                                       x1y1x2y2=True, CIoU=True)
+
+        plain_iou = DetectionHelper.bbox_iou(pred_xyxy[batch_pos_masks],
+                                       batch_bboxes[batch_pos_masks],
+                                       x1y1x2y2=True)
+
+        if (plain_iou < 0).any():
+            raise ValueError(
+                f"IOU Tensor contains negative values: {plain_iou[plain_iou < 0]}"
+            )
+        
+        num_pos = batch_pos_masks.sum().item()
+        if num_pos > 0:
+            lbox += (1.0 - iou).mean()
+
+            pos_cls_logits = cls_logits[batch_pos_masks] # (n_pos, K=nc)
+            pos_labels = batch_labels[batch_pos_masks].long() #(n_pos,)
+
+            num_classes = cls_logits.shape[-1]
+            if num_classes > 1:
+                cp = 1.0 - 0.5 * DetectionLossCalculator.label_smoothing
+                cn = 0.5 * DetectionLossCalculator.label_smoothing
+
+                cls_target = torch.full_like(pos_cls_logits, fill_value=cn)
+                cls_target[torch.arange(pos_cls_logits.shape[0]), pos_labels] = cp
+                cls_target = cls_target.detach()
+
+                iou_weight = iou.detach().clamp(0.1, 1.0)
+                if cls_loss_type == "focal":
+                    per_sample = DetectionLossCalculator.focal_loss(
+                        pos_cls_logits, cls_target,
+                        alpha=0.25, gamma=DetectionLossCalculator.gamma,
+                        reduction="none"
+                    )
+                else:
+                    per_sample = torch.nn.functional.binary_cross_entropy_with_logits(pos_cls_logits,
+                                                                                    cls_target,
+                                                                                    reduction="none")
+
+                if DetectionLossCalculator.iou_aware_cls:
+                    lcls += (per_sample.mean(dim=1) * iou_weight).mean()
+                else:
+                    lcls += per_sample.mean()
+
+        obj_target = torch.zeros_like(obj_logits, device=device)
+        obj_target[batch_pos_masks] = plain_iou.detach().clamp(0.1, 1.0)
+
+        obj_per_anchor = torch.nn.functional.binary_cross_entropy_with_logits(
+            obj_logits, obj_target, reduction="none"
+        ) # (bs, A)
+
+        start = 0
+        for i, count in enumerate(pred_anchor_counts):
+            end = start + count
+            obji = obj_per_anchor[:, start:end].mean()
+
+            if DetectionLossCalculator.autobalance:
+                obji_val = obji.detach().item()
+                DetectionLossCalculator.ssi[i] = (
+                    DetectionLossCalculator.ssi[i] * 0.9999 + obji_val * 0.0001
+                )
+                ssi_max = max(DetectionLossCalculator.ssi)
+                balance_i = (DetectionLossCalculator.ssi[i] / (ssi_max + 1e-9))
+                lobj += obji * balance_i
+            else:
+                lobj += obji * DetectionLossCalculator.balance[i]
+
+            start = end
+
+        lbox *= DetectionLossCalculator.bbox_weight
+        lobj *= DetectionLossCalculator.obj_weight
+        lcls *= DetectionLossCalculator.cls_weight            
+
+        loss = lbox + lobj + lcls
+        return loss, {"lbox": lbox, "lobj": lobj, "lcls": lcls}
+        

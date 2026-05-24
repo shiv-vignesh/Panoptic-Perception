@@ -1,6 +1,9 @@
 import os, ast
 from typing import Tuple, Optional, Union, Protocol, runtime_checkable
 
+import warnings
+warnings.simplefilter("once", UserWarning)
+
 import torch
 import torch.nn as nn
 
@@ -12,7 +15,7 @@ from panoptic_perception.models.common import (
 from panoptic_perception.models.utils import parse_model_config, initialize_weights, PanopticModelOutputs
 from panoptic_perception.models.gdip import GDIP, MultiLevelGDIP, build_vision_encoder
 from panoptic_perception.models.denet import DENet
-from panoptic_perception.utils.detection_utils import DetectionLossCalculator
+from panoptic_perception.utils.detection_utils import DetectionLossCalculator, ATSS
 from panoptic_perception.utils.lane_utils import LaneDetectionLossCalculator
 from panoptic_perception.utils.segmentation_utils import SegmentationLossCalculator
 from panoptic_perception.models.model_factory import ModelFactory
@@ -351,7 +354,7 @@ class BaseTaskModel(nn.Module):
 
 @ModelFactory.register_task_model("yolop")
 class YOLOP(BaseTaskModel):
-    def __init__(self, cfg: str, loss_weights: dict = None):
+    def __init__(self, cfg: str, loss_weights: dict = None, use_atss:bool = True):
         super(YOLOP, self).__init__()
 
         module_defs = parse_model_config(cfg)
@@ -363,6 +366,9 @@ class YOLOP(BaseTaskModel):
             "lane_detection":1.0,
             "lane_segmentation": 0.0
         }
+
+        # TODO: Relocate ATSS-specific config outside the model constructor.
+        self.use_atss = use_atss
 
         if module_defs[0]['type'] == 'heads':
             self.module_defs = module_defs[1:]
@@ -384,7 +390,7 @@ class YOLOP(BaseTaskModel):
     def forward(self, x, targets=None) -> PanopticModelOutputs:
         
         cache = {} # Cache for layer outputs
-        _, _, height, width = x.shape
+        batch_size, _, height, width = x.shape
 
         model_outputs = PanopticModelOutputs()
 
@@ -427,6 +433,13 @@ class YOLOP(BaseTaskModel):
 
                     detection_outputs  = module(inputs, image_size=(height, width))
                     model_outputs.detection_logits = detection_outputs
+
+                    if self.use_atss:
+                        model_outputs.anchor_proposals = module._anchor_proposals
+                        model_outputs.proposal_shape = module._proposal_shape
+                        model_outputs.anchor_cxcy = module._anchor_cxcy
+                        model_outputs.anchor_wh = module._anchor_wh
+                        model_outputs.anchor_strides = module._anchor_strides
 
                     if not self.training:
                         model_outputs.detection_predictions = module.activation(detection_outputs)
@@ -484,14 +497,36 @@ class YOLOP(BaseTaskModel):
                 output_name = "detections"
                 assert output_name in targets, f"Target for {output_name} not provided."
 
-                det_loss, det_loss_items = DetectionLossCalculator.compute_detection_loss_2(
-                    model_outputs.detection_logits,
-                    targets["detections"],
-                    self.module_list[self.detection_head_idx].num_layers,
-                    self.module_list[self.detection_head_idx].anchors,
-                    self.module_list[self.detection_head_idx].stride,
-                    cls_loss_type='focal'  # Use focal loss for better class imbalance handling
-                )
+                if self.use_atss:
+                    assert model_outputs.anchor_proposals is not None, \
+                        f"Expected Anchor Proposal for ATSS based Loss"
+
+                    det_loss, det_loss_items = ATSS.compute_loss(
+                        model_outputs.detection_logits,
+                        targets["detections"],
+                        model_outputs.anchor_proposals,
+                        model_outputs.anchor_cxcy,
+                        model_outputs.anchor_wh,
+                        model_outputs.anchor_strides,
+                        img_h=height, img_w=width,
+                        batch_size=batch_size
+                    )
+
+                else:
+                    det_loss, det_loss_items = DetectionLossCalculator.compute_detection_loss_2(
+                        model_outputs.detection_logits,
+                        targets["detections"],
+                        self.module_list[self.detection_head_idx].num_layers,
+                        self.module_list[self.detection_head_idx].anchors,
+                        self.module_list[self.detection_head_idx].stride,
+                        cls_loss_type='focal'  # Use focal loss for better class imbalance handling
+                    )
+
+                # for idx, det_logit in enumerate(model_outputs.detection_logits):
+                #     print(f'{idx} {det_logit.shape}')
+                # if self.use_atss:
+                #     for idx, anchor_proposal in enumerate(model_outputs.anchor_proposals):
+                #         print(f'{idx} {anchor_proposal.shape}')
 
                 # Apply multi-task loss weight
                 model_outputs.detection_loss = det_loss * self.loss_weights.get("detection", 1.0)
@@ -546,7 +581,7 @@ class YOLOP(BaseTaskModel):
 
 @ModelFactory.register_task_model("yolov8p")
 class YOLOv8P(BaseTaskModel):
-    def __init__(self, cfg:str, loss_weights: dict = None):
+    def __init__(self, cfg:str, loss_weights: dict = None, use_atss:bool = True):
         super(YOLOv8P, self).__init__()
         
         module_defs = parse_model_config(cfg)
@@ -557,7 +592,10 @@ class YOLOv8P(BaseTaskModel):
             "drivable_segmentation": 1.0,
             "lane_segmentation": 0.0
         }
-        
+
+        # TODO: Relocate ATSS-specific config outside the model constructor.
+        self.use_atss = use_atss
+
         if module_defs[0]["type"] == "heads":
             self.module_defs = module_defs[1:]
             
@@ -582,7 +620,7 @@ class YOLOv8P(BaseTaskModel):
     def forward(self, x, targets=None):
 
         cache = {} # Cache for layer outputs
-        _, _, height, width = x.shape
+        batch_size, _, height, width = x.shape
         
         model_outputs = PanopticModelOutputs()
         
@@ -625,6 +663,13 @@ class YOLOv8P(BaseTaskModel):
 
                     detection_outputs  = module(inputs, image_size=(height, width))
                     model_outputs.detection_logits = detection_outputs #list
+
+                    if self.use_atss:
+                        model_outputs.anchor_proposals = module._anchor_proposals
+                        model_outputs.proposal_shape = module._proposal_shape
+                        model_outputs.anchor_cxcy = module._anchor_cxcy
+                        model_outputs.anchor_wh = module._anchor_wh
+                        model_outputs.anchor_strides = module._anchor_strides
 
                     if not self.training:
                         model_outputs.detection_predictions = module.activation(detection_outputs) #list
@@ -696,6 +741,14 @@ class YOLOv8P(BaseTaskModel):
                 assert output_name in targets, f"Target for {output_name} not provided."
 
                 if self.anchor_free:
+                    
+                    if self.use_atss:
+                        warnings.warn(
+                            "ATSS currently supported only for Anchor Based Detection",
+                            category=UserWarning,
+                            stacklevel=2
+                        )
+
                     det_loss, det_loss_items = DetectionLossCalculator.compute_detection_loss_v8(
                         model_outputs.cls_logits_raw,
                         model_outputs.bbox_logits_raw,
@@ -706,14 +759,31 @@ class YOLOv8P(BaseTaskModel):
                     )
 
                 else:
-                    det_loss, det_loss_items = DetectionLossCalculator.compute_detection_loss_2(
-                        model_outputs.detection_logits,
-                        targets["detections"],
-                        self.module_list[self.detection_head_idx].num_layers,
-                        self.module_list[self.detection_head_idx].anchors,
-                        self.module_list[self.detection_head_idx].stride,
-                        cls_loss_type='focal'  # Use focal loss for better class imbalance handling
-                    )
+                    if self.use_atss:
+                        assert model_outputs.anchor_proposals is not None, \
+                            f"Expected Anchor Proposal for ATSS based Loss"
+                        
+                        det_loss, det_loss_items = ATSS.compute_loss(
+                            model_outputs.detection_logits,
+                            targets["detections"],
+                            model_outputs.anchor_proposals,
+                            model_outputs.anchor_cxcy,
+                            model_outputs.anchor_wh,
+                            model_outputs.anchor_strides,
+                            img_h=height, img_w=width,
+                            batch_size=batch_size                            
+                        )
+
+                    
+                    else:
+                        det_loss, det_loss_items = DetectionLossCalculator.compute_detection_loss_2(
+                            model_outputs.detection_logits,
+                            targets["detections"],
+                            self.module_list[self.detection_head_idx].num_layers,
+                            self.module_list[self.detection_head_idx].anchors,
+                            self.module_list[self.detection_head_idx].stride,
+                            cls_loss_type='focal'  # Use focal loss for better class imbalance handling
+                        )
 
                 # Apply multi-task loss weight
                 model_outputs.detection_loss = det_loss * self.loss_weights.get("detection", 1.0)

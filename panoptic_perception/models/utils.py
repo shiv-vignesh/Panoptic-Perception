@@ -1,6 +1,6 @@
 
 from dataclasses import dataclass, asdict
-from typing import List, Union
+from typing import List, Tuple
 
 import os
 import torch
@@ -25,6 +25,14 @@ class PanopticModelOutputs:
     lane_detection_loss: torch.Tensor = None
     lane_detection_loss_items: dict = None
     defogging_loss: torch.Tensor = None
+
+    # ---- ATSS - Detection Head -----
+    # List[torch.Tensor]: pre-computed (x, y) center locations per grid
+    anchor_proposals: List[torch.Tensor] = None
+    anchor_cxcy: List[torch.Tensor] = None
+    anchor_wh: List[torch.Tensor] = None
+    anchor_strides: List[torch.Tensor] = None
+    proposal_shape: Tuple[Tuple[int, int], ...] = None
 
     # ---- YoloV8 Anchor-Free Detection Head Outputs ----
     bbox_logits_raw: torch.Tensor = None
