@@ -80,7 +80,7 @@ def create_optimizer(model:Union[BaseTaskModel, BaseEnhancementModel],
     for pg in param_groups:
         scale = pg.get("lr_scale", 1.0)
         pg["lr"] = training_args.initial_lr * scale
-        logger.log_message(f"  Param group '{pg.get('name', '?')}': lr_scale={scale}, lr={pg['lr']:.6f}, params={len(pg['params'])}, trainable={pg['trainable']}")
+        logger.log_message(f"  Param group '{pg.get('name', '?')}': lr_scale={scale}, lr={pg['lr']:.6f}, params={len(pg['params'])}, trainable={pg.get('trainable', True)}")
 
     ctx = OptimizerContext(param_groups, training_args)
 

@@ -344,16 +344,11 @@ class BaseTaskModel(nn.Module):
         raise NotImplementedError(f"{self.__class__.__name__} forward not callable")
 
     def get_active_tasks(self):
-
         tasks = []
-        if self.detection_head_idx != -1:
-            tasks.append("Detection, ")
-        if self.segmentation_head_idx != -1:
-            tasks.append("Drivable Segmentation, ")
-        if self.lane_segmentation_head_idx != -1:
-            tasks.append("Lane Segmentation")            
-
-        tasks = 'Tasks: '.join(tasks)    
+        if self.detection_head_idx != -1:        tasks.append("Detection")
+        if self.segmentation_head_idx != -1:     tasks.append("Drivable Segmentation")
+        if self.lane_segmentation_head_idx != -1: tasks.append("Lane Segmentation")
+        return "Tasks: " + ", ".join(tasks) if tasks else "Tasks: none"
 
 @ModelFactory.register_task_model("yolop")
 class YOLOP(BaseTaskModel):
