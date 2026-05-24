@@ -252,7 +252,8 @@ class BaseTaskModel(nn.Module):
             return [{
                 "params": list(self.parameters()),
                 "name": self.__class__.__name__,
-                "lr_scale":1.0
+                "lr_scale":1.0,
+                "trainable": True
             }]
         
         param_groups, frozen_layers, dcn_offset_params, dcn_conv_params = self._build_param_groups(groups)        
@@ -262,14 +263,16 @@ class BaseTaskModel(nn.Module):
             param_groups.append({
                 "params": dcn_offset_params,
                 "name": "dcn_offset",
-                "lr_scale": dcn_lr_mult  # e.g., 0.1 = 10x lower LR
+                "lr_scale": dcn_lr_mult,  # e.g., 0.1 = 10x lower LR
+                "trainable": True
             })
 
         if dcn_conv_params:
             param_groups.append({
                 "params": dcn_conv_params,
                 "name": "dcn_conv",
-                "lr_scale": dcn_lr_mult * 5  # e.g., 0.5 = 2x lower LR
+                "lr_scale": dcn_lr_mult * 5,  # e.g., 0.5 = 2x lower LR
+                "trainable": True
             })
             
         if frozen_layers:        
