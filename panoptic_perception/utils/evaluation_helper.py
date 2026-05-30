@@ -63,38 +63,42 @@ class DetectionMetrics:
         ap_per_class = defaultdict(float)
         stats_per_class = defaultdict(lambda : defaultdict(float))
 
-        tp_img = np.zeros(shape=(len(all_detections), num_classes)) #per image
-        fp_img = np.zeros(shape=(len(all_detections), num_classes)) #per image
-        fn_img = np.zeros(shape=(len(all_detections), num_classes))
+        image_indices = sorted(set(all_detections.keys()) | set(all_ground_truths.keys()))
+
+        tp_img = np.zeros(shape=(len(image_indices), num_classes)) #per image
+        fp_img = np.zeros(shape=(len(image_indices), num_classes)) #per image
+        fn_img = np.zeros(shape=(len(image_indices), num_classes))
 
         for cls in range(num_classes):
             all_scores = []
             all_is_tp = []
             total_gt = 0
             
-            for image_idx in all_detections:
-                detetctions = all_detections[image_idx]
+            for row_idx, image_idx in enumerate(image_indices):
+                detections = all_detections.get(image_idx)
                 gts = all_ground_truths.get(image_idx)
 
-                if detetctions is None:
-                    continue
                 if gts is None:
-                    gts = detetctions.new_zeros((0, 5))
+                    if detections is None:
+                        continue
+                    gts = detections.new_zeros((0, 5))
+                if detections is None:
+                    detections = gts.new_zeros((0, 6))
                 
-                cls_dets = detetctions[detetctions[:, -1] == cls]
+                cls_dets = detections[detections[:, -1] == cls]
                 cls_gts = gts[gts[:, -1] == cls]
                 total_gt += cls_gts.shape[0]
                 
                 if cls_dets.shape[0] == 0:
                     #false negatives
                     if cls_gts.shape[0] > 0:
-                        fn_img[image_idx][cls] += cls_gts.shape[0]                    
+                        fn_img[row_idx][cls] += cls_gts.shape[0]
                 
                     continue
                 
                 #false postives
                 if cls_dets.shape[0] > 0 and cls_gts.shape[0] == 0:
-                    fp_img[image_idx][cls] += cls_dets.shape[0]
+                    fp_img[row_idx][cls] += cls_dets.shape[0]
                     
                     all_scores.extend(cls_dets[:, 4].cpu().tolist())
                     all_is_tp.extend([0]*cls_dets.shape[0])
@@ -119,15 +123,15 @@ class DetectionMetrics:
                     if max_iou >= iou_threshold and not matched_gt[gt_i]:
                         matched_gt[gt_i] = True
                         all_is_tp.append(1)
-                        tp_img[image_idx][cls] += 1
+                        tp_img[row_idx][cls] += 1
                         
                     else:
                         all_is_tp.append(0)
-                        fp_img[image_idx][cls] += 1
+                        fp_img[row_idx][cls] += 1
                         
                     all_scores.append(cls_dets[det_i, 4].item())
                         
-                fn_img[image_idx][cls] += (~matched_gt).sum().item()
+                fn_img[row_idx][cls] += (~matched_gt).sum().item()
                 
             if not all_scores:
                 ap_per_class[f"AP_class_{cls}"] = 0.0

@@ -112,6 +112,11 @@ from terminaltables import AsciiTable
 CLASS_NAMES = [cls.name for cls in BDD100KClassesReduced]
 
 class Trainer:
+    @staticmethod
+    def _default_stats_iou_threshold(metric_eval_mode: str) -> float:
+        if metric_eval_mode == "lenient":
+            return 0.25
+        return 0.5
     
     def __init__(self, model:Optional[Union[YOLOP, YOLOv8P, GDIPYolo, DENetYolo]], device:torch.device,
                  dataset_kwargs:dict, 
@@ -125,6 +130,12 @@ class Trainer:
         self.is_training = trainer_kwargs["is_training"]
         self.first_val_epoch = trainer_kwargs["first_val_epoch"]
         self.eval_visualize_outputs = trainer_kwargs.get("eval_visualize_outputs", False)
+        self.metric_eval_mode = trainer_kwargs.get("metric_eval_mode", "strict")
+        self.metric_average_mode = trainer_kwargs.get("metric_average_mode", "macro")
+        self.stats_iou_threshold = trainer_kwargs.get(
+            "stats_iou_threshold",
+            self._default_stats_iou_threshold(self.metric_eval_mode),
+        )
 
         self.epochs = trainer_kwargs["epochs"]
         self.monitor_train = trainer_kwargs["monitor_train"]
@@ -296,10 +307,12 @@ class Trainer:
                     depth_estimator=depth_estimator,
                 )
             else:
+                dataset_mode = DatasetMode.TRAIN if dataset_type == "train" else DatasetMode.EVAL
                 dataset = BDD100KDataset(
                     base_kwargs,
                     dataset_type=dataset_type,
                     perform_augmentation=perform_augmentation,
+                    mode=dataset_mode,
                 )
 
             return DataLoader(
@@ -1130,12 +1143,17 @@ class Trainer:
                         else:
                             dets_by_image[global_image_idx] = None
                         
-                        mask = data_items["detections"][:, 0] == image_idx
-                        img_targets = data_items["detections"][mask]
+                        target_detections = data_items.get("detections")
                         gts = None
-                        
-                        if img_targets.shape[0] > 0:
-                            boxes_xywh = img_targets[:, 2:6]
+
+                        if target_detections is not None:
+                            mask = target_detections[:, 0] == image_idx
+                            img_targets = target_detections[mask]
+                        else:
+                            img_targets = None
+
+                        if img_targets is not None and img_targets.shape[0] > 0:
+                            boxes_xywh = img_targets[:, 2:6].clone()
                             boxes_xywh[:, [0,2]] *= image_w
                             boxes_xywh[:, [1,3]] *= image_h
                             boxes_xyxy = DetectionHelper.xywh2xyxy(boxes_xywh)
@@ -1260,7 +1278,8 @@ class Trainer:
         detection_metrics = {}
         num_classes = len(BDD100KClassesReduced)
         
-        stats_iou_threshold=0.25
+        stats_iou_threshold = self.stats_iou_threshold
+        ap_label = f"mAP@{stats_iou_threshold:g}"
         ap_results, stats_per_class = DetectionMetrics.compute_stats(
             dets_by_image,
             gt_by_image,
@@ -1276,10 +1295,10 @@ class Trainer:
             class_name = BDD100KClassesReduced(cls).name
             ap_value = ap_results.get(f'AP_class_{cls}', 0.0)
             ap_table_data.append([f"{cls}: {class_name}", f"{ap_value:.4f}"])
-        ap_table_data.append(["mAP@0.5", f"{ap_results['mAP']:.4f}"])
+        ap_table_data.append([ap_label, f"{ap_results['mAP']:.4f}"])
 
         ap_table_string = AsciiTable(ap_table_data).table
-        self.logger.log_message(f"\n[{metric_prefix}] Detection Metrics (AP@0.5):")
+        self.logger.log_message(f"\n[{metric_prefix}] Detection Metrics (AP@{stats_iou_threshold:g}):")
         self.logger.log_message(ap_table_string)
         
         #Create Stats (TP, FP, FN)
@@ -1302,7 +1321,7 @@ class Trainer:
 
         # Log AP table to WandB
         wandb_ap_data = [[f"{cls}: {BDD100KClassesReduced(cls).name}", ap_results.get(f'AP_class_{cls}', 0.0)] for cls in range(num_classes)]
-        wandb_ap_data.append(["mAP@0.5", ap_results['mAP']])
+        wandb_ap_data.append([ap_label, ap_results['mAP']])
         self.wandb_logger.log_table(
             f"{metric_prefix}/detection_ap",
             columns=["Class", "AP"],
@@ -1372,6 +1391,7 @@ class Trainer:
         # Add detection metrics
         if detection_metrics:
             wandb_metrics[f"{metric_prefix}/mAP"] = detection_metrics["mAP"]
+            wandb_metrics[f"{metric_prefix}/{ap_label}"] = detection_metrics["mAP"]
             for cls in range(num_classes):
                 wandb_metrics[f"{metric_prefix}/AP_class_{cls}"] = detection_metrics.get(f'AP_class_{cls}', 0.0)
 
@@ -1394,7 +1414,7 @@ class Trainer:
             f'Det Loss: {avg_det_loss:.4f} | Drivable Loss: {avg_drivable_loss:.4f}'
         )
         if detection_metrics:
-            self.logger.log_message(f'  [{metric_prefix}] mAP@0.5: {detection_metrics["mAP"]:.4f}')
+            self.logger.log_message(f'  [{metric_prefix}] {ap_label}: {detection_metrics["mAP"]:.4f}')
         if drivable_metrics:
             self.logger.log_message(f'  [{metric_prefix}] Drivable mIoU: {drivable_metrics["mIoU"]:.4f}')
 
