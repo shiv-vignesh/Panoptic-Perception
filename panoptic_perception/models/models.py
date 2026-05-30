@@ -19,6 +19,7 @@ from panoptic_perception.utils.detection_utils import DetectionLossCalculator, A
 from panoptic_perception.utils.lane_utils import LaneDetectionLossCalculator
 from panoptic_perception.utils.segmentation_utils import SegmentationLossCalculator
 from panoptic_perception.models.model_factory import ModelFactory
+from panoptic_perception.losses.detection import DetectionLoss
 
 def create_modules(module_defs: list,
                    segmentation_head_idx: int = -1,

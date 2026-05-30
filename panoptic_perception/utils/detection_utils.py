@@ -3,6 +3,8 @@ import torch
 import torchvision
 import numpy as np
 
+from typing_extensions import deprecated
+
 class DetectionHelper:
     
     @staticmethod    
@@ -551,6 +553,7 @@ class DetectionLossCalculator:
 
         return tcls, tbox, indices, anch
 
+    @deprecated(f'')
     @staticmethod
     def compute_detection_loss_2(outputs:List[torch.Tensor], targets:torch.Tensor, 
                                 num_layers:int, anchors:torch.Tensor, stride:torch.Tensor,
