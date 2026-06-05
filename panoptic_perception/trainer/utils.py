@@ -6,7 +6,7 @@ from collections import defaultdict
 import torch
 import numpy as np
 
-from panoptic_perception.models.utils import PanopticModelOutputs
+from panoptic_perception.models.types import PanopticModelOutputs
 
 def listify(p: Any):
 

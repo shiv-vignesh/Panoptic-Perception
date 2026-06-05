@@ -10,7 +10,7 @@ from collections import defaultdict
 from tqdm import tqdm
 
 from panoptic_perception.models.models import BaseTaskModel, BaseEnhancementModel
-from panoptic_perception.models.utils import PanopticModelOutputs
+from panoptic_perception.models.types import PanopticModelOutputs
 
 from panoptic_perception.utils.logger import Logger
 from panoptic_perception.utils.wandb_logger import WandBLogger

@@ -1,53 +1,5 @@
-
-from dataclasses import dataclass, asdict
-from typing import List, Tuple
-
 import os
 import torch
-
-@dataclass
-class PanopticModelOutputs:
-    
-    detection_logits: List[torch.Tensor] = None
-    drivable_segmentation_logits: torch.Tensor = None
-    lane_segmentation_logits: torch.Tensor = None 
-    lane_detection_logits: torch.Tensor = None
-    lane_seg_logits: torch.Tensor = None
-    
-    detection_predictions: List[torch.Tensor] = None
-    drivable_segmentation_predictions: torch.Tensor = None
-    lane_segmentation_predictions: torch.Tensor = None        
-    lane_detection_predictions : torch.Tensor = None
-    
-    detection_loss: torch.Tensor = None
-    drivable_segmentation_loss: torch.Tensor = None
-    lane_segmentation_loss: torch.Tensor = None
-    lane_detection_loss: torch.Tensor = None
-    lane_detection_loss_items: dict = None
-    defogging_loss: torch.Tensor = None
-
-    # ---- ATSS - Detection Head -----
-    # List[torch.Tensor]: pre-computed (x, y) center locations per grid
-    anchor_proposals: List[torch.Tensor] = None
-    anchor_cxcy: List[torch.Tensor] = None
-    anchor_wh: List[torch.Tensor] = None
-    anchor_strides: List[torch.Tensor] = None
-    proposal_shape: Tuple[Tuple[int, int], ...] = None
-
-    # ---- YoloV8 Anchor-Free Detection Head Outputs ----
-    bbox_logits_raw: torch.Tensor = None
-    cls_logits_raw: torch.Tensor = None
-    anchor_points: torch.Tensor = None
-    strides: torch.Tensor = None
-
-    def keys(self):
-        return self.__dict__.keys()
-
-    def items(self):
-        return self.__dict__.items()
-
-    def values(self):
-        return self.__dict__.values()
 
 class WeightsManager:
     def __init__(self, verbose=True):

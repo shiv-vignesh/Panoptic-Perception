@@ -21,7 +21,7 @@ class ModelFactory:
         return decorator
 
     @classmethod
-    def from_config(cls, model_kwargs:dict, loss_weights:dict = None):
+    def from_config(cls, model_kwargs:dict):
         model_type = model_kwargs.get("model_type", "")
         cfg_path = model_kwargs.get("cfg_path", "")
                 
@@ -30,7 +30,7 @@ class ModelFactory:
             raise KeyError(f'Unknown Model Class: {model_type}')
         
         task_model_cls = cls._task_models[model_type]
-        task_model = task_model_cls(cfg_path, loss_weights=loss_weights)
+        task_model = task_model_cls(cfg_path)
         
         enhancement = model_kwargs.get("enhancement")
         if enhancement is None:

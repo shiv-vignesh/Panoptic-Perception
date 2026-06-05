@@ -15,6 +15,8 @@ from panoptic_perception.dataset.bdd100k_dataset import BDD100KDataset, FoggyBDD
 
 import gc
 
+from panoptic_perception.models.types import PanopticModelOutputs
+
 class ModelEMA:
     """
     Exponential Moving Average of model weights.
@@ -100,7 +102,7 @@ class ModelEMA:
 from panoptic_perception.dataset.enums import BDD100KClassesReduced
 
 from panoptic_perception.models.models import YOLOP, YOLOv8P, GDIPYolo, DENetYolo, get_model_param_groups
-from panoptic_perception.models.utils import PanopticModelOutputs, WeightsManager
+from panoptic_perception.models.utils import WeightsManager
 
 from panoptic_perception.utils.logger import Logger
 from panoptic_perception.utils.wandb_logger import WandBLogger

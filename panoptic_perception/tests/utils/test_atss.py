@@ -206,39 +206,3 @@ def test_compute_loss_empty_targets(yolop_model, image, empty_targets):
             "detections": empty_targets.to(device)
         }
     )
-
-# def test_subsample_infers_batch_size_when_none(atss, anchor_proposals, targets, img_size):
-#     """batch_size=None should derive from max(targets[:, 0]) without crashing."""
-#     H, W = img_size
-#     atss.subsample(
-#         anchor_proposals=anchor_proposals,
-#         targets=targets,
-#         img_w=W,
-#         img_h=H,
-#         batch_size=None,
-#     )
-
-
-# def test_subsample_rejects_wrong_target_shape(atss, anchor_proposals, img_size):
-#     """Targets must be (N, 6); other shapes should fail the assert."""
-#     H, W = img_size
-#     bad_targets = torch.zeros((3, 5), dtype=torch.float32)  # missing one column
-#     with pytest.raises(AssertionError):
-#         atss.subsample(
-#             anchor_proposals=anchor_proposals,
-#             targets=bad_targets,
-#             img_w=W,
-#             img_h=H,
-#             batch_size=2,
-#         )
-
-
-# def test_anchor_fixture_shapes(anchor_proposals):
-#     """Sanity check on the fixture itself so failures upstream are obvious."""
-#     expected_counts = [20 * 20 * 3, 40 * 40 * 3, 80 * 80 * 3]
-#     assert len(anchor_proposals) == 3
-#     for level, expected in zip(anchor_proposals, expected_counts):
-#         assert level.shape == (expected, 4)
-#         # xyxy invariant: x2 > x1, y2 > y1
-#         assert torch.all(level[:, 2] > level[:, 0])
-#         assert torch.all(level[:, 3] > level[:, 1])

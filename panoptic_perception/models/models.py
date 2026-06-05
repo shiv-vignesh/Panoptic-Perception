@@ -1,8 +1,10 @@
 import os, ast
-from typing import Tuple, Optional, Union, Protocol, runtime_checkable
+from typing import Tuple, Optional, Union, Dict
 
 import warnings
 warnings.simplefilter("once", UserWarning)
+
+from panoptic_perception.models.types import DetectionLossItems, DrivableSegmentationLossItems, LaneDetectionLossItems, ModelArchitectureInfo, PanopticModelOutputs
 
 import torch
 import torch.nn as nn
@@ -12,14 +14,18 @@ from torchmetrics.image import StructuralSimilarityIndexMeasure
 from panoptic_perception.models.common import (
     ConvBlock, Focus, BottleneckCSP, SPP, Upsample, Detect, C2F, SPPF, DetectV8, LaneDetect
 )
-from panoptic_perception.models.utils import parse_model_config, initialize_weights, PanopticModelOutputs
+from panoptic_perception.models.utils import (
+        parse_model_config, initialize_weights
+    )
+
 from panoptic_perception.models.gdip import GDIP, MultiLevelGDIP, build_vision_encoder
 from panoptic_perception.models.denet import DENet
+from panoptic_perception.losses.multi_task_loss import MultiTaskLoss
+
 from panoptic_perception.utils.detection_utils import DetectionLossCalculator, ATSS
 from panoptic_perception.utils.lane_utils import LaneDetectionLossCalculator
 from panoptic_perception.utils.segmentation_utils import SegmentationLossCalculator
 from panoptic_perception.models.model_factory import ModelFactory
-from panoptic_perception.losses.detection import DetectionLoss
 
 def create_modules(module_defs: list,
                    segmentation_head_idx: int = -1,
@@ -198,16 +204,46 @@ def create_modules(module_defs: list,
     return nn.ModuleList(module_list), routes, module_names, _cache_layer_idx
 
 class BaseTaskModel(nn.Module):
-    def __init__(self):
+    def __init__(self, loss_function:Optional[MultiTaskLoss]=None):
         super(BaseTaskModel, self).__init__()
         
         self.module_list : nn.ModuleList = None
+        self.module_names : list = []
         self._frozen_layer_indices: list[int] = []
 
         self.detection_head_idx : int = -1
         self.segmentation_head_idx : int = -1
         self.lane_segmentation_head_idx : int = -1
 
+        self._loss_function = loss_function
+        self._task_heads_cfg : dict = None
+
+    @property
+    def loss_function(self):
+        return self._loss_function
+    
+    @loss_function.setter
+    def loss_function(self, loss_fn:MultiTaskLoss):
+
+        if loss_fn is not None and not isinstance(loss_fn, MultiTaskLoss):
+            raise ValueError(
+                f"Currently supported loss function: {MultiTaskLoss}, got {type(loss_fn.__name__)}"
+            )
+        
+        self._loss_function = loss_fn
+
+    @property
+    def architecture_info(self) -> ModelArchitectureInfo:
+        names = set(self.module_names)
+        #TODO, need a scalable method of mapping task info
+        return ModelArchitectureInfo(
+            has_anchor_based_detection = "Detect"                  in names,
+            has_anchor_free_detection  = "DetectV8"                in names,
+            has_drivable_seg           = "DrivableAreaSegmentation" in names,
+            has_lane_seg               = "LaneSegmentation"        in names,
+            has_lane_det               = "LaneDetect"              in names,
+        )
+    
     def _freeze_bn(self, module):
         """
         Freeze BatchNorm layers in frozen modules by setting them to eval mode
@@ -233,9 +269,9 @@ class BaseTaskModel(nn.Module):
         groups = optimizer_kwargs.get("groups", {})
         dcn_lr_mult = optimizer_kwargs.get("dcn_lr_mult", 0.1)  # DCN offset LR = base_lr * 0.1
 
-        return self.configure_param_groups(groups, dcn_lr_mult)
+        return self._configure_param_groups(groups, dcn_lr_mult)
 
-    def configure_param_groups(self, groups:dict, dcn_lr_mult:float=0.1):
+    def _configure_param_groups(self, groups:dict, dcn_lr_mult:float=0.1):
         """
         Configure parameter groups for training with selective freezing.
         - Grouping done based on the layer_index start and end
@@ -350,24 +386,146 @@ class BaseTaskModel(nn.Module):
         if self.segmentation_head_idx != -1:     tasks.append("Drivable Segmentation")
         if self.lane_segmentation_head_idx != -1: tasks.append("Lane Segmentation")
         return "Tasks: " + ", ".join(tasks) if tasks else "Tasks: none"
+    
+    def _build_detection_loss_items(self, model_outputs:PanopticModelOutputs,
+                                    det_targets:torch.Tensor,
+                                    height:int, width:int, 
+                                    batch_size:int):
+        
+        detection_loss_items = DetectionLossItems()
+        detection_loss_items.detection_logits = model_outputs.detection_logits
+        detection_loss_items.anchor_proposals = model_outputs.anchor_proposals
+        detection_loss_items.anchor_cxcy = model_outputs.anchor_cxcy
+        detection_loss_items.anchor_wh = model_outputs.anchor_wh
+        detection_loss_items.anchor_strides = model_outputs.anchor_strides
+        detection_loss_items.image_size = (height, width)
+        detection_loss_items.batch_size = batch_size
+
+        detection_loss_items.pred_scores_logits = model_outputs.cls_logits_raw
+        detection_loss_items.pred_distri_logits = model_outputs.bbox_logits_raw
+        detection_loss_items.anchor_points = model_outputs.anchor_points
+        detection_loss_items.strides_v8 = model_outputs.strides_v8
+
+        detection_loss_items.num_layers = self.module_list[self.detection_head_idx].num_layers
+        detection_loss_items.anchors = self.module_list[self.detection_head_idx].anchors \
+                                    if hasattr(self.module_list[self.detection_head_idx], "anchors") else None
+        detection_loss_items.stride = self.module_list[self.detection_head_idx].stride \
+                                    if hasattr(self.module_list[self.detection_head_idx], "stride") else None
+
+        detection_loss_items.targets = det_targets
+
+        return detection_loss_items
+    
+    def _build_drivable_loss_items(self, model_outputs:PanopticModelOutputs,
+                                   targets_drivable:torch.Tensor):
+
+        drivable_loss_items = DrivableSegmentationLossItems()
+        drivable_loss_items.drivable_segmentation_logits = model_outputs.drivable_segmentation_logits
+        drivable_loss_items.targets = targets_drivable
+
+        return drivable_loss_items
+    
+    def _build_lane_detection_loss_items(self, model_outputs:PanopticModelOutputs,
+                                    targets_lane_dets:torch.Tensor, 
+                                    targets_lane_seg_masks:torch.Tensor,
+                                    height:int, width:int):
+
+        lane_detection_loss_items = LaneDetectionLossItems()
+        lane_detection_loss_items.lane_detection_logits = model_outputs.lane_detection_logits
+        lane_detection_loss_items.targets_detections = targets_lane_dets
+        lane_detection_loss_items.image_size = (height, width)
+        lane_detection_loss_items.lane_seg_logits = model_outputs.lane_seg_logits
+        lane_detection_loss_items.targets_seg_masks = targets_lane_seg_masks
+
+        return lane_detection_loss_items
+
+    def _build_loss_items(self, model_outputs:PanopticModelOutputs, 
+                          targets:Dict[str, torch.Tensor],
+                          height:int, width:int,
+                          batch_size:int):
+
+        if self.training and (self.loss_function is None or not isinstance(self.loss_function, MultiTaskLoss)):
+            raise ValueError(f'Expected loss function of type: {MultiTaskLoss.__name__}, got {self.loss_function}')
+
+        loss_outputs = {}
+
+        has_detection_output = (
+            model_outputs.detection_logits is not None  or
+            model_outputs.bbox_logits_raw is not None
+        )
+
+        if has_detection_output and targets.get("detections") is not None:
+
+            loss_outputs["detection"] = self._build_detection_loss_items(
+                model_outputs,
+                targets["detections"],
+                height, width,
+                batch_size
+            )
+
+        if model_outputs.drivable_segmentation_logits is not None and targets.get("drivable_area_seg") is not None:
+
+            loss_outputs["drivable_segmentation"] = self._build_drivable_loss_items(
+                model_outputs,
+                targets["drivable_area_seg"]
+            )
+
+        if model_outputs.lane_detection_logits is not None and targets.get("lanes_detections") is not None:
+            
+            loss_outputs["lane_detection"] = self._build_lane_detection_loss_items(
+                model_outputs,
+                targets["lanes_detections"],
+                targets.get("lane_seg_masks"),
+                height, width
+            )
+
+        if model_outputs.lane_segmentation_logits is not None and targets.get("lane_seg") is not None:
+
+            raise NotImplementedError(
+                f"Currently Lane Task is Detection Based, Segmentation based unsupported!"
+            )
+
+            #TODO, replace loss function like above tasks
+            # lane_detection_loss_items = LaneDetectionLossItems()
+            # lane_detection_loss_items.lane_seg_logits = model_outputs.lane_segmentation_logits
+
+            # lane_seg_loss = SegmentationLossCalculator.compute_segmentation_loss(
+            #     model_outputs.lane_segmentation_logits,
+            #     targets["lane_seg"]
+            # )
+
+        return loss_outputs
+    
+    def _compute_loss(self, model_outputs:PanopticModelOutputs, 
+                          targets:Dict[str, torch.Tensor],
+                          height:int, width:int,
+                          batch_size:int, 
+                          device:torch.device):
+        
+        loss_outputs = self._build_loss_items(model_outputs,
+                                              targets,
+                                              height, 
+                                              width, batch_size)
+        
+        multi_task_loss, multi_task_loss_items = self.loss_function(
+            loss_outputs, device
+        )        
+
+        for task_name, task_loss in multi_task_loss.items():
+            if task_name == "detection":
+                model_outputs.detection_loss = task_loss
+            if task_name == "lane_detection":
+                model_outputs.lane_detection_loss = task_loss
+            if task_name == "drivable_segmentation":
+                model_outputs.drivable_segmentation_loss = task_loss        
 
 @ModelFactory.register_task_model("yolop")
 class YOLOP(BaseTaskModel):
-    def __init__(self, cfg: str, loss_weights: dict = None, use_atss:bool = True):
+    def __init__(self, cfg: str, loss_function:MultiTaskLoss=None):
         super(YOLOP, self).__init__()
+        #TODO, remove use_atss:bool = True
 
-        module_defs = parse_model_config(cfg)
-
-        # Multi-task loss weights (detection prioritized by default)
-        self.loss_weights = loss_weights or {
-            "detection": 1.0,
-            "drivable_segmentation": 1.0,
-            "lane_detection":1.0,
-            "lane_segmentation": 0.0
-        }
-
-        # TODO: Relocate ATSS-specific config outside the model constructor.
-        self.use_atss = use_atss
+        module_defs = parse_model_config(cfg)        
 
         if module_defs[0]['type'] == 'heads':
             self.module_defs = module_defs[1:]
@@ -383,13 +541,16 @@ class YOLOP(BaseTaskModel):
             lane_segmentation_head_idx=self.lane_segmentation_head_idx
         )
 
+        self.loss_function = loss_function
+
         # Initialize model weights
         initialize_weights(self)
         
-    def forward(self, x, targets=None) -> PanopticModelOutputs:
+    def forward(self, x, targets:Dict[str, torch.Tensor]=None) -> PanopticModelOutputs:
         
         cache = {} # Cache for layer outputs
         batch_size, _, height, width = x.shape
+        device = x.device
 
         model_outputs = PanopticModelOutputs()
 
@@ -433,19 +594,15 @@ class YOLOP(BaseTaskModel):
                     detection_outputs  = module(inputs, image_size=(height, width))
                     model_outputs.detection_logits = detection_outputs
 
-                    if self.use_atss:
-                        model_outputs.anchor_proposals = module._anchor_proposals
-                        model_outputs.proposal_shape = module._proposal_shape
-                        model_outputs.anchor_cxcy = module._anchor_cxcy
-                        model_outputs.anchor_wh = module._anchor_wh
-                        model_outputs.anchor_strides = module._anchor_strides
+                    model_outputs.anchor_proposals = module._anchor_proposals
+                    model_outputs.proposal_shape = module._proposal_shape
+                    model_outputs.anchor_cxcy = module._anchor_cxcy
+                    model_outputs.anchor_wh = module._anchor_wh
+                    model_outputs.anchor_strides = module._anchor_strides
 
                     if not self.training:
                         model_outputs.detection_predictions = module.activation(detection_outputs)
 
-                    # for detection in detection_outputs:
-                    #     print(f'Layer: {i} - Module Name: {self.module_names[i]} - prediction shape: {detection.shape}')
-                
                 elif self.module_names[i] == "LaneDetect":
                     inputs = []
                     for r in route:
@@ -469,131 +626,34 @@ class YOLOP(BaseTaskModel):
             if self.module_names[i] == "DrivableAreaSegmentation":
                 model_outputs.drivable_segmentation_logits = x
                 if not self.training:
-                    # predictions["drivable_area_seg"] = x
                     model_outputs.drivable_segmentation_predictions = torch.softmax(x, dim=1)
-                    # model_outputs.drivable_segmentation_predictions = torch.sigmoid(x)
-                # print(f'Layer: {i} - Module Name: {self.module_names[i]} (Drivable Area Seg Head) - output shape: {x.shape}')
 
             elif self.module_names[i] == "LaneSegmentation":
                 model_outputs.lane_segmentation_logits = x
                 if not self.training:
                     model_outputs.lane_segmentation_predictions = torch.softmax(x, dim=1)
 
-                # print(f'Layer: {i} - Module Name: {self.module_names[i]} (Lane Seg Head) - output shape: {x.shape}')
-
-            # else:
-            #     # print(f'Layer: {i} - Module Name: {self.module_names[i]} - output shape: {x.shape}')
-
             if i in self._cache_layer_idx:
                 cache[i] = x
-                
-            # print(f'Layer_idx: {i} - ModuleName: {self.module_names[i]} - TensorShape: {x.shape}')
 
-        
         if targets is not None:
 
-            if model_outputs.detection_logits is not None and targets["detections"] is not None:
-                output_name = "detections"
-                assert output_name in targets, f"Target for {output_name} not provided."
-
-                if self.use_atss:
-                    assert model_outputs.anchor_proposals is not None, \
-                        f"Expected Anchor Proposal for ATSS based Loss"
-
-                    det_loss, det_loss_items = ATSS.compute_loss(
-                        model_outputs.detection_logits,
-                        targets["detections"],
-                        model_outputs.anchor_proposals,
-                        model_outputs.anchor_cxcy,
-                        model_outputs.anchor_wh,
-                        model_outputs.anchor_strides,
-                        img_h=height, img_w=width,
-                        batch_size=batch_size
-                    )
-
-                else:
-                    det_loss, det_loss_items = DetectionLossCalculator.compute_detection_loss_2(
-                        model_outputs.detection_logits,
-                        targets["detections"],
-                        self.module_list[self.detection_head_idx].num_layers,
-                        self.module_list[self.detection_head_idx].anchors,
-                        self.module_list[self.detection_head_idx].stride,
-                        cls_loss_type='focal'  # Use focal loss for better class imbalance handling
-                    )
-
-                # for idx, det_logit in enumerate(model_outputs.detection_logits):
-                #     print(f'{idx} {det_logit.shape}')
-                # if self.use_atss:
-                #     for idx, anchor_proposal in enumerate(model_outputs.anchor_proposals):
-                #         print(f'{idx} {anchor_proposal.shape}')
-
-                # Apply multi-task loss weight
-                model_outputs.detection_loss = det_loss * self.loss_weights.get("detection", 1.0)
-
-            if model_outputs.lane_detection_logits is not None and targets["lanes_detections"] is not None:
-                output_name = "lanes_detections"
-                assert output_name in targets, f"Target for {output_name} not provided."
-
-                lane_det_loss, lane_det_loss_items = LaneDetectionLossCalculator.compute_lane_det_loss(
-                    model_outputs.lane_detection_logits,
-                    targets["lanes_detections"],
-                    img_w=width,
-                    img_h=height
-                )
-                
-                model_outputs.lane_detection_loss = lane_det_loss * self.loss_weights.get("lane_detection", 1.0)
-                model_outputs.lane_detection_loss_items = lane_det_loss_items                
-
-                if model_outputs.lane_seg_logits is not None and targets["lane_seg_masks"] is not None:
-                    seg_loss = torch.nn.functional.nll_loss(
-                        torch.nn.functional.log_softmax(model_outputs.lane_seg_logits, dim=1),
-                        targets["lane_seg_masks"].long()
-                    )
-
-                    model_outputs.lane_detection_loss += seg_loss * self.loss_weights.get("lane_seg", 1.0)
-                    model_outputs.lane_detection_loss_items["lane_seg_loss"] = seg_loss.item()
-
-            if model_outputs.drivable_segmentation_logits is not None and targets["drivable_area_seg"] is not None:
-                output_name = "drivable_area_seg"
-                assert output_name in targets, f"Target for {output_name} not provided."
-                drivable_seg_loss = SegmentationLossCalculator.compute_segmentation_loss(
-                    model_outputs.drivable_segmentation_logits,
-                    targets["drivable_area_seg"]
-                )
-                # Apply multi-task loss weight
-                model_outputs.drivable_segmentation_loss = drivable_seg_loss * self.loss_weights.get("drivable_segmentation", 0.2)
-                # print(f'Drivable Area Segmentation Loss: {drivable_seg_loss}')
-                
-            if model_outputs.lane_segmentation_logits is not None:
-                output_name = "lane_seg"
-                assert output_name in targets, f"Target for {output_name} not provided."
-
-                lane_seg_loss = SegmentationLossCalculator.compute_segmentation_loss(
-                    model_outputs.lane_segmentation_logits,
-                    targets["lane_seg"]
-                )
-                # Apply multi-task loss weight
-                model_outputs.lane_segmentation_loss = lane_seg_loss * self.loss_weights.get("lane_segmentation", 0.0)
-                # print(f'Lane Segmentation Loss: {lane_seg_loss}')
+            self._compute_loss(
+                model_outputs, 
+                targets, 
+                height, width,
+                batch_size,
+                device
+            )
 
         return model_outputs
 
 @ModelFactory.register_task_model("yolov8p")
 class YOLOv8P(BaseTaskModel):
-    def __init__(self, cfg:str, loss_weights: dict = None, use_atss:bool = True):
+    def __init__(self, cfg:str, loss_function:MultiTaskLoss=None):
         super(YOLOv8P, self).__init__()
         
         module_defs = parse_model_config(cfg)
-        # Multi-task loss weights (detection prioritized by default)
-        self.loss_weights = loss_weights or {
-            "detection": 1.0,
-            "lane_detection":1.0,
-            "drivable_segmentation": 1.0,
-            "lane_segmentation": 0.0
-        }
-
-        # TODO: Relocate ATSS-specific config outside the model constructor.
-        self.use_atss = use_atss
 
         if module_defs[0]["type"] == "heads":
             self.module_defs = module_defs[1:]
@@ -613,6 +673,8 @@ class YOLOv8P(BaseTaskModel):
         if "DetectV8" in self.module_names:
             self.anchor_free = True
 
+        self.loss_function = loss_function
+
         # Initialize model weights
         initialize_weights(self)
         
@@ -620,6 +682,7 @@ class YOLOv8P(BaseTaskModel):
 
         cache = {} # Cache for layer outputs
         batch_size, _, height, width = x.shape
+        device = x.device
         
         model_outputs = PanopticModelOutputs()
         
@@ -663,12 +726,11 @@ class YOLOv8P(BaseTaskModel):
                     detection_outputs  = module(inputs, image_size=(height, width))
                     model_outputs.detection_logits = detection_outputs #list
 
-                    if self.use_atss:
-                        model_outputs.anchor_proposals = module._anchor_proposals
-                        model_outputs.proposal_shape = module._proposal_shape
-                        model_outputs.anchor_cxcy = module._anchor_cxcy
-                        model_outputs.anchor_wh = module._anchor_wh
-                        model_outputs.anchor_strides = module._anchor_strides
+                    model_outputs.anchor_proposals = module._anchor_proposals
+                    model_outputs.proposal_shape = module._proposal_shape
+                    model_outputs.anchor_cxcy = module._anchor_cxcy
+                    model_outputs.anchor_wh = module._anchor_wh
+                    model_outputs.anchor_strides = module._anchor_strides
 
                     if not self.training:
                         model_outputs.detection_predictions = module.activation(detection_outputs) #list
@@ -682,18 +744,18 @@ class YOLOv8P(BaseTaskModel):
                         inputs.append(cache[r])
 
                     bbox_outputs, cls_outputs, anchor_points, strides = module(inputs, image_size=(height, width))
-                    
+
                     model_outputs.bbox_logits_raw = bbox_outputs
                     model_outputs.cls_logits_raw = cls_outputs
                     model_outputs.anchor_points = anchor_points
-                    model_outputs.strides = strides
-                    
+                    model_outputs.strides_v8 = strides
+
                     if not self.training:
                         model_outputs.detection_predictions = module.activation(
                                 model_outputs.bbox_logits_raw,
                                 model_outputs.cls_logits_raw,
                                 model_outputs.anchor_points,
-                                model_outputs.strides
+                                model_outputs.strides_v8
                             ) #torch.Tensor (B, 8400, 4+C)
                 
                 elif self.module_names[i] == "LaneDetect":
@@ -732,107 +794,13 @@ class YOLOv8P(BaseTaskModel):
 
         if targets is not None:
 
-            has_detection = (model_outputs.detection_logits is not None or
-                            model_outputs.bbox_logits_raw is not None)
-
-            if has_detection and targets["detections"] is not None:
-                output_name = "detections"
-                assert output_name in targets, f"Target for {output_name} not provided."
-
-                if self.anchor_free:
-                    
-                    if self.use_atss:
-                        warnings.warn(
-                            "ATSS currently supported only for Anchor Based Detection",
-                            category=UserWarning,
-                            stacklevel=2
-                        )
-
-                    det_loss, det_loss_items = DetectionLossCalculator.compute_detection_loss_v8(
-                        model_outputs.cls_logits_raw,
-                        model_outputs.bbox_logits_raw,
-                        model_outputs.anchor_points,
-                        model_outputs.strides,
-                        targets["detections"],
-                        image_size=(height, width)
-                    )
-
-                else:
-                    if self.use_atss:
-                        assert model_outputs.anchor_proposals is not None, \
-                            f"Expected Anchor Proposal for ATSS based Loss"
-                        
-                        det_loss, det_loss_items = ATSS.compute_loss(
-                            model_outputs.detection_logits,
-                            targets["detections"],
-                            model_outputs.anchor_proposals,
-                            model_outputs.anchor_cxcy,
-                            model_outputs.anchor_wh,
-                            model_outputs.anchor_strides,
-                            img_h=height, img_w=width,
-                            batch_size=batch_size                            
-                        )
-
-                    
-                    else:
-                        det_loss, det_loss_items = DetectionLossCalculator.compute_detection_loss_2(
-                            model_outputs.detection_logits,
-                            targets["detections"],
-                            self.module_list[self.detection_head_idx].num_layers,
-                            self.module_list[self.detection_head_idx].anchors,
-                            self.module_list[self.detection_head_idx].stride,
-                            cls_loss_type='focal'  # Use focal loss for better class imbalance handling
-                        )
-
-                # Apply multi-task loss weight
-                model_outputs.detection_loss = det_loss * self.loss_weights.get("detection", 1.0)
-                # print(f'Detection Loss: {det_loss}')
-
-            if model_outputs.lane_detection_logits is not None and targets.get("lanes_detections") is not None:
-                output_name = "lanes_detections"
-                assert output_name in targets, f"Target for {output_name} not provided."
-
-                lane_det_loss, lane_det_loss_items = LaneDetectionLossCalculator.compute_lane_det_loss(
-                    model_outputs.lane_detection_logits,
-                    targets["lanes_detections"],
-                    img_w=width,
-                    img_h=height
-                )
-
-                model_outputs.lane_detection_loss = lane_det_loss * self.loss_weights.get("lane_detection", 1.0)
-                model_outputs.lane_detection_loss_items = lane_det_loss_items
-
-                if model_outputs.lane_seg_logits is not None and targets["lane_seg_masks"] is not None:
-                    seg_loss = torch.nn.functional.nll_loss(
-                        torch.nn.functional.log_softmax(model_outputs.lane_seg_logits, dim=1),
-                        targets["lane_seg_masks"].long()
-                    )
-
-                    model_outputs.lane_detection_loss += seg_loss * self.loss_weights.get("lane_seg", 1.0)
-                    model_outputs.lane_detection_loss_items["lane_seg_loss"] = seg_loss.item()
-
-            if model_outputs.drivable_segmentation_logits is not None and targets["drivable_area_seg"] is not None:
-                output_name = "drivable_area_seg"
-                assert output_name in targets, f"Target for {output_name} not provided."
-                drivable_seg_loss = SegmentationLossCalculator.compute_segmentation_loss(
-                    model_outputs.drivable_segmentation_logits,
-                    targets["drivable_area_seg"]
-                )
-                # Apply multi-task loss weight
-                model_outputs.drivable_segmentation_loss = drivable_seg_loss * self.loss_weights.get("drivable_segmentation", 0.2)
-                # print(f'Drivable Area Segmentation Loss: {drivable_seg_loss}')
-
-            if model_outputs.lane_segmentation_logits is not None:
-                output_name = "lane_seg"
-                assert output_name in targets, f"Target for {output_name} not provided."
-
-                lane_seg_loss = SegmentationLossCalculator.compute_segmentation_loss(
-                    model_outputs.lane_segmentation_logits,
-                    targets["lane_seg"]
-                )
-                # Apply multi-task loss weight
-                model_outputs.lane_segmentation_loss = lane_seg_loss * self.loss_weights.get("lane_segmentation", 0.0)
-                # print(f'Lane Segmentation Loss: {lane_seg_loss}')
+            self._compute_loss(
+                model_outputs, 
+                targets, 
+                height, width,
+                batch_size,
+                device
+            )
 
         return model_outputs
 
@@ -854,7 +822,7 @@ class BaseEnhancementModel(nn.Module):
         groups = optimizer_kwargs.get("groups", {})
         dcn_lr_mult = optimizer_kwargs.get("dcn_lr_mult", 0.1)  # DCN offset LR = base_lr * 0.1
 
-        param_groups = self.task_network.configure_param_groups(groups, dcn_lr_mult)
+        param_groups = self.task_network._configure_param_groups(groups, dcn_lr_mult)
         param_groups.extend(self._get_enhancement_param_groups(optimizer_kwargs))
 
         return param_groups
