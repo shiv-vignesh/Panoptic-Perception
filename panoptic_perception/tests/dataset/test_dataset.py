@@ -14,9 +14,11 @@ import tempfile
 import os
 import random
 
+from panoptic_perception.dataset.utils import LANE_VIS_COLORS, visualize_batch
+
 sys.path.insert(0, str(Path(__file__).parent.parent.parent))
 
-from panoptic_perception.dataset.bdd100k_dataset import BDDPreprocessor, BDD100KDataset, visualize_batch, LANE_VIS_COLORS
+from panoptic_perception.dataset.bdd100k_dataset import BDDPreprocessor, BDD100KDataset
 from panoptic_perception.dataset.enums import BDD100KClasses, BDD100KClassesReduced
 from panoptic_perception.utils.lane_utils import BDD100KLaneCategories
 from panoptic_perception.dataset.augmentations import (
@@ -24,6 +26,7 @@ from panoptic_perception.dataset.augmentations import (
     apply_augmentations, mixup_augmentation
 )
 from panoptic_perception.dataset.mosaic_augmentation import mosaic_augmentation
+from panoptic_perception.dataset.types import FrameData
 from panoptic_perception.utils.lane_utils import (
     polyline_to_lane_target, build_lane_targets, NUM_LANE_POINTS, MAX_LANES
 )
@@ -91,6 +94,23 @@ def _make_bdd_json(tmp_dir, image_id="test_img", num_boxes=2, num_lanes=2):
     with open(path, "w") as f:
         json.dump(data, f)
     return path
+
+
+def _make_frame(image=None, labels=None, lane_polys=None, seg=None,
+                drivable=None, image_path="/fake/path.jpg"):
+    """Build a FrameData from legacy-style numpy inputs for test ergonomics.
+
+    labels: optional (N, 5) [cls, cx, cy, w, h] normalized
+    lane_polys: optional List[dict] {"points", "category"}
+    """
+    if image is None:
+        image = _make_image()
+    frame = FrameData(image=image, image_path=image_path, seg=seg, drivable=drivable)
+    if labels is not None:
+        frame.set_labels_array(labels)
+    if lane_polys is not None:
+        frame.set_lane_polys_legacy(lane_polys)
+    return frame
 
 
 def _make_batch_item(h=640, w=640, n_det=2, n_lanes=2):
@@ -277,89 +297,82 @@ class TestBuildLaneTargets:
 
 class TestRandomPerspectiveLanePolys:
 
-    def test_returns_five_values(self):
-        img = _make_image(640, 640)
-        labels = _make_labels()
-        lane_polys = _make_lane_polys()
+    def test_returns_framedata(self):
+        frame = _make_frame(image=_make_image(640, 640),
+                            labels=_make_labels(),
+                            lane_polys=_make_lane_polys())
 
-        result = random_perspective(img, None, None, labels, lane_polys=lane_polys,
-                                    degrees=0, translate=0, scale=0, shear=0)
-        assert len(result) == 5
-        img_out, seg_out, drv_out, labels_out, lp_out = result
+        result = random_perspective(frame, degrees=0, translate=0, scale=0, shear=0)
+        assert isinstance(result, FrameData)
+        lp_out = result.lane_polys_legacy()
         assert lp_out is not None
         assert len(lp_out) == 2
 
     def test_identity_transform_preserves_points(self):
-        img = _make_image(720, 1280)
-        labels = np.zeros((0, 5))
         lane_polys = _make_lane_polys()
         orig_pts = [p["points"].copy() for p in lane_polys]
+        frame = _make_frame(image=_make_image(720, 1280),
+                            labels=np.zeros((0, 5)),
+                            lane_polys=lane_polys)
 
-        _, _, _, _, lp_out = random_perspective(
-            img, None, None, labels, lane_polys=lane_polys,
-            degrees=0, translate=0, scale=0, shear=0
-        )
+        result = random_perspective(frame, degrees=0, translate=0, scale=0, shear=0)
+        lp_out = result.lane_polys_legacy()
 
         for i, poly in enumerate(lp_out):
             np.testing.assert_allclose(poly["points"], orig_pts[i], atol=1.0)
 
     def test_none_lane_polys_passthrough(self):
-        img = _make_image(640, 640)
-        labels = _make_labels()
-        _, _, _, _, lp_out = random_perspective(
-            img, None, None, labels, lane_polys=None,
-            degrees=5, translate=0.1, scale=0.1, shear=5
-        )
-        assert lp_out is None
+        frame = _make_frame(image=_make_image(640, 640),
+                            labels=_make_labels(),
+                            lane_polys=None)
+        result = random_perspective(frame, degrees=5, translate=0.1, scale=0.1, shear=5)
+        assert result.lane_polys_legacy() is None
 
     def test_points_clipped_to_bounds(self):
-        img = _make_image(640, 640)
-        labels = np.zeros((0, 5))
-        lane_polys = _make_lane_polys()
+        frame = _make_frame(image=_make_image(640, 640),
+                            labels=np.zeros((0, 5)),
+                            lane_polys=_make_lane_polys())
 
         random.seed(42)
         np.random.seed(42)
-        _, _, _, _, lp_out = random_perspective(
-            img, None, None, labels, lane_polys=lane_polys,
-            degrees=30, translate=0.3, scale=0.3, shear=20
-        )
+        result = random_perspective(frame, degrees=30, translate=0.3, scale=0.3, shear=20)
 
-        for poly in lp_out:
+        for poly in result.lane_polys_legacy():
             assert (poly["points"][:, 0] >= 0).all()
             assert (poly["points"][:, 0] <= 639).all()
             assert (poly["points"][:, 1] >= 0).all()
             assert (poly["points"][:, 1] <= 639).all()
 
     def test_category_preserved(self):
-        img = _make_image(720, 1280)
-        labels = np.zeros((0, 5))
-        lane_polys = _make_lane_polys()
+        frame = _make_frame(image=_make_image(720, 1280),
+                            labels=np.zeros((0, 5)),
+                            lane_polys=_make_lane_polys())
 
-        _, _, _, _, lp_out = random_perspective(
-            img, None, None, labels, lane_polys=lane_polys,
-            degrees=0, translate=0, scale=0, shear=0
-        )
+        result = random_perspective(frame, degrees=0, translate=0, scale=0, shear=0)
+        lp_out = result.lane_polys_legacy()
         assert lp_out[0]["category"] == "lane/single white"
         assert lp_out[1]["category"] == "lane/single yellow"
 
 
 class TestFlipHorizontalLanePolys:
 
-    def test_returns_five_values(self):
-        img = _make_image(640, 640)
-        labels = _make_labels()
-        lane_polys = _make_lane_polys()
-        result = flip_horizontal(img, None, None, labels, lane_polys=lane_polys)
-        assert len(result) == 5
+    def test_returns_framedata(self):
+        frame = _make_frame(image=_make_image(640, 640),
+                            labels=_make_labels(),
+                            lane_polys=_make_lane_polys())
+        result = flip_horizontal(frame)
+        assert isinstance(result, FrameData)
 
     def test_x_coords_mirrored(self):
         w = 1280
-        img = _make_image(720, w)
-        labels = np.zeros((0, 5))
         lane_polys = [{"points": np.array([[100, 500], [200, 300]], dtype=np.float32),
                        "category": "lane/single white"}]
+        frame = _make_frame(image=_make_image(720, w),
+                            labels=np.zeros((0, 5)),
+                            lane_polys=lane_polys)
 
-        _, _, _, _, lp_out = flip_horizontal(img, None, None, labels, lane_polys=lane_polys)
+        result = flip_horizontal(frame)
+        lp_out = result.lane_polys_legacy()
 
         assert lp_out[0]["points"][0, 0] == pytest.approx(w - 1 - 100)
         assert lp_out[0]["points"][1, 0] == pytest.approx(w - 1 - 200)
@@ -368,31 +381,31 @@ class TestFlipHorizontalLanePolys:
         assert lp_out[0]["points"][1, 1] == 300
 
     def test_none_passthrough(self):
-        img = _make_image(640, 640)
-        labels = _make_labels()
-        _, _, _, _, lp_out = flip_horizontal(img, None, None, labels, lane_polys=None)
-        assert lp_out is None
+        frame = _make_frame(image=_make_image(640, 640),
+                            labels=_make_labels(),
+                            lane_polys=None)
+        result = flip_horizontal(frame)
+        assert result.lane_polys_legacy() is None
 
 
 class TestLetterboxLanePolys:
 
-    def test_returns_five_values(self):
-        img = _make_image(720, 1280)
-        labels = _make_labels()
-        lane_polys = _make_lane_polys()
-        result = letterbox_with_masks(img, None, None, labels,
-                                      lane_polys=lane_polys, new_shape=(768, 1280))
-        assert len(result) == 5
+    def test_returns_framedata(self):
+        frame = _make_frame(image=_make_image(720, 1280),
+                            labels=_make_labels(),
+                            lane_polys=_make_lane_polys())
+        result = letterbox_with_masks(frame, new_shape=(768, 1280))
+        assert isinstance(result, FrameData)
 
     def test_scale_and_offset_applied(self):
-        img = _make_image(720, 1280)
-        labels = np.zeros((0, 5))
         pts_orig = np.array([[640, 360]], dtype=np.float32)  # center of 1280x720
         lane_polys = [{"points": pts_orig.copy(), "category": "lane/single white"}]
+        frame = _make_frame(image=_make_image(720, 1280),
+                            labels=np.zeros((0, 5)),
+                            lane_polys=lane_polys)
 
-        _, _, _, _, lp_out = letterbox_with_masks(
-            img, None, None, labels, lane_polys=lane_polys, new_shape=(384, 640)
-        )
+        result = letterbox_with_masks(frame, new_shape=(384, 640))
+        lp_out = result.lane_polys_legacy()
 
         # 720x1280 -> letterbox to 384x640
         # r = min(384/720, 640/1280) = min(0.533, 0.5) = 0.5
@@ -406,119 +419,117 @@ class TestLetterboxLanePolys:
 
 class TestApplyAugmentationsLanePolys:
 
-    def test_returns_five_values(self):
-        img = _make_image(640, 640)
-        labels = _make_labels()
-        lane_polys = _make_lane_polys()
+    def test_returns_framedata(self):
+        frame = _make_frame(image=_make_image(640, 640),
+                            labels=_make_labels(),
+                            lane_polys=_make_lane_polys())
         params = {"degrees": 0, "translate": 0, "scale": 0, "shear": 0,
                   "flip_prob": 0, "salt_prob": 0, "pepper_prob": 0}
 
-        result = apply_augmentations(img, None, None, labels, params,
-                                     img_size=(640, 640), lane_polys=lane_polys)
-        assert len(result) == 5
-        _, _, _, _, lp_out = result
-        assert lp_out is not None
+        result = apply_augmentations(frame, params, img_size=(640, 640))
+        assert isinstance(result, FrameData)
+        assert result.lane_polys_legacy() is not None
 
     def test_none_passthrough(self):
-        img = _make_image(640, 640)
-        labels = _make_labels()
+        frame = _make_frame(image=_make_image(640, 640),
+                            labels=_make_labels(),
+                            lane_polys=None)
         params = {"degrees": 5, "translate": 0.1, "scale": 0.1, "shear": 5,
                   "flip_prob": 0.5}
-        _, _, _, _, lp_out = apply_augmentations(
-            img, None, None, labels, params, img_size=(640, 640), lane_polys=None
-        )
-        assert lp_out is None
+        result = apply_augmentations(frame, params, img_size=(640, 640))
+        assert result.lane_polys_legacy() is None
 
 
 class TestMixupLanePolys:
 
     def test_concatenates_polys(self):
-        img1 = _make_image(640, 640)
-        img2 = _make_image(640, 640)
-        labels1 = _make_labels(1)
-        labels2 = _make_labels(1)
         lp1 = [{"points": np.array([[100, 500], [100, 100]], dtype=np.float32),
                 "category": "lane/single white"}]
         lp2 = [{"points": np.array([[500, 600], [500, 200]], dtype=np.float32),
                 "category": "lane/single yellow"}]
 
-        _, _, _, _, mixed_lp = mixup_augmentation(
-            img1, labels1, img2, labels2,
-            lane_polys1=lp1, lane_polys2=lp2
-        )
+        frame1 = _make_frame(image=_make_image(640, 640),
+                             labels=_make_labels(1), lane_polys=lp1)
+        frame2 = _make_frame(image=_make_image(640, 640),
+                             labels=_make_labels(1), lane_polys=lp2)
+
+        result = mixup_augmentation(frame1, frame2)
+        mixed_lp = result.lane_polys_legacy()
 
         assert len(mixed_lp) == 2
         assert mixed_lp[0]["category"] == "lane/single white"
         assert mixed_lp[1]["category"] == "lane/single yellow"
 
     def test_one_side_none(self):
-        img1 = _make_image(640, 640)
-        img2 = _make_image(640, 640)
         lp1 = [{"points": np.array([[100, 500], [100, 100]], dtype=np.float32),
                 "category": "lane/single white"}]
+        frame1 = _make_frame(image=_make_image(640, 640),
+                             labels=_make_labels(1), lane_polys=lp1)
+        frame2 = _make_frame(image=_make_image(640, 640),
+                             labels=_make_labels(1), lane_polys=None)
 
-        _, _, _, _, mixed_lp = mixup_augmentation(
-            img1, _make_labels(1), img2, _make_labels(1),
-            lane_polys1=lp1, lane_polys2=None
-        )
-        assert len(mixed_lp) == 1
+        result = mixup_augmentation(frame1, frame2)
+        assert len(result.lane_polys_legacy()) == 1
 
     def test_both_none(self):
-        img1, img2 = _make_image(640, 640), _make_image(640, 640)
-        _, _, _, _, mixed_lp = mixup_augmentation(
-            img1, _make_labels(1), img2, _make_labels(1),
-            lane_polys1=None, lane_polys2=None
-        )
-        assert mixed_lp is None
+        frame1 = _make_frame(image=_make_image(640, 640),
+                             labels=_make_labels(1), lane_polys=None)
+        frame2 = _make_frame(image=_make_image(640, 640),
+                             labels=_make_labels(1), lane_polys=None)
+        result = mixup_augmentation(frame1, frame2)
+        assert result.lane_polys_legacy() is None
 
 
 class TestMosaicLanePolys:
 
-    def test_returns_five_values(self):
-        images = [_make_image(720, 1280) for _ in range(4)]
-        bboxes = [[[100, 200, 300, 400]] for _ in range(4)]
-        class_labels = [[2] for _ in range(4)]
-        segs = [None] * 4
-        drivables = [None] * 4
-        lp_list = [_make_lane_polys() for _ in range(4)]
+    def _build_frame_with_pixel_bbox(self, image=None, lane_polys=None):
+        """Mosaic test fixture: builds a FrameData with a single pixel-xyxy
+        bbox [100, 200, 300, 400] of class 2 — matches the legacy test data.
+        labels_array() handles the conversion to normalized cxcywh.
+        """
+        if image is None:
+            image = _make_image(720, 1280)
+        h, w = image.shape[:2]
+        # bbox [100, 200, 300, 400] in pixel xyxy → normalized cxcywh
+        cx = 200 / w
+        cy = 300 / h
+        bw = 200 / w
+        bh = 200 / h
+        labels = np.array([[2, cx, cy, bw, bh]], dtype=np.float32)
+        return _make_frame(image=image, labels=labels, lane_polys=lane_polys)
 
-        result = mosaic_augmentation(
-            images, bboxes, class_labels, segs, drivables,
-            lane_polys_list=lp_list, output_size=(640, 640)
-        )
-        assert len(result) == 5
-        _, _, _, _, mosaic_lp = result
+    def test_returns_framedata(self):
+        items = [
+            self._build_frame_with_pixel_bbox(lane_polys=_make_lane_polys())
+            for _ in range(4)
+        ]
+        result = mosaic_augmentation(items, output_size=(640, 640))
+        assert isinstance(result, FrameData)
+        mosaic_lp = result.lane_polys_legacy()
         assert mosaic_lp is not None
         assert len(mosaic_lp) > 0  # at least some lanes should survive
 
     def test_none_passthrough(self):
-        images = [_make_image(720, 1280) for _ in range(4)]
-        bboxes = [[] for _ in range(4)]
-        class_labels = [[] for _ in range(4)]
-        segs = [None] * 4
-        drivables = [None] * 4
-
-        _, _, _, _, mosaic_lp = mosaic_augmentation(
-            images, bboxes, class_labels, segs, drivables,
-            lane_polys_list=None, output_size=(640, 640)
-        )
-        assert mosaic_lp is None
+        items = [
+            _make_frame(image=_make_image(720, 1280),
+                        labels=np.zeros((0, 5)),
+                        lane_polys=None)
+            for _ in range(4)
+        ]
+        result = mosaic_augmentation(items, output_size=(640, 640))
+        assert result.lane_polys_legacy() is None
 
     def test_points_within_output_bounds(self):
         h_out, w_out = 640, 640
-        images = [_make_image(720, 1280) for _ in range(4)]
-        bboxes = [[] for _ in range(4)]
-        class_labels = [[] for _ in range(4)]
-        segs = [None] * 4
-        drivables = [None] * 4
-        lp_list = [_make_lane_polys() for _ in range(4)]
+        items = [
+            _make_frame(image=_make_image(720, 1280),
+                        labels=np.zeros((0, 5)),
+                        lane_polys=_make_lane_polys())
+            for _ in range(4)
+        ]
+        result = mosaic_augmentation(items, output_size=(h_out, w_out))
 
-        _, _, _, _, mosaic_lp = mosaic_augmentation(
-            images, bboxes, class_labels, segs, drivables,
-            lane_polys_list=lp_list, output_size=(h_out, w_out)
-        )
-
-        for poly in mosaic_lp:
+        for poly in result.lane_polys_legacy():
             assert (poly["points"][:, 0] >= 0).all()
             assert (poly["points"][:, 0] < w_out).all()
             assert (poly["points"][:, 1] >= 0).all()
@@ -542,79 +553,56 @@ class TestPreprocessorLaneMethods:
             path = _make_bdd_json(tmp, num_lanes=3)
             lane_polys = self.preprocessor.load_lane_annotations(path)
 
-            assert isinstance(lane_polys, list)
+            # Returns FrameLaneDetections (dataclass), iterable + len-able
             assert len(lane_polys) == 3
             for poly in lane_polys:
-                assert "points" in poly
-                assert "category" in poly
-                assert poly["points"].shape[1] == 2
-                assert poly["points"].dtype == np.float32
-                assert poly["category"].startswith("lane/")
+                # LanePoly dataclass with `points` and `category` attrs
+                assert poly.points.shape[1] == 2
+                assert poly.points.dtype == np.float32
+                assert poly.category.startswith("lane/")
 
     def test_load_lane_annotations_no_lanes(self):
         with tempfile.TemporaryDirectory() as tmp:
             path = _make_bdd_json(tmp, num_lanes=0)
             lane_polys = self.preprocessor.load_lane_annotations(path)
-            assert lane_polys == []
+            assert len(lane_polys) == 0
 
     def test_load_lane_annotations_missing_file(self):
         lane_polys = self.preprocessor.load_lane_annotations("/nonexistent/path.json")
-        assert lane_polys == []
+        assert len(lane_polys) == 0
 
+    @pytest.mark.skip(reason="BDDPreprocessor.transform_lane_points_resize does not exist; "
+                             "resizing happens inside letterbox_with_masks(frame, new_shape).")
     def test_transform_lane_points_resize(self):
-        lane_polys = [{"points": np.array([[640, 360]], dtype=np.float32),
-                       "category": "lane/single white"}]
+        pass
 
-        result = self.preprocessor.transform_lane_points_resize(lane_polys, 720, 1280)
-
-        # 720x1280 -> LongestMaxSize(1280): scale=1.0, new_h=720, new_w=1280
-        # PadIfNeeded(768, 1280): pad_top=(768-720)//2=24
-        assert result[0]["points"][0, 0] == pytest.approx(640, abs=1)
-        assert result[0]["points"][0, 1] == pytest.approx(360 + 24, abs=1)
-
+    @pytest.mark.skip(reason="BDDPreprocessor.transform_lane_points_resize does not exist; "
+                             "resizing happens inside letterbox_with_masks(frame, new_shape).")
     def test_transform_lane_points_resize_none(self):
-        assert self.preprocessor.transform_lane_points_resize(None, 720, 1280) is None
+        pass
 
+    @pytest.mark.skip(reason="BDDPreprocessor.standard_augmentations does not exist; "
+                             "use module-level apply_augmentations(frame, params, img_size)")
     def test_standard_augmentations_returns_five(self):
-        img = _make_image(720, 1280)
-        bboxes = [[100, 200, 300, 400]]
-        class_labels = [2]
-        lane_polys = _make_lane_polys()
+        pass
 
-        result = self.preprocessor.standard_augmentations(
-            img, None, None, bboxes, class_labels, lane_polys=lane_polys
-        )
-        assert len(result) == 5
-        img_out, seg_out, drv_out, labels_out, lp_out = result
-        assert lp_out is not None
+    def test_mosaic_augmentation_returns_framedata(self):
+        items = []
+        for _ in range(4):
+            img = _make_image(720, 1280)
+            h, w = img.shape[:2]
+            labels = np.array([[2, 200/w, 300/h, 200/w, 200/h]], dtype=np.float32)
+            items.append(_make_frame(image=img, labels=labels,
+                                     lane_polys=_make_lane_polys()))
 
-    def test_mosaic_augmentation_returns_five(self):
-        images = [_make_image(720, 1280) for _ in range(4)]
-        bboxes = [[[100, 200, 300, 400]] for _ in range(4)]
-        class_labels = [[2] for _ in range(4)]
-        segs = [None] * 4
-        drivables = [None] * 4
-        lp_list = [_make_lane_polys() for _ in range(4)]
+        # mosaic_augmentation is module-level (not a preprocessor method).
+        result = mosaic_augmentation(items, output_size=(640, 640))
+        assert isinstance(result, FrameData)
 
-        result = self.preprocessor.mosaic_augmentation(
-            images, bboxes, class_labels, segs, drivables,
-            lane_polys_list=lp_list
-        )
-        assert len(result) == 5
-
+    @pytest.mark.skip(reason="BDDPreprocessor.mixup_augmentation does not exist; "
+                             "use module-level mixup_augmentation(frame1, frame2)")
     def test_mixup_augmentation_returns_five(self):
-        img1 = _make_image(720, 1280)
-        img2 = _make_image(720, 1280)
-        bboxes = [[100, 200, 300, 400]]
-        class_labels = [2]
-        lp = _make_lane_polys()
-
-        result = self.preprocessor.mixup_augmentation(
-            img1, bboxes, class_labels, None, None,
-            img2, bboxes, class_labels, None, None,
-            lane_polys1=lp, lane_polys2=lp
-        )
-        assert len(result) == 5
+        pass
 
 
 # ===================================================================
@@ -628,7 +616,7 @@ class TestCollateFnWithLanes:
         result = BDDPreprocessor.collate_fn(batch)
 
         assert result["images"].shape == (2, 3, 640, 640)
-        assert result["lanes"].shape == (2, MAX_LANES, 6 + NUM_LANE_POINTS)
+        assert result["lanes_detections"].shape == (2, MAX_LANES, 6 + NUM_LANE_POINTS)
         assert result["lane_categories"].shape == (2, MAX_LANES)
 
     def test_no_lane_targets(self):
@@ -637,8 +625,8 @@ class TestCollateFnWithLanes:
         batch = [item]
         result = BDDPreprocessor.collate_fn(batch)
 
-        assert result["lanes"].shape == (1, MAX_LANES, 6 + NUM_LANE_POINTS)
-        assert (result["lanes"][0, :, 0] == 0).all(), "No valid lanes expected"
+        assert result["lanes_detections"].shape == (1, MAX_LANES, 6 + NUM_LANE_POINTS)
+        assert (result["lanes_detections"][0, :, 0] == 0).all(), "No valid lanes expected"
 
     def test_batch_indices_in_detections(self):
         batch = [_make_batch_item(n_det=1), _make_batch_item(n_det=2)]
@@ -654,7 +642,7 @@ class TestCollateFnWithLanes:
         expected_keys = {
             "images", "clean_images", "detections",
             "segmentation_masks", "drivable_area_seg",
-            "lanes", "lane_categories",
+            "lanes_detections", "lane_seg_masks", "lane_categories",
             "image_paths", "scene_attributes"
         }
         assert set(result.keys()) == expected_keys
@@ -677,7 +665,7 @@ class TestVisualizeBatchWithLanes:
             result["detections"],
             save_dir=str(tmp_path),
             batch_index=0,
-            lane_targets=result["lanes"],
+            lane_targets=result["lanes_detections"],
             lane_categories=result["lane_categories"],
         )
 
@@ -709,23 +697,34 @@ class TestEndToEndPipeline:
     """Validates the full flow: raw polys -> augmentation -> target building -> collation."""
 
     def test_standard_augmentation_pipeline(self):
-        preprocessor = BDDPreprocessor({
-            "image_resize": (640, 640),
-            "original_image_size": (720, 1280),
-        })
-
         img = _make_image(720, 1280)
-        bboxes = [[100, 200, 300, 400], [500, 100, 700, 300]]
+        # Pixel xyxy bboxes -> normalized cxcywh labels for FrameData
+        h, w = img.shape[:2]
+        raw_bboxes = [[100, 200, 300, 400], [500, 100, 700, 300]]
         class_labels = [2, 0]
-        lane_polys = _make_lane_polys()
-
-        img_out, seg_out, drv_out, labels_out, lp_out = preprocessor.standard_augmentations(
-            img, None, None, bboxes, class_labels, lane_polys=lane_polys
+        labels = np.array(
+            [
+                [c,
+                 (x1 + x2) / 2 / w,
+                 (y1 + y2) / 2 / h,
+                 (x2 - x1) / w,
+                 (y2 - y1) / h]
+                for (x1, y1, x2, y2), c in zip(raw_bboxes, class_labels)
+            ],
+            dtype=np.float32,
         )
 
+        frame = _make_frame(image=img, labels=labels, lane_polys=_make_lane_polys())
+        params = {"degrees": 5, "translate": 0.1, "scale": 0.1, "shear": 5,
+                  "flip_prob": 0.5, "salt_prob": 0, "pepper_prob": 0,
+                  "hsv_h": 0.015, "hsv_s": 0.7, "hsv_v": 0.4}
+
+        result = apply_augmentations(frame, params, img_size=(640, 640))
+        lp_out = result.lane_polys_legacy()
+
         # Build targets from augmented polylines
-        h, w = img_out.shape[:2]
-        lane_targets, lane_categories = build_lane_targets(lp_out, h, w)
+        out_h, out_w = result.image.shape[:2]
+        lane_targets, lane_categories = build_lane_targets(lp_out, out_h, out_w)
 
         assert lane_targets.shape == (MAX_LANES, 6 + NUM_LANE_POINTS)
         assert lane_categories.shape == (MAX_LANES,)
@@ -735,23 +734,17 @@ class TestEndToEndPipeline:
         assert n_valid >= 1, f"Expected at least 1 valid lane, got {n_valid}"
 
     def test_non_augmented_path(self):
-        preprocessor = BDDPreprocessor({
-            "image_resize": (768, 1280),
-            "original_image_size": (720, 1280),
-        })
+        # FrameData-native equivalent: letterbox_with_masks handles both image
+        # resize and lane-points coordinate transform in one call.
+        frame = _make_frame(
+            image=_make_image(720, 1280),
+            labels=np.zeros((0, 5)),
+            lane_polys=_make_lane_polys(),
+        )
+        frame = letterbox_with_masks(frame, new_shape=(768, 1280))
 
-        img = _make_image(720, 1280)
-        lane_polys = _make_lane_polys()
-
-        # Simulate the non-augmented path
-        orig_h, orig_w = img.shape[:2]
-        t = preprocessor.transformation(image=img, bboxes=[[100, 200, 300, 400]],
-                                        class_labels=[2])
-        img_out = t["image"]
-
-        lp_out = preprocessor.transform_lane_points_resize(lane_polys, orig_h, orig_w)
-
-        h, w = img_out.shape[:2]
+        lp_out = frame.lane_polys_legacy()
+        h, w = frame.image.shape[:2]
         lane_targets, lane_categories = build_lane_targets(lp_out, h, w)
 
         assert lane_targets.shape == (MAX_LANES, 6 + NUM_LANE_POINTS)

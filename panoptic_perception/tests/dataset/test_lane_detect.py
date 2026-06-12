@@ -12,8 +12,9 @@ import numpy as np
 import cv2
 from torch.utils.data import DataLoader
 
-from panoptic_perception.dataset.bdd100k_dataset import BDD100KDataset, BDDPreprocessor, LANE_VIS_COLORS
+from panoptic_perception.dataset.bdd100k_dataset import BDD100KDataset, BDDPreprocessor
 from panoptic_perception.dataset.enums import BDD100KClassesReduced
+from panoptic_perception.dataset.utils import LANE_VIS_COLORS
 from panoptic_perception.models.models import YOLOP
 from panoptic_perception.utils.detection_utils import DetectionHelper
 

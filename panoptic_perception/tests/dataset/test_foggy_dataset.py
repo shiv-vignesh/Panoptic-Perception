@@ -19,11 +19,13 @@ import cv2
 from collections import Counter
 from torch.utils.data import DataLoader
 
+from panoptic_perception.dataset.types import DatasetMode
+from panoptic_perception.dataset.utils import visualize_batch
+
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from dataset.bdd100k_dataset import (
     FoggyBDD100KDataset, BDD100KDataset, BDDPreprocessor,
-    DatasetMode, visualize_batch,
 )
 from dataset.adverse_weather import (
     SyntheticFogGenerator, SyntheticLowLightGenerator,

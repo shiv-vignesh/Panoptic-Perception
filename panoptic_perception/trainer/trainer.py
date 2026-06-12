@@ -11,10 +11,11 @@ from torch.utils.data.dataloader import DataLoader
 
 import numpy as np
 
-from panoptic_perception.dataset.bdd100k_dataset import BDD100KDataset, FoggyBDD100KDataset, BDDPreprocessor, DatasetMode
+from panoptic_perception.dataset.bdd100k_dataset import BDD100KDataset, FoggyBDD100KDataset, BDDPreprocessor
 
 import gc
 
+from panoptic_perception.dataset.types import DatasetMode
 from panoptic_perception.models.types import PanopticModelOutputs
 
 class ModelEMA:

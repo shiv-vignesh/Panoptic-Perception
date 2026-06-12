@@ -9,7 +9,7 @@ import cv2
 from torch.utils.data.dataloader import DataLoader
 
 from panoptic_perception.dataset.bdd100k_dataset import (
-    BDD100KDataset, FoggyBDD100KDataset, BDDPreprocessor, DatasetMode
+    BDD100KDataset, FoggyBDD100KDataset, BDDPreprocessor
 )
 from panoptic_perception.dataset.adverse_weather.depth_estimators import (
     HeuristicDepthEstimator,
@@ -19,6 +19,7 @@ from panoptic_perception.dataset.adverse_weather.depth_estimators import (
     TensorRTDepthEstimator,
     RadialDistance
 )
+from panoptic_perception.dataset.types import DatasetMode
 
 
 PROJECT_ROOT = Path(__file__).parent.parent

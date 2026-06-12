@@ -7,9 +7,10 @@ from collections import defaultdict
 
 import torch
 
-from panoptic_perception.dataset.bdd100k_dataset import BDD100KDataset, BDDPreprocessor, DatasetMode
+from panoptic_perception.dataset.bdd100k_dataset import BDD100KDataset, BDDPreprocessor
 from panoptic_perception.dataset.enums import BDD100KClassesReduced
 
+from panoptic_perception.dataset.types import DatasetMode
 from panoptic_perception.models.models import YOLOP, YOLOv8P
 from panoptic_perception.models.utils import WeightsManager
 from panoptic_perception.utils.detection_utils import DetectionHelper

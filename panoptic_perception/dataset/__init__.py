@@ -3,8 +3,10 @@ from typing import Dict, Optional
 from torch.utils.data import DataLoader
 
 from panoptic_perception.dataset.bdd100k_dataset import (
-    BDD100KDataset, FoggyBDD100KDataset, BDDPreprocessor, DatasetMode
+    BDD100KDataset, FoggyBDD100KDataset, 
+    BDDPreprocessor, FoggyBDDPreprocessor
 )
+from panoptic_perception.dataset.types import DatasetMode
 from panoptic_perception.utils.logger import Logger
 
 class DataLoaderBuilder:
@@ -64,13 +66,15 @@ class DataLoaderBuilder:
         kwargs["adverse_params"] = self._kw.get("adverse_params", {})
         return kwargs
 
-    def _make_loader(self, dataset, batch_size, shuffle, num_workers) -> DataLoader:
+    def _make_loader(self, dataset, batch_size, shuffle, 
+                    collate_fn,
+                    num_workers) -> DataLoader:
         return DataLoader(
             dataset,
             batch_size=batch_size,
             shuffle=shuffle,
             num_workers=num_workers,
-            collate_fn=BDDPreprocessor.collate_fn,
+            collate_fn=collate_fn,
             pin_memory=True,
         )
 
@@ -88,18 +92,25 @@ class DataLoaderBuilder:
                 apply_fog_prob=self._kw.get("apply_fog_prob", 0.67),
                 depth_estimator=self._depth_estimator,
             )
+            # only one process exists, depth runs there, one model copy. Simplest.
+            num_workers = 0
+            collate_fn = dataset.preprocessor.collate_fn
+
         else:
             dataset = BDD100KDataset(
                 kwargs, dataset_type="train",
                 perform_augmentation=perform_aug,
                 mode=DatasetMode.TRAIN,
             )
+            num_workers = self._kw.get("train_num_workers", 4)
+            collate_fn = BDDPreprocessor.collate_fn
 
         return self._make_loader(
             dataset,
             batch_size=self._kw["train_batch_size"],
             shuffle=self._kw.get("train_shuffle", True),
-            num_workers=self._kw.get("train_num_workers", 4),
+            collate_fn=collate_fn,
+            num_workers=num_workers,
         )
 
     def build_val(self) -> Dict[str, DataLoader]:
@@ -127,6 +138,12 @@ class DataLoaderBuilder:
         )
 
         return {
-            "val_clean": self._make_loader(clean_dataset, batch_size, False, num_workers),
-            "val_foggy": self._make_loader(foggy_dataset, batch_size, False, num_workers),
+            "val_clean": self._make_loader(clean_dataset, batch_size, 
+                                           False, 
+                                           collate_fn=BDDPreprocessor.collate_fn,
+                                           num_workers=num_workers),
+            "val_foggy": self._make_loader(foggy_dataset, batch_size, 
+                                           False, 
+                                           collate_fn=foggy_dataset.preprocessor.collate_fn,
+                                           num_workers=0),
         }
