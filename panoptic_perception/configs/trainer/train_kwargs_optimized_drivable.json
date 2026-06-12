@@ -3,7 +3,7 @@
 
     "model_kwargs":{
         "model_type":"yolop",
-        "cfg_path":"/workspace/Panoptic-Perception/panoptic_perception/configs/models/yolo-detection-drivable.cfg",
+        "cfg_path":"/workspace/Panoptic-Perception/panoptic_perception/configs/models/yolo-768-1280-detection.cfg",
         "device":"cuda:0"
     },
 
@@ -12,7 +12,7 @@
         "detection_annotations_dir": "/workspace/data/bdd100k_labels/100k",
         "segmentation_annotations_dir": "",
         "drivable_annotations_dir": "/workspace/data/drivable_maps/labels",
-        "train_batch_size": 16,
+        "train_batch_size": 6,
         "train_shuffle": true,
         "train_num_workers": 4,
         "train_preprocessor_kwargs":{
@@ -59,19 +59,19 @@
         "groups": {
             "backbone": {
                 "group": [0, 9],
-                "trainable": false
+                "trainable": true
             },
             "fpn": {
                 "group": [10, 16],
-                "trainable": false
+                "trainable": true
             },
             "det_pan": {
                 "group": [17, 23],
-                "trainable": false
+                "trainable": true
             },
             "detect_head": {
                 "group": [24],
-                "trainable": false
+                "trainable": true
             },
             "segmentation": {
                 "group": [25, 33],
@@ -114,11 +114,26 @@
         "ema_warmup_steps": 2000
     },
 
-    "loss_weights": {
-        "_description": "Multi-task loss weights",
-        "detection": 1.0,
-        "drivable_segmentation": 1.0,
-        "lane_detection": 1.0,
-        "lane_segmentation": 0.0
+
+    "loss_kwargs": {
+        "detection":{
+            "_type":"detection-loss-ATSS",
+            "kwargs":{}
+        },
+        "drivable_segmentation":{
+            "_type":"segmentation-loss",
+            "kwargs":{}
+        },
+        "lane_detection":{
+            "_type":"lane-detection-loss",
+            "kwargs":{}
+        },
+        "loss_weights": {
+            "_description": "Multi-task loss weights",
+            "detection": 1.0,
+            "drivable_segmentation": 1.0,
+            "lane_detection": 1.0,
+            "lane_segmentation": 0.0
+        }        
     }
 }
