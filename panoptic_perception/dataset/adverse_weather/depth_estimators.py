@@ -290,14 +290,20 @@ class DepthAnythingEstimator:
         # which defeats the cache and adds cudaMalloc latency to steady-state
         # inference. Only purge at OOM-adjacent boundaries.
 
-        depths = []
-        for item in post:
-            depth = item["predicted_depth"].detach().cpu().numpy().astype(np.float32)
-            dmin, dmax = depth.min(), depth.max()
-            depth = 1.0 - (depth - dmin) / (dmax - dmin + self._normalization_epsilon)
-            depths.append(np.clip(depth, 0.0, 1.0))
+        preds = torch.stack([item["predicted_depth"] for item in post])
+        preds = 1.0 - (preds - preds.amin(dim=(-1,-2), keepdim=True)) \
+                        (preds.amax(dim=(-1,-2), keepdim=True) - preds.amin(dim=(-1,-2), keepdim=True) + 1e-6)
+        
+        depths = preds.clamp(0, 1).cpu().numpy()
 
-        del post
+        # depths = []
+        # for item in post:
+        #     depth = item["predicted_depth"].detach().cpu().numpy().astype(np.float32)
+        #     dmin, dmax = depth.min(), depth.max()
+        #     depth = 1.0 - (depth - dmin) / (dmax - dmin + self._normalization_epsilon)
+        #     depths.append(np.clip(depth, 0.0, 1.0))
+
+        # del post
         return depths
 
 
