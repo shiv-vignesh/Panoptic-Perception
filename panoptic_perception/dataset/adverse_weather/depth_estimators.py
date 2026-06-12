@@ -291,7 +291,7 @@ class DepthAnythingEstimator:
         # inference. Only purge at OOM-adjacent boundaries.
 
         preds = torch.stack([item["predicted_depth"] for item in post])
-        preds = 1.0 - (preds - preds.amin(dim=(-1,-2), keepdim=True)) \
+        preds = 1.0 - (preds - preds.amin(dim=(-1,-2), keepdim=True)) / \
                         (preds.amax(dim=(-1,-2), keepdim=True) - preds.amin(dim=(-1,-2), keepdim=True) + 1e-6)
         
         depths = preds.clamp(0, 1).cpu().numpy()
