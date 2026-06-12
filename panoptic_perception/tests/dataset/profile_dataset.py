@@ -127,12 +127,10 @@ def foggy_dataloader(dataset_kwargs, depth_anything_backend, dataset_type, batch
         print(f"  Shuffle: {dataloader.shuffle if hasattr(dataloader, 'shuffle') else 'N/A'}")
 
         return dataloader
-
     except Exception as e:
         print(f"⚠ Dataset creation failed (expected if data not present)")
         print(f"  Error: {e}")
         print(f"  Note: Update paths in test_dataset_creation() to point to actual BDD100K data")
-
         exit(1)
 
 @pytest.fixture

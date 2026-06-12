@@ -1,6 +1,15 @@
 import json
 import os
 import argparse
+import warnings
+
+warnings.warn(
+    "panoptic_perception.scripts.train.train is deprecated and will be removed. "
+    "Use `python -m panoptic_perception.scripts.train.train_v2` with a config under "
+    "panoptic_perception/configs/trainer/ (see configs/trainer/README.md).",
+    DeprecationWarning,
+    stacklevel=2,
+)
 
 import torch
 

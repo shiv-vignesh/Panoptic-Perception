@@ -1,8 +1,17 @@
-import os, math, time, copy
+import os, math, time, copy, warnings
 from tqdm import tqdm
 from datetime import datetime
 
 from typing import Iterable, Union, Optional
+
+warnings.warn(
+    "panoptic_perception.trainer.trainer.Trainer is deprecated and will be removed. "
+    "Use panoptic_perception.trainer.trainer_refactor.Trainer, which integrates with "
+    "MultiTaskLoss, LossFactory, and the new TrainingArgument config schema. "
+    "See panoptic_perception/configs/trainer/README.md.",
+    DeprecationWarning,
+    stacklevel=2,
+)
 from collections import defaultdict
 
 import torch
