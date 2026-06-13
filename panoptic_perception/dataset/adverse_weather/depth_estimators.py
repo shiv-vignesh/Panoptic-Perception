@@ -23,6 +23,19 @@ class DepthEstimator(Protocol):
         """
         ...
 
+    def estimate_batch(self, images_rgb: list[np.ndarray]) -> list[np.ndarray]:
+        """Return per-image normalized relative depth.
+
+        Args:
+            images_rgb: list of B uint8 RGB images, shapes (H_i, W_i, 3) — sizes
+                may differ across images.
+
+        Returns:
+            list of B float32 arrays in [0, 1], each matching its input size,
+            where 0 = near and 1 = far.
+        """
+        ...
+
 
 @dataclass
 class HeuristicDepthEstimator:
@@ -55,7 +68,12 @@ class HeuristicDepthEstimator:
             + self.edge_weight * (1.0 - edge)
         )
         return np.clip(depth, 0.0, 1.0).astype(np.float32)
-
+    
+    def estimate_batch(self, images_rgb: list[np.ndarray]) -> list[np.ndarray]:
+        """Heuristic depth is pure numpy/cv2 — no GPU saturation gain from
+        vectorizing across the batch. Loop is correct and fast enough.
+        """
+        return [self.estimate(img) for img in images_rgb]
 
 class ONNXDepthEstimator:
     """Depth estimation via ONNX Runtime. Supports CUDA, TensorRT, and CPU providers.
@@ -122,16 +140,19 @@ class ONNXDepthEstimator:
         active = self._session.get_providers()
         print(f"[ONNXDepthEstimator] Loaded {self.onnx_path} | providers: {active}")
 
-    def _preprocess(self, image_rgb: np.ndarray) -> np.ndarray:
-        """Resize, normalize, NCHW float32 — replicates HF DPT image processor."""
+    def _preprocess_single(self, image_rgb: np.ndarray) -> np.ndarray:
+        """HWC uint8 → (3, S, S) float32. Shared by single and batch paths."""
         img = cv2.resize(
             image_rgb, (self._input_size, self._input_size),
             interpolation=cv2.INTER_CUBIC,
         )
         img = img.astype(np.float32) / 255.0
         img = (img - self._MEAN) / self._STD
-        img = np.transpose(img, (2, 0, 1))  # HWC → CHW
-        return np.expand_dims(img, 0).astype(np.float32)  # (1, 3, H, W)
+        return np.transpose(img, (2, 0, 1))  # HWC → CHW
+
+    def _preprocess(self, image_rgb: np.ndarray) -> np.ndarray:
+        """Single-image entry: add the batch dim → (1, 3, S, S)."""
+        return np.expand_dims(self._preprocess_single(image_rgb), 0).astype(np.float32)
 
     def estimate(self, image_rgb: np.ndarray) -> np.ndarray:
         self._ensure_loaded()
@@ -149,6 +170,37 @@ class ONNXDepthEstimator:
         dmin, dmax = depth.min(), depth.max()
         depth = 1.0 - (depth - dmin) / (dmax - dmin + self._normalization_epsilon)
         return np.clip(depth, 0.0, 1.0).astype(np.float32)
+
+    def estimate_batch(self, images_rgb: list[np.ndarray]) -> list[np.ndarray]:
+        """Batched depth estimation in a single session.run call.
+
+        Requires the ONNX model to have been exported with a dynamic batch
+        dimension on `pixel_values`. Standard Depth Anything exports do; if
+        yours doesn't, re-export or fall back to looping `estimate` per image.
+        """
+        self._ensure_loaded()
+
+        target_sizes = [(img.shape[0], img.shape[1]) for img in images_rgb]
+
+        # Preprocess each image, stack into (B, 3, S, S)
+        batch = np.stack(
+            [self._preprocess_single(img) for img in images_rgb],
+            axis=0,
+        ).astype(np.float32)
+        batch = np.ascontiguousarray(batch)   # ORT is strict about layout
+
+        outputs = self._session.run(None, {"pixel_values": batch})
+        depth_batch = outputs[0].astype(np.float32)   # (B, S, S)
+
+        depths = []
+        for i, (h, w) in enumerate(target_sizes):
+            depth = depth_batch[i]
+            depth = cv2.resize(depth, (w, h), interpolation=cv2.INTER_LINEAR)
+            dmin, dmax = depth.min(), depth.max()
+            depth = 1.0 - (depth - dmin) / (dmax - dmin + self._normalization_epsilon)
+            depths.append(np.clip(depth, 0.0, 1.0))
+
+        return depths
 
 
 class DepthAnythingEstimator:
@@ -233,17 +285,25 @@ class DepthAnythingEstimator:
         )
 
         del inputs, outputs
-        if use_amp:
-            torch.cuda.empty_cache()
+        # Intentionally not calling torch.cuda.empty_cache() here — purging the
+        # caching allocator every batch forces re-allocation on the next call,
+        # which defeats the cache and adds cudaMalloc latency to steady-state
+        # inference. Only purge at OOM-adjacent boundaries.
 
-        depths = []
-        for item in post:
-            depth = item["predicted_depth"].detach().cpu().numpy().astype(np.float32)
-            dmin, dmax = depth.min(), depth.max()
-            depth = 1.0 - (depth - dmin) / (dmax - dmin + self._normalization_epsilon)
-            depths.append(np.clip(depth, 0.0, 1.0))
+        preds = torch.stack([item["predicted_depth"] for item in post])
+        preds = 1.0 - (preds - preds.amin(dim=(-1,-2), keepdim=True)) / \
+                        (preds.amax(dim=(-1,-2), keepdim=True) - preds.amin(dim=(-1,-2), keepdim=True) + 1e-6)
+        
+        depths = preds.clamp(0, 1).cpu().numpy()
 
-        del post
+        # depths = []
+        # for item in post:
+        #     depth = item["predicted_depth"].detach().cpu().numpy().astype(np.float32)
+        #     dmin, dmax = depth.min(), depth.max()
+        #     depth = 1.0 - (depth - dmin) / (dmax - dmin + self._normalization_epsilon)
+        #     depths.append(np.clip(depth, 0.0, 1.0))
+
+        # del post
         return depths
 
 

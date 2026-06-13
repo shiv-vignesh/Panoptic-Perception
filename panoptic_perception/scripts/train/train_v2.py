@@ -1,10 +1,12 @@
 import json
 import os
 import argparse
-
 from typing import Union, Optional
 
 import torch
+
+import warnings
+warnings.simplefilter("once", UserWarning)
 
 from panoptic_perception.models import ModelFactory, BaseTaskModel, BaseEnhancementModel
 
@@ -13,6 +15,7 @@ from panoptic_perception.utils.wandb_logger import WandBLogger
 from panoptic_perception.utils.config_parser import load_json, parse_config
 
 from panoptic_perception.dataset import DataLoaderBuilder
+from panoptic_perception.losses.multi_task_loss import MultiTaskLoss
 
 from panoptic_perception.trainer.trainer_args import TrainingArgument
 from panoptic_perception.trainer.trainer_optimizer import OptimizerContext, build_optmizer
@@ -33,7 +36,18 @@ DEFAULT_CALLBACKS = ["checkpoint", "eval_metrics"]
 def create_training_arguments(config:dict) -> TrainingArgument:
     return TrainingArgument.from_config(parse_config(config))
 
-def create_model(model_kwargs:dict, loss_weights: dict = None) -> Union[BaseTaskModel, BaseEnhancementModel]:
+def create_loss_function(loss_kwargs:dict):
+
+    if not loss_kwargs:    
+        raise ValueError(
+            f"Expected Loss Kwargs dict to configure loss function, got {loss_kwargs}"
+        )
+
+    return MultiTaskLoss(
+        loss_kwargs
+    )
+
+def create_model(model_kwargs:dict, loss_kwargs:dict) -> Union[BaseTaskModel, BaseEnhancementModel]:
 
     device = model_kwargs.get("device", "cuda")
 
@@ -53,9 +67,12 @@ def create_model(model_kwargs:dict, loss_weights: dict = None) -> Union[BaseTask
 
         model_kwargs["enhancement"] = "denet-yolo"
 
-    model = ModelFactory.from_config(model_kwargs, loss_weights)
+    model = ModelFactory.from_config(model_kwargs)
     device = torch.device(device) if torch.cuda.is_available() and "cuda" in device else torch.device("cpu")
     model.to(device)
+
+    multi_task_loss_function = create_loss_function(loss_kwargs)
+    model.loss_function = multi_task_loss_function
 
     return model, device
 
@@ -80,7 +97,7 @@ def create_optimizer(model:Union[BaseTaskModel, BaseEnhancementModel],
     for pg in param_groups:
         scale = pg.get("lr_scale", 1.0)
         pg["lr"] = training_args.initial_lr * scale
-        logger.log_message(f"  Param group '{pg.get('name', '?')}': lr_scale={scale}, lr={pg['lr']:.6f}, params={len(pg['params'])}, trainable={pg["trainable"]}")
+        logger.log_message(f"  Param group '{pg.get('name', '?')}': lr_scale={scale}, lr={pg['lr']:.6f}, params={len(pg['params'])}, trainable={pg.get('trainable', True)}")
 
     ctx = OptimizerContext(param_groups, training_args)
 
@@ -177,14 +194,29 @@ def main(args:argparse.Namespace):
         raise ValueError(f"Expected Model Kwargs dict")
 
     logger.log_message("=== Creating Model ===")
-    model, device = create_model(config["model_kwargs"], config.get("loss_weights"))
+    model, device = create_model(config["model_kwargs"], config.get("loss_kwargs"))
     logger.log_message(f"Model type       : {model.__class__.__name__}")
     logger.log_message(f"Device           : {device}")
     logger.log_message(f"Parameters       : {sum(p.numel() for p in model.parameters()):,}")
     logger.log_message(f"Trainable params : {sum(p.numel() for p in model.parameters() if p.requires_grad):,}")
     logger.log_message(f"Active tasks     : {model.get_active_tasks()}")
-    loss_weights = config.get("loss_weights", {})
-    logger.log_message(f"Loss weights     : {', '.join(f'{k}={v}' for k, v in loss_weights.items() if not k.startswith('_'))}")
+    loss_kwargs = config.get("loss_kwargs", {})
+
+    logger.log_message("=== Loss Configuration ===")
+    for task_name, task_cfg in loss_kwargs.items():
+        if task_name == "loss_weights":
+            continue   # printed separately below  
+        loss_type = task_cfg.get("_type", "?")
+        extra = task_cfg.get("kwargs", {})
+        extra_str = f" ({extra})" if extra else "" 
+        logger.log_message(f"  {task_name:25} : {loss_type}{extra_str}")
+
+    weights = loss_kwargs.get("loss_weights", {})
+    if weights:
+        logger.log_message("Loss weights:")
+        for task_name, weight in weights.items():
+            logger.log_message(f"  {task_name:25} : {weight}")
+
     logger.log_new_line()
 
     logger.log_message("=== Creating Optimizer ===")

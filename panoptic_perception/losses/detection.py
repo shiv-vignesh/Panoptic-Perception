@@ -1,470 +1,44 @@
-from typing import List, Optional
+from abc import ABC, abstractmethod
+
 import torch
 import torchvision
 import numpy as np
 
-from typing_extensions import deprecated
+from scipy.interpolate import interp1d
 
-class DetectionHelper:
-    
-    @staticmethod    
-    def bbox_iou(box1:torch.Tensor, box2:torch.Tensor, x1y1x2y2:bool=True, 
-                CIoU:bool=False, GIoU:bool=False, DIoU:bool=False, eps:float=1e-7):
+from typing import Tuple, Dict, List
+
+from panoptic_perception.utils.detection_utils import DetectionHelper, DetectionLossCalculator, ATSS
+from panoptic_perception.models.types import LaneDetectionLossItems
+
+from panoptic_perception.losses.loss_factory import LossFactory
+from panoptic_perception.models.types import DetectionLossItems
+
+class DetectionLoss(ABC):
+
+    def __init__(self, bbox_weight: float = 0.05,
+            obj_weight: float = 1.0,
+            cls_weight: float = 0.5,
+            balance:list = [4.0, 1.0, 0.4],
+            gamma:float = 2.0,
+            iou_aware_cls:bool=False,
+            label_smoothing:float=0.0, 
+            autobalance:bool=False,
+            ssi = [1.0, 1.0, 1.0]):
         
-        if not x1y1x2y2:
-            # Convert from (x, y, w, h) to (x1, y1, x2, y2)
-            # x1 = x - w/2
-            # x2 = x + w/2
-            
-            b1_x1, b1_x2 = box1[:, 0] - box1[:, 2]/2 , box1[:, 0] + box1[:, 2]/2
-            b1_y1, b1_y2 = box1[:, 1] - box1[:, 3]/2 , box1[:, 1] + box1[:, 3]/2
-            b2_x1, b2_x2 = box2[:, 0] - box2[:, 2]/2 , box2[:, 0] + box2[:, 2]/2
-            b2_y1, b2_y2 = box2[:, 1] - box2[:, 3]/2 , box2[:, 1] + box2[:, 3]/2        
-        
-        else:
-            b1_x1, b1_y1, b1_x2, b1_y2 = box1[:, 0], box1[:, 1], box1[:, 2], box1[:, 3]
-            b2_x1, b2_y1, b2_x2, b2_y2 = box2[:, 0], box2[:, 1], box2[:, 2], box2[:, 3]
-            
-        # Intersection coordinates
-        inter_x1 = torch.max(b1_x1, b2_x1)
-        inter_y1 = torch.max(b1_y1, b2_y1)
-        inter_x2 = torch.min(b1_x2, b2_x2)
-        inter_y2 = torch.min(b1_y2, b2_y2)
-        
-        # Intersection area
-        inter_area = torch.clamp(inter_x2 - inter_x1, min=0) * torch.clamp(inter_y2 - inter_y1, min=0)
-        # Union area
-        b1_area = (b1_x2 - b1_x1) * (b1_y2 - b1_y1)
-        b2_area = (b2_x2 - b2_x1) * (b2_y2 - b2_y1)
-        
-        union_area = b1_area + b2_area - inter_area + eps
-        iou = inter_area / union_area
-        
-        if CIoU or GIoU or DIoU: # Advanced IoU calculations
-            cw = torch.max(b1_x2, b2_x2) - torch.min(b1_x1, b2_x1)  # convex width
-            ch = torch.max(b1_y2, b2_y2) - torch.min(b1_y1, b2_y1)  # convex height
-            
-            # c_union = b1_area + b2_area - inter_area + eps  # union area
-            w1, h1 = b1_x2 - b1_x1, b1_y2 - b1_y1 + eps
-            w2, h2 = b2_x2 - b2_x1, b2_y2 - b2_y1 + eps
-            
-            if DIoU or CIoU:
-                c2 = cw ** 2 + ch ** 2 + eps
-                rho2 = (( (b2_x1 + b2_x2)/2 - (b1_x1 + b1_x2)/2 ) ** 2 + 
-                        ( (b2_y1 + b2_y2)/2 - (b1_y1 + b1_y2)/2 ) ** 2) / 4 # center distance squared
-                if DIoU:
-                    return iou - rho2 / c2
-                elif CIoU:
-                    # Clamp aspect ratios to prevent gradient explosion through atan when w or h ≈ 0
-                    v = (4/ (torch.pi ** 2)) * torch.pow(torch.atan(torch.clamp(w2 / h2, -1e4, 1e4)) - torch.atan(torch.clamp(w1 / h1, -1e4, 1e4)), 2)
-                    with torch.no_grad():
-                        alpha = v / (1 - iou + v + eps)
-                    return iou - (rho2 / c2 + v * alpha)
-            elif GIoU:
-                c_area = cw * ch + eps
-                return iou - (c_area - union_area) / c_area
-            
-        return iou
-    
-    @staticmethod
-    def bbox_iou_pairwise(box1, box2, eps=1e-7) -> torch.Tensor:
-        """
-        Pairwise IoU between two sets of boxes (both in x1y1x2y2 format).
-    
-        box1: [M, 4]
-        box2: [N, 4]
-        Returns: [M, N] IoU matrix
-        """
-                
-        area1 = (box1[:, 2] - box1[:, 0]) * (box1[:, 3] - box1[:, 1])
-        area2 = (box2[:, 2] - box2[:, 0]) * (box2[:, 3] - box2[:, 1])
-        
-        inter_x1 = torch.max(box1[:, None, 0], box2[None, :, 0])
-        inter_y1 = torch.max(box1[:, None, 1], box2[None, :, 1])
-        inter_x2 = torch.min(box1[:, None, 2], box2[None, :, 2])
-        inter_y2 = torch.min(box1[:, None, 3], box2[None, :, 3])
-        
-        inter_area = (inter_x2 - inter_x1).clamp(min=0) * (inter_y2 - inter_y1).clamp(min=0)
-        union_area = area1[:, None] + area2[None, :] - inter_area + eps
-        
-        return inter_area/union_area
-    
-    @staticmethod
-    def align_scores_pairwise(pred_logits:torch.Tensor, gt_labels:torch.Tensor,
-                              iou_pairwise:torch.Tensor, is_inside_mask:torch.Tensor,
-                              alpha:float = 0.5, beta:float = 6.0):
-        """
-        Gather the predicted score for each GT's actual class
-        For each prediction-GT pair, get P(correct_class)
-        
-        pred_scores (raw logits) : [M, C], M=8400
-        gt_labels: [N]
-        iou_pairwise (result from bbox_iou_pairwise) : [M, N]
-        """
-        
-        pred_scores = pred_logits.sigmoid()
-        align_scores = pred_scores[:, gt_labels.long()] #[M, N]
-        
-        assert align_scores.shape == iou_pairwise.shape, \
-            f"Expected Class Align Tensor and IOU Pairwise to have same shape, got: {align_scores.shape} and {iou_pairwise.shape}"
-        
-        aligment_metric = (align_scores ** alpha) * (iou_pairwise ** beta)
-        return aligment_metric * is_inside_mask
-    
-    @staticmethod
-    def non_max_suppression(
-        predictions: torch.Tensor,
-        conf_threshold: float = 0.25,
-        iou_threshold: float = 0.45,
-        max_detections: int = 300
-    ) -> List[torch.Tensor]:
-        """
-        Perform Non-Maximum Suppression (NMS) on detection predictions.
+        self.bbox_weight = bbox_weight
+        self.obj_weight = obj_weight
+        self.cls_weight = cls_weight
 
-        Args:
-            predictions: Tensor of shape (batch_size, num_boxes, 5+num_classes)
-                        [x, y, w, h, objectness, class_scores...]
-            conf_threshold: Minimum confidence threshold
-            iou_threshold: IoU threshold for NMS
-            max_detections: Maximum number of detections to keep
+        self.balance = balance
+        self.gamma = gamma
 
-        Returns:
-            List of tensors, one per image, shape (num_detections, 6)
-            [x1, y1, x2, y2, confidence, class_id]
-        """
-        batch_size = predictions.shape[0]
-        num_classes = predictions.shape[2] - 5
-        output = [None] * batch_size
+        self.iou_aware_cls = iou_aware_cls
+        self.label_smoothing = label_smoothing
+        self.autobalance = autobalance
+        self.ssi = ssi
 
-        for img_idx in range(batch_size):
-            pred = predictions[img_idx]  # (num_boxes, 5+num_classes)
-
-            if pred.shape[0] == 0:
-                continue
-
-            # Multiply class scores by objectness to get final confidence
-            pred[:, 5:] *= pred[:, 4:5]
-
-            # Get max confidence across all classes
-            class_conf, class_pred = pred[:, 5:].max(1, keepdim=True)
-
-            # Filter by confidence threshold
-            conf_mask = class_conf[:, 0] > conf_threshold
-            pred = pred[conf_mask]
-            class_conf = class_conf[conf_mask]
-            class_pred = class_pred[conf_mask]
-
-            # Convert from (x, y, w, h) to (x1, y1, x2, y2)
-            boxes = DetectionHelper.xywh2xyxy(pred[:, :4])
-            
-            detections = torch.cat([boxes, class_conf, class_pred.float()], 1)
-
-            # Perform NMS per class
-            unique_classes = detections[:, -1].unique()
-            keep_boxes = []
-
-            for cls in unique_classes:
-                cls_mask = detections[:, -1] == cls
-                cls_detections = detections[cls_mask]
-
-                # Sort by confidence (column 4 - already final confidence)
-                conf_sort_idx = torch.argsort(cls_detections[:, 4], descending=True)
-                cls_detections = cls_detections[conf_sort_idx]
-
-                # NMS using final confidence (column 4 - no multiply!)
-                keep_idx = DetectionHelper.nms_boxes(
-                    cls_detections[:, :4],
-                    cls_detections[:, 4],  # Just column 4, NOT [:, 4] * [:, 5]
-                    iou_threshold
-                )
-
-                keep_boxes.append(cls_detections[keep_idx])
-
-            if keep_boxes:
-                all_dets = torch.cat(keep_boxes, 0)
-                if max_detections > 0:
-                    all_dets = all_dets[all_dets[:, 4].argsort(descending=True)][:max_detections]
-                output[img_idx] = all_dets
-
-        return output
-
-    @staticmethod
-    def nms_boxes(boxes: torch.Tensor, scores: torch.Tensor, iou_threshold: float) -> List[int]:
-        """
-        Perform NMS on boxes with given scores using optimized torchvision implementation.
-
-        Args:
-            boxes: (N, 4) tensor [x1, y1, x2, y2]
-            scores: (N,) tensor of confidence scores
-            iou_threshold: IoU threshold
-
-        Returns:
-            List of indices to keep
-        """
-        # Use torchvision's optimized NMS (GPU-accelerated, C++ backend)
-        keep_indices = torchvision.ops.nms(boxes, scores, iou_threshold)
-        return keep_indices.tolist()
-
-    @staticmethod
-    def non_max_suppression_v8(predictions:torch.Tensor, 
-                               conf_threshold:float = 0.25, 
-                               iou_threshold:float = 0.45,
-                               max_detections: int = 300) -> List[torch.Tensor]:
-
-        """        
-        Perform Non-Maximum Suppression (NMS) on anchor free detection predictions.
-        
-        Args:
-            predictions: Tensor of shape (batch_size, num_boxes = 8400, 4+num_classes)
-                        [x, y, w, h, class_scores...]
-                        class_scores : sigmoid activated
-                        
-            conf_threshold: Minimum confidence threshold
-            iou_threshold: IoU threshold for NMS
-            max_detections: Maximum number of detections to keep
-
-        Returns:
-            List of tensors, one per image, shape (num_detections, 6)
-            [x1, y1, x2, y2, class_id]        
-        
-        """
-        
-        batch_size = predictions.shape[0]
-        num_classes = predictions.shape[2] - 4
-        output = [None] * batch_size
-        
-        for img_idx in range(batch_size):
-            pred = predictions[img_idx] #(num_boxes = 8400, 4+nc)
-            
-            if pred.shape[0] == 0:
-                continue
-
-            boxes, scores = pred[:, :4], pred[:, 4:]
-            boxes = DetectionHelper.xywh2xyxy(boxes)
-
-            # (8400,) (8400,)
-            conf, cls = scores.max(dim=1) 
-            mask = conf > conf_threshold
-
-            boxes = boxes[mask] #(num_dets, 4) where num_dets <= 8400 
-            conf = conf[mask] #(num_dets,) where num_dets <= 8400
-            cls = cls[mask] #(num_dets,) where num_dets <= 8400
-
-            detections = torch.cat([boxes, conf.unsqueeze(-1), cls.unsqueeze(-1).float()], dim=1)
-
-            unique_classes = detections[:, -1].unique()
-            keep_boxes = []
-
-            for c in unique_classes:
-                cls_mask = detections[:, -1] == c
-                cls_detections = detections[cls_mask]
-
-                # Sort by confidence (column 4 - already final confidence)
-                conf_sort_idx = torch.argsort(cls_detections[:, 4], descending=True)
-                cls_detections = cls_detections[conf_sort_idx]
-
-                keep_idx = DetectionHelper.nms_boxes(
-                    cls_detections[:, :4],
-                    cls_detections[:, 4],
-                    iou_threshold
-                )
-
-                keep_boxes.append(cls_detections[keep_idx])
-
-            if keep_boxes:
-                all_dets = torch.cat(keep_boxes, 0)
-                if max_detections > 0:
-                    all_dets = all_dets[all_dets[:, 4].argsort(descending=True)][:max_detections]
-
-                output[img_idx] = all_dets
-
-        return output            
-
-    @staticmethod
-    def box_iou(box1: torch.Tensor, box2: torch.Tensor) -> torch.Tensor:
-        """
-        Compute IoU between two sets of boxes (simple version for NMS).
-
-        Args:
-            box1: (N, 4) [x1, y1, x2, y2]
-            box2: (M, 4) [x1, y1, x2, y2]
-
-        Returns:
-            (N, M) IoU matrix
-        """
-        area1 = (box1[:, 2] - box1[:, 0]) * (box1[:, 3] - box1[:, 1])
-        area2 = (box2[:, 2] - box2[:, 0]) * (box2[:, 3] - box2[:, 1])
-
-        # Intersection
-        lt = torch.max(box1[:, None, :2], box2[:, :2])  # (N, M, 2)
-        rb = torch.min(box1[:, None, 2:], box2[:, 2:])  # (N, M, 2)
-
-        wh = (rb - lt).clamp(min=0)  # (N, M, 2)
-        inter = wh[:, :, 0] * wh[:, :, 1]  # (N, M)
-
-        # Union
-        union = area1[:, None] + area2 - inter
-
-        iou = inter / (union + 1e-6)
-        return iou
-    
-    @staticmethod
-    def xywh2xyxy(boxes:torch.Tensor):
-        """
-        Convert bounding boxes from (x_center, y_center, width, height) to (x1, y1, x2, y2)
-        boxes: Tensor of shape (..., 4)
-        Returns: Tensor of same shape as input
-        """
-        x_c, y_c, w, h = boxes.unbind(-1)
-        x1 = x_c - w / 2
-        y1 = y_c - h / 2
-        x2 = x_c + w / 2
-        y2 = y_c + h / 2
-        return torch.stack((x1, y1, x2, y2), dim=-1)
-    
-    @staticmethod
-    def xyxy2xywh(boxes:torch.Tensor):
-        """
-        Convert bounding boxes from (x1, y1, x2, y2) to (x_center, y_center, width, height)
-        boxes: Tensor of shape (..., 4)
-        Returns: Tensor of same shape as input
-        """
-        x1, y1, x2, y2 = boxes.unbind(-1)
-        x_c = (x1 + x2) / 2
-        y_c = (y1 + y2) / 2
-        w = x2 - x1
-        h = y2 - y1
-        return torch.stack((x_c, y_c, w, h), dim=-1)
-
-    @staticmethod
-    def visualize_detections(
-        image: torch.Tensor,
-        predictions: Optional[torch.Tensor],
-        targets: Optional[torch.Tensor],
-        class_names: Optional[List[str]] = None,
-        pred_color: tuple = (0, 255, 0),  # Green for predictions
-        target_color: tuple = (255, 0, 0),  # Red for targets
-        thickness: int = 1,
-        font_scale: float = 0.2,
-        save_path: Optional[str] = None
-    ) -> np.ndarray:
-        """
-        Visualize detection predictions and ground truth on an image.
-
-        Args:
-            image: Tensor of shape (C, H, W) or (H, W, C), values in [0, 1] or [0, 255]
-            predictions: Tensor of shape (N, 6) [x1, y1, x2, y2, confidence, class_id]
-                        or None if no predictions
-            targets: Tensor of shape (M, 5) [x1, y1, x2, y2, class_id]
-                    or None if no targets
-            class_names: List of class names for labeling
-            pred_color: BGR color for prediction boxes (green by default)
-            target_color: BGR color for target boxes (red by default)
-            thickness: Line thickness for boxes
-            font_scale: Font scale for labels
-            save_path: If provided, save the image to this path
-
-        Returns:
-            Annotated image as numpy array (H, W, C) in BGR format
-        """
-        import cv2
-
-        # Convert image to numpy array
-        if torch.is_tensor(image):
-            image = image.detach().cpu().numpy()
-
-        # Handle channel dimension
-        if image.shape[0] == 3:  # (C, H, W) -> (H, W, C)
-            image = np.transpose(image, (1, 2, 0))
-
-        # Convert to uint8 if needed
-        if image.max() <= 1.0:
-            image = (image * 255).astype(np.uint8)
-        else:
-            image = image.astype(np.uint8)
-
-        # Convert RGB to BGR for OpenCV
-        image = cv2.cvtColor(image, cv2.COLOR_RGB2BGR)
-
-        # Make a copy to draw on
-        vis_image = image.copy()
-
-        # Draw target boxes (red) first so predictions overlay them
-        if targets is not None and len(targets) > 0:
-            if torch.is_tensor(targets):
-                targets = targets.detach().cpu().numpy()
-
-            for box in targets:
-                x1, y1, x2, y2 = box[:4].astype(int)
-                class_id = int(box[4]) if len(box) > 4 else -1
-
-                # Draw box
-                cv2.rectangle(vis_image, (x1, y1), (x2, y2), target_color, thickness)
-
-                # Draw label
-                if class_names is not None and 0 <= class_id < len(class_names):
-                    label = f"GT: {class_names[class_id]}"
-                else:
-                    label = f"GT: {class_id}"
-
-                label_size, baseline = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, font_scale, 1)
-                y1_label = max(y1, label_size[1] + 5)
-                cv2.rectangle(vis_image, (x1, y1_label - label_size[1] - 5),
-                            (x1 + label_size[0], y1_label), target_color, -1)
-                cv2.putText(vis_image, label, (x1, y1_label - 5),
-                           cv2.FONT_HERSHEY_SIMPLEX, font_scale, (255, 255, 255), 1)
-
-        # Draw prediction boxes (green)
-        if predictions is not None and len(predictions) > 0:
-            if torch.is_tensor(predictions):
-                predictions = predictions.detach().cpu().numpy()
-
-            for box in predictions:
-                x1, y1, x2, y2 = box[:4].astype(int)
-                confidence = box[4] if len(box) > 4 else 0.0
-                class_id = int(box[5]) if len(box) > 5 else -1
-
-                # Draw box
-                cv2.rectangle(vis_image, (x1, y1), (x2, y2), pred_color, thickness)
-
-                # Draw label with confidence
-                if class_names is not None and 0 <= class_id < len(class_names):
-                    label = f"{class_names[class_id]}: {confidence:.2f}"
-                else:
-                    label = f"{class_id}: {confidence:.2f}"
-
-                label_size, baseline = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, font_scale, 1)
-                y2_label = min(y2 + label_size[1] + 10, vis_image.shape[0])
-                cv2.rectangle(vis_image, (x1, y2),
-                            (x1 + label_size[0], y2_label), pred_color, -1)
-                cv2.putText(vis_image, label, (x1, y2 + label_size[1] + 2),
-                           cv2.FONT_HERSHEY_SIMPLEX, font_scale, (255, 255, 255), 1)
-
-        # Save if path provided
-        if save_path is not None:
-            cv2.imwrite(save_path, vis_image)
-
-        return vis_image
-
-class DetectionLossCalculator:
-    
-    
-    bbox_weight: float = 0.05
-    obj_weight: float = 1.0
-    cls_weight: float = 0.5
-    
-    balance:list = [4.0, 1.0, 0.4]
-    gamma:float=2.0
-    class_weights = None  # Not needed: detection loss is computed on matched targets which are already balanced
-    
-    iou_aware_cls:bool=False
-    label_smoothing:float=0.0 
-    autobalance:bool=False
-    
-    ssi = [1.0, 1.0, 1.0]
-
-    @staticmethod
-    def focal_loss(inputs, targets, alpha=0.25, gamma=2.0, reduction="mean"):
+    def focal_loss(self, inputs, targets, alpha=0.25, gamma=2.0, reduction="mean"):
         """
         Compute focal loss for binary classification.
         Inputs:
@@ -481,7 +55,7 @@ class DetectionLossCalculator:
                                                                     reduction="none")
         # Get the probability of the true class
         pt = torch.exp(-bce_loss)
-        loss = alpha * (1 - pt) ** gamma * bce_loss
+        loss = alpha * (1. - pt) ** gamma * bce_loss
         if reduction == "mean":
             return loss.mean()
         elif reduction == "sum":
@@ -489,11 +63,32 @@ class DetectionLossCalculator:
         elif reduction == "none":
             return loss
         else:
-            return loss   
+            return loss
 
-    @staticmethod
-    def build_targets_2(preds:List[torch.Tensor], targets:torch.Tensor, 
+    @abstractmethod
+    def __call__(self, model:DetectionLossItems) -> Tuple[torch.Tensor, Dict]:
+        raise NotImplementedError
+
+@LossFactory.register_loss_function("detection-loss-anchor")
+class YOLODetectionLoss(DetectionLoss):
+    def __init__(self, bbox_weight = 0.05, obj_weight = 1, cls_weight = 0.5, balance = [4, 1, 0.4], gamma = 2, iou_aware_cls = False, label_smoothing = 0, autobalance = False, ssi=[1, 1, 1]):
+        super().__init__(bbox_weight, obj_weight, cls_weight, balance, gamma, iou_aware_cls, label_smoothing, autobalance, ssi)
+
+        self.detection_loss_weight = 1.0
+
+    def build_targets_2(self, preds:List[torch.Tensor], targets:torch.Tensor, 
                         num_layers:int, anchors:torch.Tensor, stride:torch.Tensor):
+                
+        assert anchors.shape[0] == num_layers, \
+            f'Expected Number of Anchors to be equal to num layers, got {anchors.shape[0]} and {num_layers}'
+        
+        if stride is None or stride.numel() == 0:
+            raise ValueError(f'Expected non-empty stride tensor, \
+                             got {stride.shape if isinstance(stride, torch.Tensor) else stride}')
+        
+        assert stride.shape[0] == num_layers, \
+            f'Expected Number of stride to be equal to num layers, got {stride.shape[0]} and {num_layers}'
+
         device = targets.device
         # num_layers = detect_module.num_layers
         tcls, tbox, indices, anch = [], [], [], []
@@ -551,25 +146,32 @@ class DetectionLossCalculator:
                                 torch.tensor([], device=device)))
                 anch.append(torch.zeros((0,2), device=device))
 
-        return tcls, tbox, indices, anch
+        return tcls, tbox, indices, anch        
 
-    @deprecated(f'')
-    @staticmethod
-    def compute_detection_loss_2(outputs:List[torch.Tensor], targets:torch.Tensor, 
-                                num_layers:int, anchors:torch.Tensor, stride:torch.Tensor,
-                                cls_loss_type:str='BCE'):
+    def __call__(self, loss_items:DetectionLossItems, cls_loss_type:str='focal'):
+
+        targets = loss_items.targets
+
         device = targets.device
         lcls = torch.zeros(1, device=device)
         lbox = torch.zeros(1, device=device)
         lobj = torch.zeros(1, device=device)
 
+        if loss_items.detection_logits is None:
+            raise ValueError(f'Expected detection_logits, got {loss_items.detection_logits}')
+
+        if loss_items.targets is None or loss_items.targets.numel() == 0:
+            raise ValueError(f'Expected targets to be non-empty, got {loss_items.targets}')
+
         # Build targets
-        tcls, tbox, indices, anch_per_target = DetectionLossCalculator.build_targets_2(outputs, targets, 
-                                                                                    num_layers, anchors, stride)
+        tcls, tbox, indices, anch_per_target = self.build_targets_2(loss_items.detection_logits, 
+                                                                                    targets, 
+                                                                                    loss_items.num_layers, 
+                                                                                    loss_items.anchors, 
+                                                                                    loss_items.stride)
 
         ious = []
-
-        for i, pred in enumerate(outputs):
+        for i, pred in enumerate(loss_items.detection_logits):
             b, a, gj, gi = indices[i]
             tobj = torch.zeros_like(pred[..., 4], device=device)  # objectness target
 
@@ -645,45 +247,65 @@ class DetectionLossCalculator:
         lcls *= DetectionLossCalculator.cls_weight
 
         loss = lbox + lobj + lcls
+        loss = self.detection_loss_weight * loss
+
         return loss, {"lbox": lbox, "lobj": lobj, "lcls": lcls, "iou": sum(ious)/len(ious) if ious else 0.0}
 
-    @staticmethod
-    def compute_detection_loss_v8(pred_scores_logits:torch.Tensor, pred_distri_logits:torch.Tensor,
-                                  anchor_points:torch.Tensor, strides:torch.Tensor, 
-                                  targets:torch.Tensor, image_size:tuple, 
-                                  xywh2xyxy:bool=True, topk:int=10):
+@LossFactory.register_loss_function("detection-loss-anchor-free")
+class YOLOv8DetectionLoss(DetectionLoss):
+
+    def __init__(self, 
+                bbox_weight = 7.5, obj_weight = 1, 
+                dfl_weight = 1.5, cls_weight = 0.5, balance = [4, 1, 0.4], 
+                gamma = 2, iou_aware_cls = False, 
+                label_smoothing = 0, autobalance = False, 
+                ssi=[1, 1, 1],
+                topk:int=10, xywh2xyxy:bool=True):
+        
+        super().__init__(bbox_weight, obj_weight, cls_weight, balance, 
+                        gamma, iou_aware_cls, label_smoothing, autobalance, ssi)
+
+        self.topk = topk
+        self.xywh2xyxy = xywh2xyxy
+        self.dfl_weight = dfl_weight
+
+        self.detection_loss_weight = 1.0
+
+    def __call__(self, loss_items:DetectionLossItems, cls_loss_type:str='focal'):
+
         """
         pred_scores - (bs, 8400, C)
         pred_distri - (bs, 8400, 64)
         anchor_points - (8400, 2)
         strides - (8400, 1)
         """
-        
-        img_h, img_w = image_size
-        device = pred_distri_logits.device
 
-        bs, num_dets, num_classes = pred_scores_logits.shape
-        reg_max = pred_distri_logits.shape[-1] // 4 # 64 // 4 = 16
-        pred_distri_logits = pred_distri_logits.view(bs, num_dets, 4, reg_max)
-        pred_distri = torch.softmax(pred_distri_logits, dim=-1)
+        img_h, img_w = loss_items.image_size
+        device = loss_items.pred_distri_logits.device
+        targets:torch.Tensor = loss_items.targets
+
+        bs, num_dets, num_classes = loss_items.pred_scores_logits.shape
+        reg_max = loss_items.pred_distri_logits.shape[-1] // 4 # 64 // 4 = 16
+        loss_items.pred_distri_logits = loss_items.pred_distri_logits.view(bs, num_dets, 4, reg_max)
+        pred_distri = torch.softmax(loss_items.pred_distri_logits, dim=-1)
 
         project = torch.arange(pred_distri.shape[-1], dtype=pred_distri.dtype, device=device)
         pred_ltrb = (pred_distri * project).sum(dim=-1)
 
-        anchor_x = anchor_points[:, 0].unsqueeze(0)
-        anchor_y = anchor_points[:, 1].unsqueeze(0)
+        anchor_x = loss_items.anchor_points[:, 0].unsqueeze(0)
+        anchor_y = loss_items.anchor_points[:, 1].unsqueeze(0)
         
-        strides_orig = strides
-        strides = strides.unsqueeze(0)
+        strides_orig = loss_items.strides_v8
+        loss_items.strides_v8 = loss_items.strides_v8.unsqueeze(0)
 
         # Convert to xyxy in pixel coords:
-        x1 = anchor_x - pred_ltrb[:, :, 0] * strides.squeeze(-1)
-        y1 = anchor_y - pred_ltrb[:, :, 1] * strides.squeeze(-1)
-        x2 = anchor_x + pred_ltrb[:, :, 2] * strides.squeeze(-1)
-        y2 = anchor_y + pred_ltrb[:, :, 3] * strides.squeeze(-1)
+        x1 = anchor_x - pred_ltrb[:, :, 0] * loss_items.strides_v8.squeeze(-1)
+        y1 = anchor_y - pred_ltrb[:, :, 1] * loss_items.strides_v8.squeeze(-1)
+        x2 = anchor_x + pred_ltrb[:, :, 2] * loss_items.strides_v8.squeeze(-1)
+        y2 = anchor_y + pred_ltrb[:, :, 3] * loss_items.strides_v8.squeeze(-1)
 
         pred_bboxes = torch.stack([x1, y1, x2, y2], dim=-1)
-        
+
         lcls = torch.zeros(1, device=device)
         lbox = torch.zeros(1, device=device)
         ldfl = torch.zeros(1, device=device)
@@ -692,12 +314,12 @@ class DetectionLossCalculator:
             gt_bboxes = targets[targets[:, 0] == b][:, 2:]
             gt_labels = targets[targets[:, 0] == b][:, 1]
             pbox = pred_bboxes[b]
-            plabels = pred_scores_logits[b]
+            plabels = loss_items.pred_scores_logits[b]
 
             if not gt_bboxes.shape[0]:
                 continue
 
-            if xywh2xyxy:
+            if self.xywh2xyxy:
                 gt_x1 = (gt_bboxes[:, 0] - gt_bboxes[:, 2] / 2) * img_w
                 gt_y1 = (gt_bboxes[:, 1] - gt_bboxes[:, 3] / 2) * img_h
                 gt_x2 = (gt_bboxes[:, 0] + gt_bboxes[:, 2] / 2) * img_w
@@ -705,10 +327,10 @@ class DetectionLossCalculator:
                 gt_bboxes = torch.stack([gt_x1, gt_y1, gt_x2, gt_y2], dim=-1)
 
             is_inside = (
-                (anchor_points[:, 0:1] > gt_bboxes[None, :, 0]) &
-                (anchor_points[:, 1:2] > gt_bboxes[None, :, 1]) &
-                (anchor_points[:, 0:1] < gt_bboxes[None, :, 2]) &
-                (anchor_points[:, 1:2] < gt_bboxes[None, :, 3]) 
+                (loss_items.anchor_points[:, 0:1] > gt_bboxes[None, :, 0]) &
+                (loss_items.anchor_points[:, 1:2] > gt_bboxes[None, :, 1]) &
+                (loss_items.anchor_points[:, 0:1] < gt_bboxes[None, :, 2]) &
+                (loss_items.anchor_points[:, 1:2] < gt_bboxes[None, :, 3]) 
             )
 
             iou = DetectionHelper.bbox_iou_pairwise(pbox, gt_bboxes)
@@ -717,7 +339,7 @@ class DetectionLossCalculator:
             )
 
             # For each GT (column), get top-k cells by alignment metric 
-            topk_metrics, topk_indices = torch.topk(align_scores, dim=0, k=topk)
+            topk_metrics, topk_indices = torch.topk(align_scores, dim=0, k=self.topk)
 
             topk_mask = torch.zeros_like(align_scores, dtype=torch.bool, device=device)
             topk_mask.scatter_(0, topk_indices, True) # Build a mask: [8400, N]            
@@ -746,7 +368,7 @@ class DetectionLossCalculator:
             target_scores[fg_mask, assigned_gt_cls[fg_mask]] = soft_targets[fg_mask]
 
             lcls += torch.nn.functional.binary_cross_entropy_with_logits(
-                pred_scores_logits[b],
+                loss_items.pred_scores_logits[b],
                 target_scores,
                 reduction="mean"
             ) 
@@ -765,7 +387,7 @@ class DetectionLossCalculator:
                 
             if fg_mask.sum() > 0:
                 gt_xyxy = assigned_gt_bboxes[fg_mask]
-                anchor_fg = anchor_points[fg_mask]
+                anchor_fg = loss_items.anchor_points[fg_mask]
                 stride_fg = strides_orig.squeeze(-1)[fg_mask]
 
                 target_l = (anchor_fg[:, 0] - gt_xyxy[:, 0]) / stride_fg
@@ -777,7 +399,7 @@ class DetectionLossCalculator:
                 target_ltrb = target_ltrb.clamp(0, reg_max - 1 - 0.01)  # clamp to [0, 14.99]
 
                 # DFL: cross-entropy targeting two adjacent bins
-                raw_logits = pred_distri_logits[b][fg_mask]  # [M, 4, 16]
+                raw_logits = loss_items.pred_distri_logits[b][fg_mask]  # [M, 4, 16]
                 raw_logits = raw_logits.view(-1, 16)      # [M*4, 16]
                 target_flat = target_ltrb.view(-1)        # [M*4]
 
@@ -797,17 +419,24 @@ class DetectionLossCalculator:
             else:
                 ldfl += torch.tensor(0.0, device=device)
 
-        loss = 0.5 * lcls + 7.5 * lbox + 1.5 * ldfl
+        loss = self.cls_weight * lcls + self.bbox_weight * lbox + self.dfl_weight * ldfl
+        loss = self.detection_loss_weight * loss
+
         return loss, {"lcls": lcls.item(), "lbox": lbox.item(), "ldfl": ldfl.item()}
-    
 
-# ----- ATSS -----
-# Truthful replication of https://github.com/sfzhang15/ATSS/tree/master
+@LossFactory.register_loss_function("detection-loss-ATSS")
+class ATSSDetectionLoss(DetectionLoss):
 
-class ATSS:
+    def __init__(self, bbox_weight = 0.05, obj_weight = 1, 
+                cls_weight = 0.5, balance = [4, 1, 0.4], 
+                gamma = 2, iou_aware_cls = False, 
+                label_smoothing = 0, autobalance = False, ssi=[1, 1, 1]):
+        
+        super().__init__(bbox_weight, obj_weight, cls_weight, balance, gamma, iou_aware_cls, label_smoothing, autobalance, ssi)
 
-    @staticmethod
-    def _check_center_constraint(anchor_centers:torch.Tensor,
+        self.detection_loss_weight = 1.0
+
+    def _check_center_constraint(self, anchor_centers:torch.Tensor,
                                 gt_bboxes:torch.Tensor,
                                 candidate_indices:torch.Tensor):
         
@@ -831,8 +460,7 @@ class ATSS:
 
         return in_box
     
-    @staticmethod
-    def _match_targets_to_proposals(anchor_proposals:torch.Tensor, anchor_centers:torch.Tensor,
+    def _match_targets_to_proposals(self, anchor_proposals:torch.Tensor, anchor_centers:torch.Tensor,
                                     gt_centers:torch.Tensor, gt_bboxes:torch.Tensor, 
                                     gt_labels:torch.Tensor,
                                     level_sizes:List[int],
@@ -879,7 +507,7 @@ class ATSS:
 
         # (N_gt, L * K) , L = len(level_sizes)
         iou_filter = candidate_ious >= adaptive_thresholds 
-        in_box = ATSS._check_center_constraint(anchor_centers, gt_bboxes, candidate_indices)
+        in_box = self._check_center_constraint(anchor_centers, gt_bboxes, candidate_indices)
 
         accept = iou_filter & in_box #(N_gt, L * K)
 
@@ -903,13 +531,14 @@ class ATSS:
 
         return matches, matched_gt_bboxes, matched_gt_labels, pos_mask
 
-    @staticmethod
-    def _prepare_targets(anchor_proposals:torch.Tensor, targets:torch.Tensor, 
+    def _prepare_targets(self, 
+                        anchor_proposals:torch.Tensor, 
+                        targets:torch.Tensor, 
                         img_w, img_h, 
                         batch_size:int, 
                         level_sizes:List[int],
                         device:torch.device):
-        
+
         """
             anchor_proposals - [A, 4]
                 A - sum(anchors_per_level)
@@ -923,7 +552,8 @@ class ATSS:
         num_coords = anchor_proposals.shape[1]
 
         # per batch_idx -> matched_gt_labels: (A,) int
-        #   gathered gt class id at each anchor (garbage where pos_mask is False)        
+        #   gathered gt class id at each anchor (garbage where pos_mask is False)
+
         batch_labels = torch.zeros(
             (batch_size, num_anchors),
             dtype=torch.long,
@@ -978,7 +608,7 @@ class ATSS:
             # Shapes same order as return 
             # [A], [A, 4], [A], [A]
             matches, matched_gt_bboxes, matched_gt_labels, pos_mask = \
-                ATSS._match_targets_to_proposals(
+                self._match_targets_to_proposals(
                 anchor_proposals, anchor_centers,
                 gt_centers, gt_bboxes,
                 gt_labels, level_sizes
@@ -990,9 +620,10 @@ class ATSS:
             batch_matches[batch_idx] = matches
         
         return batch_labels, batch_bboxes, batch_pos_masks, batch_matches
-
-    @staticmethod
-    def subsample(anchor_proposals:List[torch.Tensor], targets:torch.Tensor, 
+    
+    def subsample(self, 
+                anchor_proposals:List[torch.Tensor], 
+                targets:torch.Tensor, 
                 img_w, img_h, 
                 batch_size:int,
                 device:torch.device):
@@ -1033,15 +664,15 @@ class ATSS:
             level_sizes.append(num_anchors)
 
         anchor_proposals = torch.cat(anchor_proposals, dim=0).to(device)
-        return ATSS._prepare_targets(
+        return self._prepare_targets(
             anchor_proposals, 
             targets, 
             img_w, img_h, 
             batch_size, level_sizes, device
         )
 
-    @staticmethod
     def _validate_anchor_metadata(
+        self,
         anchor_cxcy: List[torch.Tensor],
         anchor_wh: List[torch.Tensor],
         anchor_strides: List[torch.Tensor],
@@ -1132,124 +763,123 @@ class ATSS:
 
         return True
 
-    @staticmethod
-    def compute_loss(outputs:List[torch.Tensor], targets:torch.Tensor,
-                    anchors_proposals:List[torch.Tensor], 
-                    anchor_cxcy:List[torch.Tensor],
-                    anchor_wh:List[torch.Tensor],
-                    anchor_strides:List[torch.Tensor],
-                    img_h, img_w, 
-                    batch_size:int,
-                    cls_loss_type:str="focal"):
-        
-        if len(outputs) == 0 or len(anchors_proposals) == 0:
+    def __call__(self, loss_items: DetectionLossItems, cls_loss_type: str = 'focal'):
+
+        # outputs = loss_items.detection_logits
+        targets = loss_items.targets
+
+        if loss_items.detection_logits is None:
+            raise ValueError(f'Expected detection_logits, got {loss_items.detection_logits}')
+
+        if len(loss_items.detection_logits) == 0 or len(loss_items.anchor_proposals) == 0:
             raise ValueError(
-                f"Expected non-empty outputs and anchor proposals, "
-                f"got {len(outputs)} outputs and "
-                f"{len(anchors_proposals)} anchor sets."
-            )
-        
-        if len(outputs) != len(anchors_proposals):
-            raise ValueError(
-                f"Expected equal number of outputs and anchor proposal tensors, "
-                f"got {len(outputs)} outputs and "
-                f"{len(anchors_proposals)} anchor sets."
+                f"Expected non-empty detection_logits and anchor proposals, "
+                f"got {len(loss_items.detection_logits)} detection_logits and "
+                f"{len(loss_items.anchor_proposals)} anchor sets."
             )
 
+        if len(loss_items.detection_logits) != len(loss_items.anchor_proposals):
+            raise ValueError(
+                f"Expected equal number of outpdetection_logitsuts and anchor proposal tensors, "
+                f"got {len(loss_items.detection_logits)} detection_logits and "
+                f"{len(loss_items.anchor_proposals)} anchor sets."
+            )
 
         device = targets.device
+        img_h, img_w = loss_items.image_size
+        batch_size = loss_items.batch_size
+
         batch_labels, batch_bboxes, batch_pos_masks, batch_matches = \
-            ATSS.subsample(
-                anchor_proposals=anchors_proposals,
+            self.subsample(
+                anchor_proposals=loss_items.anchor_proposals,
                 targets=targets,
                 img_h=img_h,
                 img_w=img_w,
                 batch_size=batch_size,
-                device=device
+                device=device,
             )
-        
-        feature_dim = outputs[0].shape[-1]
-        def reshape_output(i: int, output:torch.Tensor):
+
+        feature_dim = loss_items.detection_logits[0].shape[-1]
+
+        def reshape_output(i: int, output: torch.Tensor):
             if output.shape[0] != batch_size:
                 raise ValueError(
                     f"Output tensor {i} has batch size "
                     f"{output.shape[0]} != {batch_size}"
                 )
-
             if output.shape[-1] != feature_dim:
                 raise ValueError(
                     f"Output tensor {i} has feature dim "
                     f"{output.shape[-1]} != {feature_dim}"
                 )
             return output.permute(0, 2, 3, 1, 4) \
-                    .contiguous() \
-                    .view(batch_size, -1, output.shape[-1])
-        
+                         .contiguous() \
+                         .view(batch_size, -1, output.shape[-1])
+
         reshaped_outputs = []
         pred_anchor_counts = []
-        for i, output in enumerate(outputs):
+        for i, output in enumerate(loss_items.detection_logits):
             output = reshape_output(i, output)
-            anchor_count = output.shape[1]
             reshaped_outputs.append(output)
-            pred_anchor_counts.append(anchor_count)
+            pred_anchor_counts.append(output.shape[1])
 
-        outputs = torch.cat(
-            reshaped_outputs,
-            dim=1
-        )
+        outputs_flat = torch.cat(reshaped_outputs, dim=1)   # renamed to avoid shadowing
 
-        ATSS._validate_anchor_metadata(
-            anchor_cxcy, 
-            anchor_wh,
-            anchor_strides,
+        self._validate_anchor_metadata(
+            loss_items.anchor_cxcy,
+            loss_items.anchor_wh,
+            loss_items.anchor_strides,
             len(pred_anchor_counts),
             pred_anchor_counts,
-            device=device
+            device=device,
         )
 
-        anchor_cxcy = torch.cat(anchor_cxcy, dim=0) #(A, 2)
-        anchor_wh = torch.cat(anchor_wh, dim=0) #(A, 2)
-        anchor_strides = torch.cat(anchor_strides, 0) #(A,)
-        
+        anchor_cxcy = torch.cat(loss_items.anchor_cxcy, dim=0)     # (A, 2)
+        anchor_wh = torch.cat(loss_items.anchor_wh, dim=0)       # (A, 2)
+        anchor_strides = torch.cat(loss_items.anchor_strides, dim=0)  # (A,)
+
         lcls = torch.zeros(1, device=device)
         lbox = torch.zeros(1, device=device)
-        lobj = torch.zeros(1, device=device)        
+        lobj = torch.zeros(1, device=device)
 
-        raw_xy = outputs[..., :2]
-        raw_wh = outputs[..., 2:4]
-        obj_logits = outputs[..., 4]
-        cls_logits = outputs[..., 5:]
+        raw_xy = outputs_flat[..., :2]
+        raw_wh = outputs_flat[..., 2:4]
+        obj_logits = outputs_flat[..., 4]
+        cls_logits = outputs_flat[..., 5:]
 
-        #offset in (-1, 1) * scale to ± stride pixels + anchor cell center
+        # offset in (-1, 1) * scale to ±stride pixels + anchor cell center
         pxy = (raw_xy.sigmoid() * 2 - 1) * anchor_strides[None, :, None] + anchor_cxcy[None, :, :]
         # pwh: predicted size in pixels. (sigmoid*2)^2 ∈ [0, 4]
         pwh = (raw_wh.sigmoid() * 2) ** 2 * anchor_wh[None, :, :]
         pred_xyxy = torch.cat([pxy - pwh / 2, pxy + pwh / 2], dim=-1)   # (B, A, 4)
 
-        iou = DetectionHelper.bbox_iou(pred_xyxy[batch_pos_masks],
-                                       batch_bboxes[batch_pos_masks],
-                                       x1y1x2y2=True, CIoU=True)
-
-        plain_iou = DetectionHelper.bbox_iou(pred_xyxy[batch_pos_masks],
-                                       batch_bboxes[batch_pos_masks],
-                                       x1y1x2y2=True)
+        iou = DetectionHelper.bbox_iou(
+            pred_xyxy[batch_pos_masks],
+            batch_bboxes[batch_pos_masks],
+            x1y1x2y2=True, CIoU=True,
+        )
+        plain_iou = DetectionHelper.bbox_iou(
+            pred_xyxy[batch_pos_masks],
+            batch_bboxes[batch_pos_masks],
+            x1y1x2y2=True,
+        )
 
         if (plain_iou < 0).any():
             raise ValueError(
                 f"IOU Tensor contains negative values: {plain_iou[plain_iou < 0]}"
             )
-        
+
         num_pos = batch_pos_masks.sum().item()
         if num_pos > 0:
             lbox += (1.0 - iou).mean()
 
-            pos_cls_logits = cls_logits[batch_pos_masks] # (n_pos, K=nc)
-            pos_labels = batch_labels[batch_pos_masks].long() #(n_pos,)
+            pos_cls_logits = cls_logits[batch_pos_masks]              # (n_pos, K)
+            pos_labels = batch_labels[batch_pos_masks].long()     # (n_pos,)
 
             num_classes = cls_logits.shape[-1]
             if num_classes > 1:
-                cp = 1.0 - 0.5 * DetectionLossCalculator.label_smoothing
-                cn = 0.5 * DetectionLossCalculator.label_smoothing
+                cp = 1.0 - 0.5 * self.label_smoothing
+                cn = 0.5 * self.label_smoothing
 
                 cls_target = torch.full_like(pos_cls_logits, fill_value=cn)
                 cls_target[torch.arange(pos_cls_logits.shape[0]), pos_labels] = cp
@@ -1257,17 +887,17 @@ class ATSS:
 
                 iou_weight = iou.detach().clamp(0.1, 1.0)
                 if cls_loss_type == "focal":
-                    per_sample = DetectionLossCalculator.focal_loss(
+                    per_sample = self.focal_loss(
                         pos_cls_logits, cls_target,
-                        alpha=0.25, gamma=DetectionLossCalculator.gamma,
-                        reduction="none"
+                        alpha=0.25, gamma=self.gamma,
+                        reduction="none",
                     )
                 else:
-                    per_sample = torch.nn.functional.binary_cross_entropy_with_logits(pos_cls_logits,
-                                                                                    cls_target,
-                                                                                    reduction="none")
+                    per_sample = torch.nn.functional.binary_cross_entropy_with_logits(
+                        pos_cls_logits, cls_target, reduction="none",
+                    )
 
-                if DetectionLossCalculator.iou_aware_cls:
+                if self.iou_aware_cls:
                     lcls += (per_sample.mean(dim=1) * iou_weight).mean()
                 else:
                     lcls += per_sample.mean()
@@ -1276,31 +906,310 @@ class ATSS:
         obj_target[batch_pos_masks] = plain_iou.detach().clamp(0.1, 1.0)
 
         obj_per_anchor = torch.nn.functional.binary_cross_entropy_with_logits(
-            obj_logits, obj_target, reduction="none"
-        ) # (bs, A)
+            obj_logits, obj_target, reduction="none",
+        )  # (B, A)
 
         start = 0
         for i, count in enumerate(pred_anchor_counts):
             end = start + count
             obji = obj_per_anchor[:, start:end].mean()
 
-            if DetectionLossCalculator.autobalance:
+            if self.autobalance:
                 obji_val = obji.detach().item()
-                DetectionLossCalculator.ssi[i] = (
-                    DetectionLossCalculator.ssi[i] * 0.9999 + obji_val * 0.0001
-                )
-                ssi_max = max(DetectionLossCalculator.ssi)
-                balance_i = (DetectionLossCalculator.ssi[i] / (ssi_max + 1e-9))
+                self.ssi[i] = self.ssi[i] * 0.9999 + obji_val * 0.0001
+                ssi_max = max(self.ssi)
+                balance_i = self.ssi[i] / (ssi_max + 1e-9)
                 lobj += obji * balance_i
             else:
-                lobj += obji * DetectionLossCalculator.balance[i]
+                lobj += obji * self.balance[i]
 
             start = end
 
-        lbox *= DetectionLossCalculator.bbox_weight
-        lobj *= DetectionLossCalculator.obj_weight
-        lcls *= DetectionLossCalculator.cls_weight            
+        lbox *= self.bbox_weight
+        lobj *= self.obj_weight
+        lcls *= self.cls_weight
 
-        loss = lbox + lobj + lcls
+        loss = (lbox + lobj + lcls) * self.detection_loss_weight
         return loss, {"lbox": lbox, "lobj": lobj, "lcls": lcls}
+    
+# ----- Lane Detection -----
+# Adapted from: https://github.com/Turoad/CLRNet
+
+@LossFactory.register_loss_function("lane-detection-loss")
+class LaneDetectionLossCalculator:
+
+    cls_loss_weight = 2.0
+    xyt_loss_weight = 0.5
+    iou_loss_weight = 2.0
+
+    NUM_LANE_POINTS = 72
+    MAX_LANES = 8    
+
+    loss_weights = {
+        "lane_detection":1.0,
+        "lane_segmentation": 1.0
+    }
+
+    
+    def focal_loss(self, inputs, targets, alpha=0.25, gamma=2.0, reduction='none'):
+        """
+        Softmax-based focal loss for multi-class (2-class bg/fg) classification.
+        Note: DetectionLossCalculator.focal_loss is BCE-based (binary), not reusable here.
+        """
+        # inputs: (N, C) raw logits, targets: (N,) long labels
+        p = torch.softmax(inputs, dim=1) + 1e-8        # (N, C)
+        ce = torch.nn.functional.cross_entropy(inputs, targets, reduction='none')   # (N,)
+        p_t = p[torch.arange(len(targets), device=targets.device), targets]         # (N,)
+        # Constant alpha for all classes (matches official CLRNet focal_loss.py)
+        loss = alpha * (1 - p_t) ** gamma * ce                                     # (N,)
+        if reduction == 'mean':
+            return loss.mean()
+        elif reduction == 'sum':
+            return loss.sum()
+        return loss
+
+    
+    def line_iou(self, pred, target, img_w, length=15, aligned=True):
+        """
+        1D lane IoU with rectangular buffer strips.
+        Only target validity is checked (predictions can be out-of-bounds and
+        naturally receive 0 overlap via geometry).
+        """
+        # pred: (N, 72) pixels, target: (N, 72) or (M, 72) pixels
+        px1, px2 = pred - length, pred + length         # (N, 72)
+        tx1, tx2 = target - length, target + length
+
+        if aligned:
+            invalid = (target < 0) | (target >= img_w)  # (N, 72)
+            ovr = torch.min(px2, tx2) - torch.max(px1, tx1)                         # (N, 72)
+            union = torch.max(px2, tx2) - torch.min(px1, tx1)                       # (N, 72)
+        else:
+            num_pred = pred.shape[0]
+            tgt_expanded = target.unsqueeze(0).expand(num_pred, -1, -1)             # (N, M, 72)
+            invalid = (tgt_expanded < 0) | (tgt_expanded >= img_w)                  # (N, M, 72)
+            ovr = (torch.min(px2[:, None, :], tx2[None, ...]) -
+                   torch.max(px1[:, None, :], tx1[None, ...]))                      # (N, M, 72)
+            union = (torch.max(px2[:, None, :], tx2[None, ...]) -
+                     torch.min(px1[:, None, :], tx1[None, ...]))                    # (N, M, 72)
+
+        # Match official CLRNet: do NOT clamp ovr to >=0.
+        # Negative overlap at valid positions penalizes misaligned lanes,
+        # giving stronger gradients for geometry refinement.
+        ovr[invalid] = 0.
+        union[invalid] = 0.
+        return ovr.sum(-1) / (union.sum(-1) + 1e-9)    # (N,) or (N, M)
+
+    
+    def _distance_cost(self, predictions, targets, img_w):
+        """Mean absolute x-distance between pred and GT at valid y-levels (pixel space)."""
+        # predictions[:, 6:] and targets[:, 6:] already in pixel space (scaled by assign)
+        pred_xs = predictions[:, 6:].unsqueeze(1)       # (P, 1, 72)
+        tgt_xs = targets[:, 6:].unsqueeze(0)            # (1, T, 72)
+
+        valid = (tgt_xs >= 0) & (tgt_xs < img_w)       # (P, T, 72)
+        dist = torch.abs(pred_xs - tgt_xs) * valid.float()                          # (P, T, 72)
+        return dist.sum(-1) / valid.sum(-1).float().clamp(min=1)                    # (P, T)
+
+    
+    def _focal_cost(self, cls_pred, gt_labels, alpha=0.25, gamma=2.0, eps=1e-12):
+        """Classification cost for assignment (takes softmaxed probabilities)."""
+        # cls_pred: (P, 2) softmaxed, gt_labels: (T,) all 1s for valid lanes
+        neg_cost = -(1 - cls_pred + eps).log() * (1 - alpha) * cls_pred.pow(gamma)  # (P, 2)
+        pos_cost = -(cls_pred + eps).log() * alpha * (1 - cls_pred).pow(gamma)      # (P, 2)
+        return pos_cost[:, gt_labels] - neg_cost[:, gt_labels]                      # (P, T)
+
+    
+    def _dynamic_k_assign(self, cost, pair_wise_ious):
+        """Dynamic k matching: top-4 IoU per GT determines number of assigned priors."""
+        # cost: (P, T), pair_wise_ious: (P, T)
+        matching = torch.zeros_like(cost)               # (P, T)
+        n_candidate_k = min(4, cost.shape[0])
+
+        topk_ious, _ = torch.topk(pair_wise_ious, n_candidate_k, dim=0)            # (4, T)
+        dynamic_ks = topk_ious.sum(0).int().clamp(min=1)# (T,)
+
+        for gt_idx in range(cost.shape[1]):
+            _, pos_idx = torch.topk(
+                cost[:, gt_idx], k=dynamic_ks[gt_idx].item(), largest=False)
+            matching[pos_idx, gt_idx] = 1.0
+
+        # Resolve conflicts: prior matched to multiple GTs -> keep lowest cost
+        conflict_rows = torch.where(matching.sum(1) > 1)[0]                         # (C,)
+        if len(conflict_rows) > 0:
+            _, best_gt = cost[conflict_rows].min(dim=1) # (C,)
+            matching[conflict_rows] = 0
+            matching[conflict_rows, best_gt] = 1.0
+
+        matched_row = matching.sum(1).nonzero().flatten()                           # (K,)
+        matched_col = matching[matched_row].argmax(-1).flatten()                    # (K,)
+        return matched_row, matched_col
+
+    
+    def assign(self, predictions, targets, img_w, img_h,
+               distance_cost_weight=3.0, cls_cost_weight=1.0):
+        """
+        Full lane-to-prior assignment with combined spatial similarity + classification cost.
+        All spatial metrics are normalized to similarity scores in (0, 1] before combining.
+        """
+        # predictions: (P, 78) normalized, targets: (T, 78) normalized (valid GT only)
+        with torch.no_grad():
+            predictions = predictions.detach().clone()
+            targets = targets.detach().clone()
+            num_priors = predictions.shape[0]
+            num_targets = targets.shape[0]
+
+            # Scale to pixel space for spatial costs
+            predictions[:, 3] *= (img_w - 1)           # start_x -> px
+            predictions[:, 6:] *= (img_w - 1)          # x-coords -> px
+            targets[:, 3] *= (img_w - 1)               # start_x -> px
+            targets[:, 6:] *= (img_w - 1)              # x-coords -> px
+
+            # 1. Distance similarity
+            distances = self._distance_cost(
+                predictions, targets, img_w)            # (P, T)
+            distances = 1 - (distances / distances.max().clamp(min=1e-4)) + 1e-2   # -> similarity
+
+            # 2. Classification cost
+            cls_pred = torch.softmax(predictions[:, :2], dim=1)                     # (P, 2)
+            gt_labels = torch.ones(num_targets, dtype=torch.long,
+       device=targets.device)                           # (T,)
+            cls_cost = self._focal_cost(
+                cls_pred, gt_labels)                    # (P, T)
+
+            # 3. Start point similarity (scale start_y to pixels for comparable L2)
+            pred_start = predictions[:, 2:4].clone()    # (P, 2)
+            pred_start[:, 0] *= (img_h - 1)            # start_y -> px
+            tgt_start = targets[:, 2:4].clone()         # (T, 2)
+            tgt_start[:, 0] *= (img_h - 1)             # start_y -> px
+            start_xys = torch.cdist(pred_start, tgt_start, p=2).reshape(
+                num_priors, num_targets)                # (P, T)
+            start_xys = (1 - start_xys / start_xys.max().clamp(min=1e-4)) + 1e-2  # -> similarity
+
+            # 4. Theta similarity (scale to degrees for magnitude)
+            thetas = torch.cdist(
+                predictions[:, 4:5], targets[:, 4:5], p=1).reshape(
+                num_priors, num_targets) * 180          # (P, T)
+            thetas = (1 - thetas / thetas.max().clamp(min=1e-4)) + 1e-2            # -> similarity
+
+            # Combined cost: high similarity product -> large negative -> selected by topk(largest=False)
+            cost = -(distances * start_xys * thetas) ** 2 * distance_cost_weight \
+                   + cls_cost * cls_cost_weight         # (P, T)
+
+            # Line IoU for dynamic-k
+            pair_wise_ious = self.line_iou(
+                predictions[:, 6:], targets[:, 6:],
+                img_w, aligned=False)                   # (P, T)
+
+        return self._dynamic_k_assign(cost, pair_wise_ious)
+
+    
+    def compute_lane_det_loss(self, predictions_lists, targets, 
+                            img_w, img_h, n_strips=71):
+        """
+        predictions_lists: List[(bs, 192, 78)] per refinement stage, or single (bs, 192, 78)
+        targets: (bs, max_lanes, 78)
+            [0]=valid, [1]=category, [2]=start_y, [3]=start_x, [4]=theta, [5]=length, [6:78]=x_coords
+            x_coords normalized [0,1], invalid positions = -1e5
+        """
+        if isinstance(predictions_lists, torch.Tensor):
+            predictions_lists = [predictions_lists]
+
+        device = predictions_lists[0].device
+        bs = predictions_lists[0].shape[0]
+        num_stages = len(predictions_lists)
+
+        cls_loss = torch.tensor(0.0, device=device)
+        reg_xytl_loss = torch.tensor(0.0, device=device)
+        iou_loss = torch.tensor(0.0, device=device)
+
+        for stage in range(num_stages):
+            preds_stage = predictions_lists[stage]      # (bs, 192, 78)
+
+            for b in range(bs):
+                pred = preds_stage[b]                   # (192, 78)
+                target = targets[b]                     # (max_lanes, 78)
+                target = target[target[:, 0] == 1] #TODO, target[:, 1] == 1         # (T, 78) valid
+
+                if len(target) == 0:
+                    cls_target = pred.new_zeros(pred.shape[0]).long()                # (192,)
+                    cls_loss = cls_loss + self.focal_loss(
+                        pred[:, :2], cls_target).sum()
+                    continue
+
+                with torch.no_grad():
+                    matched_row, matched_col = self.assign(
+                        pred, target, img_w, img_h)
+
+                # --- Classification ---
+                cls_target = pred.new_zeros(pred.shape[0]).long()                   # (192,)
+                cls_target[matched_row] = 1
+                cls_loss = cls_loss + self.focal_loss(
+                    pred[:, :2], cls_target             # (192, 2) vs (192,)
+                ).sum() / target.shape[0]
+
+                # --- Regression: start_y, start_x, theta, length ---
+                reg_yxtl = pred[matched_row, 2:6].clone()                           # (K, 4)
+                reg_yxtl[:, 0] *= n_strips              # start_y -> strips
+                reg_yxtl[:, 1] *= (img_w - 1)          # start_x -> px
+                reg_yxtl[:, 2] *= 180                   # theta -> degrees
+                reg_yxtl[:, 3] *= n_strips              # length -> strips
+
+                target_yxtl = target[matched_col, 2:6].clone()                      # (K, 4)
+
+                # Adjust target length relative to prediction start position
+                with torch.no_grad():
+                    pred_starts = (pred[matched_row, 2] * n_strips).round().long().clamp(0, n_strips)              # (K,)
+                    tgt_starts = (target[matched_col, 2] * n_strips).round().long()      # (K,)
+                    target_yxtl[:, 3] -= (pred_starts - tgt_starts).float() / n_strips
+
+                target_yxtl[:, 0] *= n_strips           # start_y -> strips
+                target_yxtl[:, 1] *= (img_w - 1)       # start_x -> px
+                target_yxtl[:, 2] *= 180                # theta -> degrees
+                target_yxtl[:, 3] *= n_strips           # length -> strips
+
+                reg_xytl_loss = reg_xytl_loss + torch.nn.functional.smooth_l1_loss(
+                    reg_yxtl, target_yxtl, reduction='none').mean()
+
+                # --- Line IoU ---
+                pred_xs = pred[matched_row, 6:] * (img_w - 1)                       # (K, 72) px
+                tgt_xs = target[matched_col, 6:] * (img_w - 1)                      # (K, 72) px
+                iou_loss = iou_loss + (1 - self.line_iou(
+                    pred_xs, tgt_xs, img_w, length=15, aligned=True)).mean()
+
+        denom = bs * num_stages
+        cls_loss /= denom
+        reg_xytl_loss /= denom
+        iou_loss /= denom
+
+        total = (cls_loss * LaneDetectionLossCalculator.cls_loss_weight +
+                 reg_xytl_loss * LaneDetectionLossCalculator.xyt_loss_weight +
+                 iou_loss * LaneDetectionLossCalculator.iou_loss_weight).reshape(1)
+
+        return total, {
+            'lane_cls_loss': (cls_loss * LaneDetectionLossCalculator.cls_loss_weight).item(),
+            'lane_reg_loss': (reg_xytl_loss * LaneDetectionLossCalculator.xyt_loss_weight).item(),
+            'lane_iou_loss': (iou_loss * LaneDetectionLossCalculator.iou_loss_weight).item(),
+        }
+
+    def __call__(self, loss_items:LaneDetectionLossItems):
         
+        img_h, img_w = loss_items.image_size
+        
+        lane_det_loss, lane_det_loss_items = self.compute_lane_det_loss(
+            loss_items.lane_detection_logits,
+            loss_items.targets_detections,
+            img_w=img_w, img_h=img_h            
+        )
+
+        lane_det_loss += LaneDetectionLossCalculator.loss_weights.get("lane_detection", 1.0)
+
+        if loss_items.lane_seg_logits is not None and loss_items.targets_seg_masks is not None:
+            seg_loss = torch.nn.functional.nll_loss(
+                torch.nn.functional.log_softmax(loss_items.lane_seg_logits, dim=1),
+                loss_items.targets_seg_masks
+            )
+
+            lane_det_loss += seg_loss * LaneDetectionLossCalculator.loss_weights.get("lane_seg", 1.0)
+            lane_det_loss_items["lane_seg_loss"] = seg_loss.item()
+
+        return lane_det_loss, lane_det_loss_items

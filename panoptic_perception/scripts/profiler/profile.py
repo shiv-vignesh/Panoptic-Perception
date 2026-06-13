@@ -5,7 +5,9 @@ from pathlib import Path
 from typing import List, Any
 from collections import defaultdict
 
-from .trace_models import GPUSpecs, KernelRecord, ForwardError, ProfilerInfo
+from .trace_models import GPUSpecs, KernelRecord, ForwardError, ProfilerInfo, DTYPE_MAP
+from .bytes_estimators import estimate_bytes
+from .utils import get_pynvml_gpu_specs, get_cores_per_sm, render_kernel_table
 
 class Profiler:
     def __init__(self, 
@@ -61,14 +63,27 @@ class Profiler:
         if device.type != "cuda":
             raise ValueError(f"{device.type}, CUDA Device required")
         
-        device_props = torch.cuda.get_device_properties(device)
-        return GPUSpecs(
-            name=device_props.name,
-            sm_count=device_props.multi_processor_count,
-            memory_gb=device_props.total_memory / 1024**3,
-            compute_capability=(device_props.major, device_props.minor)         
-        )
-    
+        specs : GPUSpecs
+        try:
+            specs = get_pynvml_gpu_specs(device)
+        except ImportError:
+            print(f'pynvml not installed, fallback to torch API device properties ')
+            
+            specs = GPUSpecs()
+            device_props = torch.cuda.get_device_properties(device)
+            cc_major, cc_minor = device_props.major, device_props.minor
+
+            clock_rate_mhz  = device_props.clock_rate / 1000
+
+            cores_per_sm = get_cores_per_sm(cc_major, cc_minor)
+            total_cores = specs.sm_count * cores_per_sm
+
+            fp32_tflops = (total_cores * 2 * clock_rate_mhz) / 1e12
+            specs.peak_tflops_by_dtype["fp32"] = round(fp32_tflops, 2)
+            specs.peak_tflops_by_dtype["fp16"] = round(fp32_tflops * 2, 2)    
+
+        return specs            
+
     def _generate_inputs(self, input_shape:List[int],
                         dtype:torch.dtype, device:torch.device):
         
@@ -253,17 +268,95 @@ class Profiler:
 
         key_averages = prof.key_averages(group_by_input_shape=self.group_by_input_shape, group_by_stack_n=True)
         for evnt in key_averages:
+            # PyTorch 2.8 renamed self_cuda_time_total -> self_device_time_total
+            # (device-agnostic naming). Fall back for older versions.
+            gpu_time = getattr(evnt, "self_device_time_total", None)
+            if gpu_time is None:
+                gpu_time = getattr(evnt, "self_cuda_time_total", 0.0)
+
             kernel_record = KernelRecord(
                 name=evnt.key,
-                gpu_time=getattr(evnt, "self_cuda_time_total", 0.0),
+                gpu_time=gpu_time,
                 cpu_time=getattr(evnt, "self_cpu_time_total", 0.0),
                 cpu_mem_usage=evnt.self_cpu_memory_usage,
                 gpu_mem_usage=evnt.device_memory_usage,
                 call_count=evnt.count,
                 input_shapes=evnt.input_shapes,
-                total_kflops=evnt.flops
+                total_flops=evnt.flops
             )
             event_lists.append(kernel_record)
+
+        return event_lists
+
+    def compute_roofline(self, event_lists:List[KernelRecord], device:torch.device, dtype:torch.dtype, gpu_specs:GPUSpecs):
+
+        is_cpu_profile = device.type == "cpu" and gpu_specs is None
+        dtype_bytes = torch.tensor([], dtype=dtype).element_size()
+
+        if gpu_specs is None:
+            print(f'[WARN] cannot compute ceil performance for kernels on non-GPU device')
+
+        for record in event_lists:
+            if record.call_count <= 0:
+                continue
+
+            bytes_est = estimate_bytes(record, dtype_bytes)
+            print(record.name, bytes_est)
+            print()            
+            if bytes_est is None:
+                record.roofline = "no_estimator"
+                continue
+
+            flops_per_call = (record.total_flops or 0) / record.call_count
+            #arthematic intensity
+            ai = flops_per_call / bytes_est if bytes_est > 0 else 0.0
+            record.bytes_estimate = bytes_est
+            record.arithmetic_intensity = ai
+
+            cpu_time_per_call_s = (record.cpu_time * 1e-6) / record.call_count
+            record.cpu_time_per_call_s = cpu_time_per_call_s
+
+            if record.gpu_time <= 0:
+                # No CUDA kernel ran for this op: either CPU-only profile,
+                # or a metadata/view op (aten::view, aten::reshape, etc.)
+                # that doesn't launch device work even on GPU runs.
+                record.roofline = "cpu_only_profile" if is_cpu_profile else "no_gpu_kernel"
+                continue
+
+            gpu_time_per_call_s = (record.gpu_time * 1e-6) / record.call_count            
+            achieved_tflops = (flops_per_call / 1e12) / gpu_time_per_call_s if flops_per_call else 0.0
+            achieved_bw_gbps = (bytes_est / 1e9) / gpu_time_per_call_s if bytes_est > 0 else 0.0
+
+            record.gpu_time_per_call_s = gpu_time_per_call_s
+            record.achieved_bandwidth_gbps = achieved_bw_gbps
+            record.achieved_tflops = achieved_tflops
+
+            ceiling = None
+            ridge = None
+            if gpu_specs:
+                _dtype_str = DTYPE_MAP[dtype]
+                if _dtype_str not in gpu_specs.peak_tflops_by_dtype:
+                    print(f'[WARN] cannot compute ceil for dtype: {_dtype_str} '
+                          f'Supported dtypes: {list(gpu_specs.peak_tflops_by_dtype.keys())}')
+                    continue
+
+                ceiling = min(gpu_specs.peak_tflops_by_dtype[_dtype_str], 
+                              gpu_specs.peak_memory_bandwidth * ai / 1000)
+
+                ridge = gpu_specs.peak_tflops_by_dtype[_dtype_str] * 1000 / gpu_specs.peak_memory_bandwidth  # in FLOPs/byte
+
+            record.roofline_ratio = (achieved_tflops / ceiling) if ceiling and ceiling > 0 else 0.0
+            record.roofline_ceiling_tflops = ceiling if ceiling and ceiling > 0 else 0.0
+            if ridge:            
+                if ai == 0:
+                    record.roofline = "no_flops"
+                elif ai < ridge * 0.5:
+                    record.roofline = "memory_bound"
+                elif ai > ridge * 2:
+                    record.roofline = "compute_bound"
+                else:
+                    record.roofline = "balanced"
+
 
     def run(self, model:torch.nn.Module, inputs:torch.Tensor = None, 
             input_shape:List[int] = None,
@@ -307,9 +400,13 @@ class Profiler:
               f"Device: {device} "
               f"input shape: {_input.shape} ")
 
-        self.profile(
+        event_lists = self.profile(
             model, 
             _input,
             device
         )
+
+        self.compute_roofline(event_lists, device, dtype, gpu_specs)
+        render_table = render_kernel_table(event_lists)
+        print(render_table)
     

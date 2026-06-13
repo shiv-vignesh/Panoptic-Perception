@@ -1,7 +1,8 @@
 import cv2
 import numpy as np
 
-from panoptic_perception.dataset.bdd100k_dataset import BDD100KDataset, DatasetMode
+from panoptic_perception.dataset.bdd100k_dataset import BDD100KDataset
+from panoptic_perception.dataset.types import DatasetMode
 
 
 def test_eval_dataset_allows_missing_detection_annotations(tmp_path):

@@ -25,7 +25,7 @@ from panoptic_perception.trainer.callbacks import (
 )
 from panoptic_perception.trainer.utils import EvalMetrics
 from panoptic_perception.models.models import BaseTaskModel
-from panoptic_perception.models.utils import PanopticModelOutputs
+from panoptic_perception.models.types import PanopticModelOutputs
 from panoptic_perception.utils.logger import Logger
 from panoptic_perception.utils.wandb_logger import WandBLogger
 

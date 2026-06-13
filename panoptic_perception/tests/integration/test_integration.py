@@ -69,7 +69,7 @@ def test_integration():
     print("TEST: Model Forward Pass with DataLoader")
     print("="*60)
     
-    cfg_path = "/Users/shivvignesh/Documents/PersonalProjects/PanopticPerceptionProject/panoptic_perception/configs/models/yolo-lane-detect.cfg"
+    cfg_path = "panoptic_perception/configs/models/yolo-lane-detect.cfg"
     model = YOLOP(
         cfg_path
     )
