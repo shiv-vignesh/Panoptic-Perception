@@ -757,7 +757,7 @@ class FoggyBDDPreprocessor(BDDPreprocessor):
             lane_categories.append(s.get("lane_categories"))
             lane_seg_masks.append(s.get("lane_seg_mask"))
 
-            apply_fog = True if batch["mode"] != DatasetMode.TRAIN else random.random() < self.apply_fog_prob
+            apply_fog = True if s["mode"] != DatasetMode.TRAIN else random.random() < self.apply_fog_prob
             fog_mask.append(apply_fog)
             if apply_fog:
                 images_to_depth.append(img)
