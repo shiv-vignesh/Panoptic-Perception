@@ -294,7 +294,7 @@ class DepthAnythingEstimator:
 
         del inputs, outputs
 
-        preds = torch.stack([item["predicted_depth"] for item in post])
+        preds = torch.stack([item["predicted_depth"] for item in post]).float()
         preds = 1.0 - (preds - preds.amin(dim=(-1,-2), keepdim=True)) / \
                         (preds.amax(dim=(-1,-2), keepdim=True) - preds.amin(dim=(-1,-2), keepdim=True) + 1e-6)
 

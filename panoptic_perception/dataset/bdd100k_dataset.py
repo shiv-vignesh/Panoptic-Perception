@@ -811,9 +811,12 @@ class FoggyBDDPreprocessor(BDDPreprocessor):
 
         # ----- Scatter fogged subset back into original batch positions -----
         degraded_full = clean_full.clone()
+        H_img, W_img = images_rgb[0].shape[:2]
+        depth_full = torch.zeros((len(images_rgb), H_img, W_img), device=device, dtype=torch.float32)
         if fogged_subset is not None:
             mask_t = torch.tensor(fog_mask, device=device, dtype=torch.bool)
             degraded_full[mask_t] = fogged_subset
+            depth_full[mask_t] = depth_maps.to(dtype=torch.float32)
 
         # ----- Detection targets: prefix the FULL batch position (not subset) -----
         det_rows : List[torch.Tensor] = []
@@ -835,16 +838,18 @@ class FoggyBDDPreprocessor(BDDPreprocessor):
             return torch.stack(present, dim=0) if present else None
 
         return {
-            "images":             degraded_full,
-            "clean_images":       clean_full,
-            "detections":         batch_targets_tensor,
-            "segmentation_masks": _stack_optional(segs),
-            "drivable_area_seg":  _stack_optional(drivables),
-            "lanes_detections":   _stack_optional(lane_targets_list),
-            "lane_seg_masks":     _stack_optional(lane_seg_masks),
-            "lane_categories":    _stack_optional(lane_categories),
-            "image_paths":        image_paths,
-            "scene_attributes":   scene_attrs,
+            "images":             degraded_full,                                # (B, 3, H, W) float32 in [0,1], on depth device
+            "clean_images":       clean_full,                                   # (B, 3, H, W) float32 in [0,1], on depth device
+            "depth_maps":         depth_full,                                   # (B, H, W)    float32, zeros at non-fogged positions
+            "fog_mask":           torch.tensor(fog_mask, dtype=torch.bool),     # (B,)         bool, True where fog applied
+            "detections":         batch_targets_tensor,                        # (N_total, 6) [batch_idx, cls, cx, cy, w, h] or None
+            "segmentation_masks": _stack_optional(segs),                        # (B, H, W)    long or None
+            "drivable_area_seg":  _stack_optional(drivables),                   # (B, H, W)    long or None
+            "lanes_detections":   _stack_optional(lane_targets_list),           # (B, ...) or None
+            "lane_seg_masks":     _stack_optional(lane_seg_masks),              # (B, H, W) or None
+            "lane_categories":    _stack_optional(lane_categories),             # (B, ...) or None
+            "image_paths":        image_paths,                                  # list[str], len B
+            "scene_attributes":   scene_attrs,                                  # list[dict], len B
         }
 
     def collate_fn(self, batch):
@@ -891,15 +896,20 @@ class FoggyBDDPreprocessor(BDDPreprocessor):
             )
 
         depth_iter = iter(depth_maps)
+        H_img, W_img = images_rgb[0].shape[:2]
+        zero_depth = np.zeros((H_img, W_img), dtype=np.float32)
+        depth_per_sample : List[np.ndarray] = []
         for batch_idx, (img, apply_fog, attrs, det) in enumerate(
             zip(images_rgb, fog_mask, scene_attrs, det_targets)):
 
             if apply_fog:
-                depth = next(depth_iter)            
+                depth = next(depth_iter)
                 beta, gamma = self._select_degradation(attrs)
                 degraded = img if beta is None and gamma is None else self._apply_degradation(img, depth, beta, gamma)
+                depth_per_sample.append(depth.astype(np.float32))
             else:
                 degraded = img
+                depth_per_sample.append(zero_depth)
 
             clean_tensors.append(_to_chw_tensor(img))
             degraded_tensors.append(_to_chw_tensor(degraded))
@@ -912,6 +922,7 @@ class FoggyBDDPreprocessor(BDDPreprocessor):
         # ----- Stack to batched tensors -----
         batch_images_tensor = torch.stack(degraded_tensors, dim=0)
         batch_clean_images_tensor = torch.stack(clean_tensors,    dim=0)
+        batch_depth_tensor = torch.from_numpy(np.stack(depth_per_sample))
 
         batch_targets_tensor = torch.cat(det_rows, dim=0) if det_rows else None
         if batch_targets_tensor is not None:
@@ -923,16 +934,18 @@ class FoggyBDDPreprocessor(BDDPreprocessor):
             return torch.stack(present, dim=0) if present else None
 
         return {
-            "images":             batch_images_tensor,
-            "clean_images":       batch_clean_images_tensor,
-            "detections":         batch_targets_tensor,
-            "segmentation_masks": _stack_optional(segs),
-            "drivable_area_seg":  _stack_optional(drivables),
-            "lanes_detections":   _stack_optional(lane_targets_list),
-            "lane_seg_masks":     _stack_optional(lane_seg_masks),
-            "lane_categories":    _stack_optional(lane_categories),
-            "image_paths":        image_paths,
-            "scene_attributes":   scene_attrs,
+            "images":             batch_images_tensor,                          # (B, 3, H, W) float32 in [0,1], CPU
+            "clean_images":       batch_clean_images_tensor,                    # (B, 3, H, W) float32 in [0,1], CPU
+            "depth_maps":         batch_depth_tensor,                           # (B, H, W)    float32, zeros at non-fogged positions, CPU
+            "fog_mask":           torch.tensor(fog_mask, dtype=torch.bool),     # (B,)         bool, True where fog applied
+            "detections":         batch_targets_tensor,                        # (N_total, 6) [batch_idx, cls, cx, cy, w, h] or None
+            "segmentation_masks": _stack_optional(segs),                        # (B, H, W)    long or None
+            "drivable_area_seg":  _stack_optional(drivables),                   # (B, H, W)    long or None
+            "lanes_detections":   _stack_optional(lane_targets_list),           # (B, ...) or None
+            "lane_seg_masks":     _stack_optional(lane_seg_masks),              # (B, H, W) or None
+            "lane_categories":    _stack_optional(lane_categories),             # (B, ...) or None
+            "image_paths":        image_paths,                                  # list[str], len B
+            "scene_attributes":   scene_attrs,                                  # list[dict], len B
         }
 
 class FoggyBDD100KDataset(BDD100KDataset):
