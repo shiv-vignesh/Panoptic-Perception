@@ -810,7 +810,17 @@ class BaseEnhancementModel(nn.Module):
 
         self.task_network : BaseTaskModel = None
         self.enhanced_image : torch.Tensor = None
-    
+
+    @property
+    def loss_function(self):
+        return self.task_network.loss_function if self.task_network is not None else None
+
+    @loss_function.setter
+    def loss_function(self, loss_fn):
+        if self.task_network is None:
+            raise RuntimeError("task_network is not set; cannot assign loss_function on the wrapper.")
+        self.task_network.loss_function = loss_fn
+
     def _get_enhancement_param_groups(self, optimizer_kwargs:dict) -> list[dict]:
         raise NotImplementedError
 
