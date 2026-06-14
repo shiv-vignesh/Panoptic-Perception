@@ -20,6 +20,7 @@
 
     "dataset_kwargs":{
         "dataset_class": "foggy",
+        "collate_path": "cpu",
         "depth_map_dir": "/workspace/data/depth_maps",
         "strict_map": true,
         "apply_fog_prob": 0.67,

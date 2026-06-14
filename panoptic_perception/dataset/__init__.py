@@ -11,13 +11,33 @@ from panoptic_perception.utils.logger import Logger
 
 class DataLoaderBuilder:
 
+    # Backends whose estimate_batch returns torch.Tensor — required for gpu_collate_fn.
+    _GPU_COLLATE_BACKENDS = {"depth_anything", "onnx", "torch_compile"}
+
     def __init__(self, dataset_kwargs: dict, logger:Logger=None):
         self._kw = dataset_kwargs
         self._dataset_class = dataset_kwargs.get("dataset_class", "default")
+        self._collate_path = dataset_kwargs.get("collate_path", "cpu")
         self._depth_estimator = None
+        self._logger = logger
 
         if self._dataset_class == "foggy":
             self._init_depth_estimator(logger)
+            self._validate_collate_path()
+
+    def _validate_collate_path(self):
+        if self._collate_path not in ("cpu", "gpu"):
+            raise ValueError(
+                f"collate_path must be 'cpu' or 'gpu', got {self._collate_path!r}"
+            )
+        if self._collate_path == "gpu":
+            backend = self._kw.get("adverse_params", {}).get("depth_backend", "heuristic")
+            if backend not in self._GPU_COLLATE_BACKENDS:
+                raise ValueError(
+                    f"collate_path='gpu' requires a torch-tensor depth_backend "
+                    f"({sorted(self._GPU_COLLATE_BACKENDS)}); got depth_backend={backend!r}. "
+                    f"Either set collate_path='cpu' or change depth_backend."
+                )
 
     def _init_depth_estimator(self, logger:Logger):
         adverse_params = self._kw.get("adverse_params", {})
@@ -66,7 +86,7 @@ class DataLoaderBuilder:
         kwargs["adverse_params"] = self._kw.get("adverse_params", {})
         return kwargs
 
-    def _make_loader(self, dataset, batch_size, shuffle, 
+    def _make_loader(self, dataset, batch_size, shuffle,
                     collate_fn,
                     num_workers) -> DataLoader:
         return DataLoader(
@@ -75,7 +95,7 @@ class DataLoaderBuilder:
             shuffle=shuffle,
             num_workers=num_workers,
             collate_fn=collate_fn,
-            pin_memory=True,
+            pin_memory=(num_workers > 0),
         )
 
     def build_train(self) -> DataLoader:
@@ -92,9 +112,14 @@ class DataLoaderBuilder:
                 apply_fog_prob=self._kw.get("apply_fog_prob", 0.67),
                 depth_estimator=self._depth_estimator,
             )
-            # only one process exists, depth runs there, one model copy. Simplest.
+            # Single-process collation. Depth runs in main process either way;
+            # collate_path selects CPU per-image fog vs GPU batched fog.
             num_workers = 0
-            collate_fn = dataset.preprocessor.collate_fn
+            collate_fn = (
+                dataset.preprocessor.gpu_collate_fn
+                if self._collate_path == "gpu"
+                else dataset.preprocessor.collate_fn
+            )
 
         else:
             dataset = BDD100KDataset(
@@ -137,13 +162,19 @@ class DataLoaderBuilder:
             depth_estimator=self._depth_estimator,
         )
 
+        foggy_collate_fn = (
+            foggy_dataset.preprocessor.gpu_collate_fn
+            if self._collate_path == "gpu"
+            else foggy_dataset.preprocessor.collate_fn
+        )
+
         return {
-            "val_clean": self._make_loader(clean_dataset, batch_size, 
-                                           False, 
+            "val_clean": self._make_loader(clean_dataset, batch_size,
+                                           False,
                                            collate_fn=BDDPreprocessor.collate_fn,
                                            num_workers=num_workers),
-            "val_foggy": self._make_loader(foggy_dataset, batch_size, 
-                                           False, 
-                                           collate_fn=foggy_dataset.preprocessor.collate_fn,
+            "val_foggy": self._make_loader(foggy_dataset, batch_size,
+                                           False,
+                                           collate_fn=foggy_collate_fn,
                                            num_workers=0),
         }

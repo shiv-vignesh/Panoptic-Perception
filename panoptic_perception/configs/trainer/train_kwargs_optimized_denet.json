@@ -21,6 +21,7 @@
 
     "dataset_kwargs":{
         "dataset_class": "foggy",
+        "collate_path": "gpu",
         "depth_map_dir": null,
         "strict_map": false,
         "apply_fog_prob": 0.67,

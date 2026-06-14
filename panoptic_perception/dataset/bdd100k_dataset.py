@@ -725,8 +725,7 @@ class FoggyBDDPreprocessor(BDDPreprocessor):
 
         return image
 
-    def _build_degraded_batch(self, batch):
-
+    def gpu_collate_fn(self, batch):
         # ----- Gather pass over the batch -----
         images_rgb        : List[np.ndarray] = []
         image_paths       : List[str]        = []
@@ -763,7 +762,7 @@ class FoggyBDDPreprocessor(BDDPreprocessor):
         if n_fogged > 0:
             depth_maps = self.depth_estimator.estimate_batch(imgs_to_depth_np, return_tensors=True)
             assert isinstance(depth_maps, torch.Tensor), \
-                "_build_degraded_batch requires a depth_estimator returning torch.Tensor; got " \
+                "gpu_collate_fn requires a depth_estimator returning torch.Tensor; got " \
                 f"{type(depth_maps).__name__}. Use `collate_fn` for numpy-only backends."
             device = depth_maps.device
 
