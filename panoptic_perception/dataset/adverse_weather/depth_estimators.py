@@ -36,6 +36,8 @@ class DepthEstimator(Protocol):
         """
         ...
 
+    def __call__(self):
+        raise NotImplementedError
 
 @dataclass
 class HeuristicDepthEstimator:
@@ -69,11 +71,17 @@ class HeuristicDepthEstimator:
         )
         return np.clip(depth, 0.0, 1.0).astype(np.float32)
     
-    def estimate_batch(self, images_rgb: list[np.ndarray]) -> list[np.ndarray]:
+    def estimate_batch(self, images_rgb: list[np.ndarray], return_tensors:bool = False) -> list[np.ndarray]:
         """Heuristic depth is pure numpy/cv2 — no GPU saturation gain from
         vectorizing across the batch. Loop is correct and fast enough.
         """
-        return [self.estimate(img) for img in images_rgb]
+
+        if not return_tensors:
+            return [self.estimate(img) for img in images_rgb]
+        
+        return torch.from_numpy(
+            np.stack([self.estimate(img) for img in images_rgb])
+        )
 
 class ONNXDepthEstimator:
     """Depth estimation via ONNX Runtime. Supports CUDA, TensorRT, and CPU providers.
@@ -265,7 +273,7 @@ class DepthAnythingEstimator:
         depth = 1.0 - (depth - dmin) / (dmax - dmin + self._normalization_epsilon)
         return np.clip(depth, 0.0, 1.0)
 
-    def estimate_batch(self, images_rgb: list[np.ndarray]) -> list[np.ndarray]:
+    def estimate_batch(self, images_rgb: list[np.ndarray], return_tensors:bool = False) -> list[np.ndarray]:
         """Batched depth estimation. Returns list of float32 arrays in [0, 1], shape (H, W)."""
         self._ensure_loaded()
 
@@ -285,27 +293,15 @@ class DepthAnythingEstimator:
         )
 
         del inputs, outputs
-        # Intentionally not calling torch.cuda.empty_cache() here — purging the
-        # caching allocator every batch forces re-allocation on the next call,
-        # which defeats the cache and adds cudaMalloc latency to steady-state
-        # inference. Only purge at OOM-adjacent boundaries.
 
         preds = torch.stack([item["predicted_depth"] for item in post])
         preds = 1.0 - (preds - preds.amin(dim=(-1,-2), keepdim=True)) / \
                         (preds.amax(dim=(-1,-2), keepdim=True) - preds.amin(dim=(-1,-2), keepdim=True) + 1e-6)
-        
-        depths = preds.clamp(0, 1).cpu().numpy()
 
-        # depths = []
-        # for item in post:
-        #     depth = item["predicted_depth"].detach().cpu().numpy().astype(np.float32)
-        #     dmin, dmax = depth.min(), depth.max()
-        #     depth = 1.0 - (depth - dmin) / (dmax - dmin + self._normalization_epsilon)
-        #     depths.append(np.clip(depth, 0.0, 1.0))
+        if not return_tensors:
+            return preds.clamp(0, 1).cpu().numpy()
 
-        # del post
-        return depths
-
+        return preds.clamp(0, 1)
 
 class TorchCompiledDepthEstimator:
     """Wraps DepthAnythingEstimator with torch.compile for faster inference.
