@@ -731,16 +731,18 @@ class FoggyBDDPreprocessor(BDDPreprocessor):
         """
             Batched depth estimation → per-image degradation → tensorize → collate.
         """
-        # ----- Single gather pass over the batch -----
-        images_rgb        : List[np.ndarray] = []
-        image_paths       : List[str]        = []
-        scene_attrs       : List[dict]       = []
-        segs              : List = []
-        drivables         : List = []
-        det_targets       : List = []
+
+        images_rgb : List[np.ndarray] = []
+        image_paths : List[str] = []
+        scene_attrs : List[dict] = []
+        segs : List = []
+        drivables : List = []
+        det_targets : List = []
         lane_targets_list : List = []
-        lane_categories   : List = []
-        lane_seg_masks    : List = []
+        lane_categories : List = []
+        lane_seg_masks : List = []
+        images_to_depth : List[np.ndarray] = []
+        fog_mask : List[bool] = []
 
         for s in batch:
             img = s["image"]
@@ -755,26 +757,30 @@ class FoggyBDDPreprocessor(BDDPreprocessor):
             lane_categories.append(s.get("lane_categories"))
             lane_seg_masks.append(s.get("lane_seg_mask"))
 
-        # ----- Batched depth estimation  -----
-        depth_maps = self.depth_estimator.estimate_batch(images_rgb)
+            apply_fog = True if batch["mode"] != DatasetMode.TRAIN else random.random() < self.apply_fog_prob
+            fog_mask.append(apply_fog)
+            if apply_fog:
+                images_to_depth.append(img)
 
-        # ----- Per-image: degrade → tensorize → record detection rows -----
-        clean_tensors    : List[torch.Tensor] = []
+        depth_maps = self.depth_estimator.estimate_batch(images_to_depth)
+
+        clean_tensors : List[torch.Tensor] = []
         degraded_tensors : List[torch.Tensor] = []
-        det_rows         : List[torch.Tensor] = []
+        det_rows : List[torch.Tensor] = []
 
         def _to_chw_tensor(img_uint8_rgb):
-            # (H, W, 3) uint8 RGB → (3, H, W) float32 in [0, 1]
             return torch.from_numpy(img_uint8_rgb).permute(2, 0, 1).contiguous().float() / 255.0
 
-        for batch_idx, (img, depth, attrs, det) in enumerate(
-            zip(images_rgb, depth_maps, scene_attrs, det_targets)):
+        depth_iter = iter(depth_maps)
+        for batch_idx, (img, apply_fog, attrs, det) in enumerate(
+            zip(images_rgb, fog_mask, scene_attrs, det_targets)):
 
-            beta, gamma = self._select_degradation(attrs)
-            if beta is None and gamma is None:
-                degraded = img
+            if apply_fog:
+                depth = next(depth_iter)            
+                beta, gamma = self._select_degradation(attrs)
+                degraded = img if beta is None and gamma is None else self._apply_degradation(img, depth, beta, gamma)
             else:
-                degraded = self._apply_degradation(img, depth, beta, gamma)
+                degraded = img
 
             clean_tensors.append(_to_chw_tensor(img))
             degraded_tensors.append(_to_chw_tensor(degraded))
@@ -785,12 +791,11 @@ class FoggyBDDPreprocessor(BDDPreprocessor):
                 det_rows.append(torch.cat([prefix, det_t], dim=1))
 
         # ----- Stack to batched tensors -----
-        batch_images_tensor       = torch.stack(degraded_tensors, dim=0)
+        batch_images_tensor = torch.stack(degraded_tensors, dim=0)
         batch_clean_images_tensor = torch.stack(clean_tensors,    dim=0)
 
         batch_targets_tensor = torch.cat(det_rows, dim=0) if det_rows else None
         if batch_targets_tensor is not None:
-            # cx, cy ∈ [0, 1]; w, h ∈ [0.001, 1] — match parent collate_fn sanitization
             batch_targets_tensor[:, 2:4] = batch_targets_tensor[:, 2:4].clamp(0.0, 1.0)
             batch_targets_tensor[:, 4:6] = batch_targets_tensor[:, 4:6].clamp(0.001, 1.0)
 
@@ -810,7 +815,6 @@ class FoggyBDDPreprocessor(BDDPreprocessor):
             "image_paths":        image_paths,
             "scene_attributes":   scene_attrs,
         }
-
 
 class FoggyBDD100KDataset(BDD100KDataset):
     
@@ -889,4 +893,5 @@ class FoggyBDD100KDataset(BDD100KDataset):
             "lane_categories":   lane_categories,
             "image_path":        frame.image_path,
             "scene_attributes":  scene_attributes,
+            "mode":self.mode
         }
