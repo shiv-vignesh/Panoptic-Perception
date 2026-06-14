@@ -539,13 +539,11 @@ class BDD100KDataset(Dataset):
                 # No-augment path: just letterbox to target.
                 frame = letterbox_with_masks(frame, new_shape=target_size)
 
-        # ---- 2. Build lane targets from the final frame ----------------------
         img_h, img_w = frame.image.shape[:2]
         lane_polys_list = frame.lane_polys_legacy() or []
         lane_targets, lane_categories = build_lane_targets(lane_polys_list, img_h, img_w)
         lane_seg_mask = build_lane_seg_mask(lane_polys_list, img_h, img_w)
 
-        # ---- 3. Tensorize ----------------------------------------------------
         image_tensor = self.preprocessor.normalize_tensor(
             torch.from_numpy(frame.image).permute(2, 0, 1)
         )
@@ -727,10 +725,129 @@ class FoggyBDDPreprocessor(BDDPreprocessor):
 
         return image
 
+    def _build_degraded_batch(self, batch):
+
+        # ----- Gather pass over the batch -----
+        images_rgb        : List[np.ndarray] = []
+        image_paths       : List[str]        = []
+        scene_attrs       : List[dict]       = []
+        segs              : List = []
+        drivables         : List = []
+        det_targets       : List = []
+        lane_targets_list : List = []
+        lane_categories   : List = []
+        lane_seg_masks    : List = []
+        imgs_to_depth_np  : List[np.ndarray] = []
+        fog_mask          : List[bool]       = []
+
+        for s in batch:
+            img = s["image"]
+            assert img is not None, "image is None in batch sample"
+            images_rgb.append(img)
+            image_paths.append(s["image_path"])
+            scene_attrs.append(s["scene_attributes"])
+            segs.append(s.get("segmentation_mask"))
+            drivables.append(s.get("drivable_mask"))
+            det_targets.append(s.get("detection_targets"))
+            lane_targets_list.append(s.get("lane_targets"))
+            lane_categories.append(s.get("lane_categories"))
+            lane_seg_masks.append(s.get("lane_seg_mask"))
+
+            apply_fog = True if s["mode"] != DatasetMode.TRAIN else random.random() < self.apply_fog_prob
+            fog_mask.append(apply_fog)
+            if apply_fog:
+                imgs_to_depth_np.append(img)
+
+        n_fogged = sum(fog_mask)
+
+        if n_fogged > 0:
+            depth_maps = self.depth_estimator.estimate_batch(imgs_to_depth_np, return_tensors=True)
+            assert isinstance(depth_maps, torch.Tensor), \
+                "_build_degraded_batch requires a depth_estimator returning torch.Tensor; got " \
+                f"{type(depth_maps).__name__}. Use `collate_fn` for numpy-only backends."
+            device = depth_maps.device
+
+            # Subset (B_fogged, 3, H, W) float in [0, 1] on the depth device
+            imgs_to_depth_t = self.normalize_tensor(
+                torch.from_numpy(np.stack(imgs_to_depth_np))
+                     .to(device, non_blocking=True)
+                     .permute(0, 3, 1, 2)
+                     .contiguous()
+            )
+
+            betas  : List[float] = []
+            gammas : List[float] = []
+            for apply_fog, attrs in zip(fog_mask, scene_attrs):
+                if apply_fog:
+                    beta, gamma = self._select_degradation(attrs)
+                    betas.append(beta)
+                    gammas.append(gamma)
+
+            # Invariants — surface any subset/batch drift loudly
+            assert len(imgs_to_depth_np) == n_fogged, "imgs_to_depth_np / fog_mask drift"
+            assert depth_maps.shape[0]    == n_fogged, "depth_maps / fog_mask drift"
+            assert len(betas) == len(gammas) == n_fogged, "betas/gammas / fog_mask drift"
+
+            # Vectorized fog + darkness on the subset → (B_fogged, 3, H, W) in [0, 1]
+            fogged_subset = self.fog_generator.generate_batch(
+                images_to_depth=imgs_to_depth_t,
+                depth_tensors=depth_maps,
+                betas=betas, gammas=gammas,
+                device=device,
+                atmospheric_light_quantile=self.atmospheric_light_quantile,
+                atmospheric_light_min_pixels=self.atmospheric_light_min_pixels
+            )
+        else:
+            device = torch.device(getattr(self.depth_estimator, "output_device", "cpu"))
+            fogged_subset = None
+
+        # ----- Full (B, 3, H, W) clean batch on `device` -----
+        clean_full = self.normalize_tensor(
+            torch.from_numpy(np.stack(images_rgb))
+                 .to(device, non_blocking=True)
+                 .permute(0, 3, 1, 2)
+                 .contiguous()
+        )
+
+        # ----- Scatter fogged subset back into original batch positions -----
+        degraded_full = clean_full.clone()
+        if fogged_subset is not None:
+            mask_t = torch.tensor(fog_mask, device=device, dtype=torch.bool)
+            degraded_full[mask_t] = fogged_subset
+
+        # ----- Detection targets: prefix the FULL batch position (not subset) -----
+        det_rows : List[torch.Tensor] = []
+        for batch_idx, det in enumerate(det_targets):
+            if det is not None and len(det) > 0:
+                det_t  = torch.as_tensor(det, dtype=torch.float32)
+                prefix = torch.full((det_t.shape[0], 1), batch_idx, dtype=det_t.dtype)
+                det_rows.append(torch.cat([prefix, det_t], dim=1))
+
+        batch_targets_tensor = torch.cat(det_rows, dim=0) if det_rows else None
+        if batch_targets_tensor is not None:
+            batch_targets_tensor[:, 2:4] = batch_targets_tensor[:, 2:4].clamp(0.0, 1.0)
+            batch_targets_tensor[:, 4:6] = batch_targets_tensor[:, 4:6].clamp(0.001, 1.0)
+
+        # Optional masks/targets stay on CPU — trainer handles device placement,
+        # matching the behavior of `collate_fn`.
+        def _stack_optional(items):
+            present = [torch.as_tensor(x) for x in items if x is not None]
+            return torch.stack(present, dim=0) if present else None
+
+        return {
+            "images":             degraded_full,
+            "clean_images":       clean_full,
+            "detections":         batch_targets_tensor,
+            "segmentation_masks": _stack_optional(segs),
+            "drivable_area_seg":  _stack_optional(drivables),
+            "lanes_detections":   _stack_optional(lane_targets_list),
+            "lane_seg_masks":     _stack_optional(lane_seg_masks),
+            "lane_categories":    _stack_optional(lane_categories),
+            "image_paths":        image_paths,
+            "scene_attributes":   scene_attrs,
+        }
+
     def collate_fn(self, batch):
-        """
-            Batched depth estimation → per-image degradation → tensorize → collate.
-        """
 
         images_rgb : List[np.ndarray] = []
         image_paths : List[str] = []
@@ -769,7 +886,9 @@ class FoggyBDDPreprocessor(BDDPreprocessor):
         det_rows : List[torch.Tensor] = []
 
         def _to_chw_tensor(img_uint8_rgb):
-            return torch.from_numpy(img_uint8_rgb).permute(2, 0, 1).contiguous().float() / 255.0
+            return self.normalize_tensor(
+                torch.from_numpy(img_uint8_rgb).permute(2, 0, 1).contiguous()
+            )
 
         depth_iter = iter(depth_maps)
         for batch_idx, (img, apply_fog, attrs, det) in enumerate(

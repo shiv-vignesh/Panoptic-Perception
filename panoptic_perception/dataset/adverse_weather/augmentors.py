@@ -1,8 +1,9 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Literal
+from typing import Literal, List
 
+import torch
 import numpy as np
 
 from .config import VALID_COMPOUND_ORDERS, load_config
@@ -85,6 +86,70 @@ class SyntheticFogGenerator:
         foggy = image * t + A * (1.0 - t)
         return _to_uint8(np.clip(foggy, 0.0, 1.0), self._uint8_max), depth, transmission
 
+    def estimate_atmospheric_light_gpu(self, 
+                                    images:torch.Tensor,
+                                    depths:torch.Tensor,
+                                    quantile:float,
+                                    min_pixels:int) -> torch.Tensor:
+        
+        B = depths.shape[0]
+        depths_flat = depths.view(B, -1)
+        images_flat = images.view(B, 3, -1)
+
+        thresh = torch.quantile(depths_flat, quantile, dim=1, keepdim=True)
+        mask = depths_flat >= thresh
+
+        count = mask.sum(dim=1, keepdim=True).float()
+        masked_sum = (images_flat * mask.unsqueeze(1)).sum(dim=2)
+        A_masked = masked_sum / count.clamp(min=1.0)
+        A_global = images_flat.mean(dim=2)
+
+        use_masked = (count.squeeze(1) >= min_pixels).unsqueeze(1) # (B, 1) bool
+        A = torch.where(use_masked, A_masked, A_global)
+
+        return A.view(B, 3, 1, 1)
+
+    def generate_batch(self, images_to_depth:torch.Tensor, depth_tensors:torch.Tensor,
+                    betas:List[float], gammas:List[float], 
+                    device:torch.device,
+                    atmospheric_light_quantile:float=0.9,
+                    atmospheric_light_min_pixels:int=10):
+        
+        if depth_tensors is None or not isinstance(depth_tensors, torch.Tensor):
+            raise ValueError(
+                f'Expected Depth Tensors , got: {type(depth_tensors)}'
+            )
+        
+        if len(depth_tensors.shape) < 3:
+            raise ValueError(f'Expected Depth Tensors to have 3dim, got {depth_tensors.shape}')
+        
+        B, H, W = depth_tensors.shape
+
+        if len(images_to_depth.shape) < 4:
+            raise ValueError(
+                f'Image batch {tuple(images_to_depth.shape)} != expected ({B}, {H}, {W}, 3)'
+            )
+        if len(betas) != B or len(gammas) != B:
+            raise ValueError(
+                f'Param length mismatch: betas={len(betas)} gamma={len(gammas)} batch={B}'
+            )
+
+        # Vectorized fog: transmission = exp(-beta * depth), fogged = img*t + A*(1-t)
+        beta_t  = torch.tensor([b or 0.0 for b in betas], device=device).view(B, 1, 1, 1)
+        gamma_t = torch.tensor([g or 1.0 for g in gammas], device=device).view(B, 1, 1, 1)
+
+        A = self.estimate_atmospheric_light_gpu(
+            images=images_to_depth,
+            depths=depth_tensors,
+            quantile=atmospheric_light_quantile,
+            min_pixels=atmospheric_light_min_pixels
+        )
+
+        transmission = torch.exp(-beta_t * depth_tensors.unsqueeze(1))  # (B, 1, H, W)
+        fogged = images_to_depth * transmission + A * (1.0 - transmission)
+
+        darkened = fogged.clamp(0.0, 1.0).pow(gamma_t)
+        return darkened.clamp(0.0, 1.0)
 
 class SyntheticLowLightGenerator:
     """Gamma darkening in bounded range [gamma_min, gamma_max]."""

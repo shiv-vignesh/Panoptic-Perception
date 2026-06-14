@@ -118,7 +118,7 @@ def foggy_dataloader(dataset_kwargs, depth_anything_backend, dataset_type, batch
             batch_size=batch_size,
             shuffle=True,
             num_workers=0,  # Use 0 for debugging, increase for training
-            collate_fn=dataset.preprocessor.collate_fn
+            collate_fn=dataset.preprocessor._build_degraded_batch
         )
 
         print(f"✓ DataLoader created successfully")
