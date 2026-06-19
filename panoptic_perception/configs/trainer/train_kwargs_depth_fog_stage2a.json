@@ -1,0 +1,102 @@
+{
+    "model_kwargs":{
+        "cfg_path":"panoptic_perception/configs/models/yolo-detection-drivable.cfg",
+        "device":"cuda:0"
+    },
+
+    "dataset_kwargs":{
+        "dataset_class":"foggy",
+        "collate_path":"cpu",
+        "images_dir": "/home/owl/ashu1069/data/bdd100k/100k/100k",
+        "detection_annotations_dir": "/home/owl/ashu1069/data/bdd100k/bdd100k_labels/100k",
+        "segmentation_annotations_dir": "",
+        "drivable_annotations_dir": "/home/owl/ashu1069/data/bdd100k/drivable_maps/labels",
+        "depth_map_dir": "/home/owl/ashu1069/data/bdd100k/depth_anything_v2_uint16",
+        "strict_map": true,
+        "apply_fog_prob": 0.5,
+        "adverse_params": {
+            "depth_backend": "cached",
+            "apply_darkness": false,
+            "fog_betas": [0.005, 0.008, 0.012],
+            "max_depth_meters": 80.0,
+            "atmospheric_light_quantile": 0.9,
+            "atmospheric_light_min_pixels": 10,
+            "atmospheric_light": [0.85, 0.85, 0.85]
+        },
+        "train_batch_size":24,
+        "train_shuffle":true,
+        "train_num_workers":4,
+        "train_preprocessor_kwargs":{
+            "image_resize": [640, 640],
+            "original_image_size": [720, 1280],
+            "perform_augmentation":true
+        },
+        "val_batch_size":16,
+        "val_shuffle":false,
+        "val_num_workers":4,
+        "val_preprocessor_kwargs":{
+            "image_resize": [640, 640],
+            "original_image_size": [720, 1280]
+        }
+    },
+    "optimizer_kwargs":{
+        "_description": "AdamW optimizer configuration",
+        "_type": "AdamW",
+        "initial_lr": 1e-3,
+        "weight_decay": 0.01,
+        "momentum":0.937,
+        "warmup_bias_lr":0.1,
+        "warmup_momentum":0.8,
+        "warmup_epochs":3,
+        "groups": {
+            "backbone": {
+                "group":[0, 23],
+                "trainable":false
+            },
+            "detect": {
+                "group":[24],
+                "trainable":false
+            },
+            "segmentation": {
+                "group":[25, 33],
+                "trainable":true
+            }
+        },
+        "gdip_groups":{
+            "vision_encoder": {"trainable": true, "lr_scale": 0.1},
+            "gdip_module": {"trainable": true, "lr_scale": 1.0}
+        }
+    },
+    "lr_scheduler_kwargs":{
+        "_type":"cosine",
+        "linear_lr_kwargs":{
+            "start_factor":1.0,
+            "end_factor":0.01
+        },
+        "cosine_annealing_lr_kwargs":{
+            "eta_min":1e-6
+        }
+    },
+    "trainer_kwargs":{
+        "output_dir": "yolop-depth-fog-stage2a",
+        "is_training":true,
+        "first_val_epoch": 0,
+        "metric_eval_mode": "strict",
+        "metric_average_mode": "macro",
+        "epochs": 100,
+        "monitor_train": true,
+        "monitor_val": true,
+        "gradient_clipping": 1.0,
+        "checkpoint_idx":2,
+        "gradient_accumulation_steps":2,
+        "lr_scheduler_start_epoch":1,
+        "checkpoint_path":"yolop-detection-detection-rectified/ckpt_49/ckpt-49.pt",
+        "reload_optimizer":false,
+        "reload_optimizer_with_initial_lr":false,
+
+        "wandb_project":"yolop-depth-fog-stage2a",
+        "use_ema": true,
+        "ema_decay": 0.9999,
+        "ema_warmup_steps": 2000
+    }
+}

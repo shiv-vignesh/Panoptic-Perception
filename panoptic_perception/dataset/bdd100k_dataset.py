@@ -603,6 +603,7 @@ class FoggyBDDPreprocessor(BDDPreprocessor):
 
         self.fog_betas = self.adverse_params.get("fog_betas", [0.010, 0.020, 0.035])
         self.darkness_gammas = self.adverse_params.get("darkness_gammas", [1.5, 2.0, 3.5])
+        self.apply_darkness = self.adverse_params.get("apply_darkness", True)
         self.atmospheric_light_quantile = self.adverse_params.get("atmospheric_light_quantile", 0.9)
         self.atmospheric_light_min_pixels = self.adverse_params.get("atmospheric_light_min_pixels", 10)
         self.atmospheric_light = self.adverse_params.get("atmospheric_light", None)
@@ -627,11 +628,13 @@ class FoggyBDDPreprocessor(BDDPreprocessor):
         self.fog_generator = SyntheticFogGenerator(
             depth_estimator=self.depth_estimator
         )
-        self.lowlight_generator = SyntheticLowLightGenerator(
-            gamma_min=min(self.darkness_gammas),
-            gamma_max=max(self.darkness_gammas),
-            gamma_min_threshold=1.0,
-        )
+        self.lowlight_generator = None
+        if self.apply_darkness:
+            self.lowlight_generator = SyntheticLowLightGenerator(
+                gamma_min=min(self.darkness_gammas),
+                gamma_max=max(self.darkness_gammas),
+                gamma_min_threshold=1.0,
+            )
 
     def _select_degradation(self, scene_attributes, beta=None, gamma=None):
         """Adjust or skip degradation based on scene context."""
@@ -661,6 +664,8 @@ class FoggyBDDPreprocessor(BDDPreprocessor):
             return beta
         
         def sample_gamma():
+            if not self.apply_darkness:
+                return None
             return np.random.uniform(self.lowlight_generator.gamma_min, self.lowlight_generator.gamma_max)
 
         weather = scene_attributes.get("weather", "undefined") if scene_attributes else "undefined"
