@@ -1,3 +1,7 @@
+import os
+
+import cv2
+import numpy as np
 import pytest
 import torch
 from torch.utils.data import DataLoader
@@ -6,7 +10,7 @@ import cProfile
 import pstats
 
 from panoptic_perception.dataset.bdd100k_dataset import (
-    BDD100KDataset, 
+    BDD100KDataset,
     FoggyBDD100KDataset,
     BDDPreprocessor
 )
@@ -180,15 +184,15 @@ def test_profile_foggy_dataset_dataloader(foggy_dataloader, warmup_iters, c_prof
         except Exception as e:
             raise RuntimeError(
                 f'Runtime Error: {e}'
-            )        
+            )
 
     print(f'Running Warmup Iterations')
-    
+
     for _ in range(warmup_iters):
         run_dataloader()
-        
+
     print(f'Warmup Iterations Complete, running profiler')
-    
+
     c_prof.enable()
     run_dataloader()
     c_prof.disable()
@@ -199,3 +203,53 @@ def test_profile_foggy_dataset_dataloader(foggy_dataloader, warmup_iters, c_prof
     stats.print_stats(30)
 
     c_prof.dump_stats("dataloader.prof")
+
+
+def test_visualize_foggy_batch(foggy_dataloader):
+    """
+    Pull one batch and write per-sample composites (clean | degraded | depth)
+    to viz_foggy_batch/. Useful for eyeballing fog + depth quality.
+    """
+    out_dir = "viz_foggy_batch"
+    os.makedirs(out_dir, exist_ok=True)
+
+    batch = next(iter(foggy_dataloader))
+    images   = batch["images"].detach().cpu().numpy()        # (B, 3, H, W) float [0,1]
+    clean    = batch["clean_images"].detach().cpu().numpy()  # (B, 3, H, W) float [0,1]
+    depths   = batch["depth_maps"].detach().cpu().numpy()    # (B, H, W)    float
+    fog_mask = batch["fog_mask"].detach().cpu().numpy()      # (B,) bool
+
+    def _chw_to_bgr(img_chw_float):
+        rgb = (img_chw_float.transpose(1, 2, 0) * 255.0).clip(0, 255).astype(np.uint8)
+        return cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR)
+
+    def _depth_to_bgr(depth_hw):
+        # Per-sample min-max normalize for visualization contrast.
+        # Non-fogged samples are all-zero → render as flat black.
+        d_min, d_max = float(depth_hw.min()), float(depth_hw.max())
+        if d_max <= d_min:
+            d_u8 = np.zeros_like(depth_hw, dtype=np.uint8)
+        else:
+            d_u8 = (((depth_hw - d_min) / (d_max - d_min)) * 255.0).astype(np.uint8)
+        return cv2.applyColorMap(d_u8, cv2.COLORMAP_INFERNO)
+
+    B = images.shape[0]
+    for i in range(B):
+        clean_bgr    = _chw_to_bgr(clean[i])
+        degraded_bgr = _chw_to_bgr(images[i])
+        depth_bgr    = _depth_to_bgr(depths[i])
+
+        # Align depth resolution to the image if estimator returned a different size
+        if depth_bgr.shape[:2] != clean_bgr.shape[:2]:
+            depth_bgr = cv2.resize(
+                depth_bgr,
+                (clean_bgr.shape[1], clean_bgr.shape[0]),
+                interpolation=cv2.INTER_LINEAR,
+            )
+
+        composite = np.concatenate([clean_bgr, degraded_bgr, depth_bgr], axis=1)
+        tag = "fogged" if bool(fog_mask[i]) else "clean"
+        fname = f"sample{i:02d}_{tag}.png"
+        cv2.imwrite(os.path.join(out_dir, fname), composite)
+
+    print(f"Wrote {B} composites (clean | degraded | depth) to {out_dir}/")
