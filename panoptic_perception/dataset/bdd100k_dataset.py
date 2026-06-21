@@ -115,8 +115,8 @@ class BDDPreprocessor:
         for frames in data["frames"]:
             for item in frames["objects"]:
                 if "box2d" in item:
-                    bbox = Bbox(item["box2d"]["x1"], item["box2d"]["x2"], 
-                               item["box2d"]["y1"], item["box2d"]["y2"])
+                    bbox = Bbox(item["box2d"]["x1"], item["box2d"]["y1"], 
+                               item["box2d"]["x2"], item["box2d"]["y2"])
                     
                     if bbox.valid_bbox:
                         if filter_by_area:
