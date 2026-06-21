@@ -37,7 +37,10 @@ class MultiTaskLoss:
         })
 
         for task_name, cfg in loss_kwargs.items():
-            if "loss_weights" in task_name:
+            # Skip the weights block and any doc-only keys (`_description`, `_note`, …).
+            # Matches the convention used elsewhere in the configs — leading-underscore
+            # keys are documentation/metadata, not task entries.
+            if "loss_weights" in task_name or task_name.startswith("_"):
                 continue
 
             loss_func = LossFactory.build(cfg)
