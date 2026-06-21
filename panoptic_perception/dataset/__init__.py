@@ -110,6 +110,7 @@ class DataLoaderBuilder:
                 mode=DatasetMode.TRAIN,
                 strict_map=self._kw.get("strict_map", True),
                 apply_fog_prob=self._kw.get("apply_fog_prob", 0.67),
+                apply_fog=self._kw.get("apply_fog", True),
                 depth_estimator=self._depth_estimator,
             )
             # Single-process collation. Depth runs in main process either way;
@@ -159,6 +160,7 @@ class DataLoaderBuilder:
             mode=DatasetMode.EVAL,
             strict_map=self._kw.get("strict_map", True),
             apply_fog_prob=1.0,
+            apply_fog=self._kw.get("apply_fog", True),
             depth_estimator=self._depth_estimator,
         )
 

@@ -1,5 +1,5 @@
 import os, ast
-from typing import Tuple, Optional, Union, Dict
+from typing import Tuple, Optional, Union, Dict, List
 
 import warnings
 warnings.simplefilter("once", UserWarning)
@@ -243,6 +243,9 @@ class BaseTaskModel(nn.Module):
             has_lane_seg               = "LaneSegmentation"        in names,
             has_lane_det               = "LaneDetect"              in names,
         )
+    
+    def forward_backbone(self, x:torch.Tensor, intercept_layers:List[int]):
+        raise NotImplementedError
     
     def _freeze_bn(self, module):
         """
@@ -523,7 +526,6 @@ class BaseTaskModel(nn.Module):
 class YOLOP(BaseTaskModel):
     def __init__(self, cfg: str, loss_function:MultiTaskLoss=None):
         super(YOLOP, self).__init__()
-        #TODO, remove use_atss:bool = True
 
         module_defs = parse_model_config(cfg)        
 
@@ -647,6 +649,182 @@ class YOLOP(BaseTaskModel):
             )
 
         return model_outputs
+
+    def forward_backbone(self, x:torch.Tensor, intercept_layers:List[int]):
+        """
+        Walk the module_list up to max(intercept_layers) and return:
+          - cache_intercepts: {layer_idx: tensor} for each requested tap
+          - cache:            {layer_idx: tensor} for every layer in _cache_layer_idx
+                              (needed by forward_task_head to resume the walk)
+        """
+        cache = {}
+        cache_intercepts = {}
+        stop_after = max(intercept_layers) if intercept_layers else len(self.module_list) - 1
+
+        for i, (module, route) in enumerate(zip(self.module_list, self.routes)):
+            if route == -1:
+                x = module(x)
+
+            elif len(route) == 1:
+                if route[0] == -1:
+                    x = module(x)
+                else:
+                    x = module(cache[route[0]])
+
+            elif len(route) > 1:
+                if self.module_names[i] == "Concat":
+                    for r in route:
+                        if r == -1:
+                            continue
+                        assert r in cache, f"Output for layer {r} not found in cache."
+                        x = torch.cat([x, cache[r]], dim=1)
+
+                elif self.module_names[i] == "ResidualAdd":
+                    for r in route:
+                        if r == -1:
+                            continue
+                        assert r in cache, f"Output for layer {r} not found in cache."
+                        assert x.shape == cache[r].shape, f"Residual Add Expects Tensors of Same Size, Found: {x.shape} and {cache[r].shape}"
+
+                        x = x + cache[r]
+
+            else:
+                pass  # TODO: future modules
+
+            if i in self._cache_layer_idx:
+                cache[i] = x
+
+            if i in intercept_layers:
+                cache_intercepts[i] = x
+
+            if i >= stop_after:
+                break
+
+        return cache_intercepts, cache
+
+    def forward_task_head(self,
+                          fused_intercepts: Dict[int, torch.Tensor],
+                          cache: Dict[int, torch.Tensor],
+                          image_shape,
+                          targets: Dict[str, torch.Tensor] = None) -> PanopticModelOutputs:
+        """
+        Resume the forward walk from max(fused_intercepts.keys()) + 1, using
+        `cache` (from forward_backbone) for any layer reference and overriding
+        tap-layer outputs with the fused tensors.
+
+        Returns the same `PanopticModelOutputs` shape as `forward()` and calls
+        `_compute_loss` when targets are provided — preserves the trainer contract.
+        """
+        if not fused_intercepts:
+            raise ValueError("fused_intercepts must be non-empty")
+
+        batch_size, _, height, width = image_shape
+        device = next(iter(fused_intercepts.values())).device
+
+        # Merge backbone cache with fused overrides (don't mutate the caller's dicts).
+        cache = {**cache, **fused_intercepts}
+
+        start_idx = max(fused_intercepts.keys()) + 1
+        # Seed `x` for the rare case a route uses -1 immediately; multi-route layers
+        # consume via the cache regardless of x.
+        x = cache.get(start_idx - 1, None)
+
+        model_outputs = PanopticModelOutputs()
+
+        for i in range(start_idx, len(self.module_list)):
+            module, route = self.module_list[i], self.routes[i]
+
+            if route == -1:
+                x = module(x)
+
+            elif len(route) == 1:
+                if route[0] == -1:
+                    x = module(x)
+                else:
+                    x = module(cache[route[0]])
+
+            elif len(route) > 1:
+                if self.module_names[i] == "Concat":
+                    parts = []
+                    for r in route:
+                        if r == -1:
+                            parts.append(x)
+                        else:
+                            assert r in cache, f"Output for layer {r} not found in cache."
+                            parts.append(cache[r])
+                    x = torch.cat(parts, dim=1)
+
+                elif self.module_names[i] == "ResidualAdd":
+                    for r in route:
+                        if r == -1:
+                            continue
+                        assert r in cache, f"Output for layer {r} not found in cache."
+                        assert x.shape == cache[r].shape, f"Residual Add Expects Tensors of Same Size, Found: {x.shape} and {cache[r].shape}"
+                        x = x + cache[r]
+
+                elif self.module_names[i] == "Detect":
+                    inputs = []
+                    for r in route:
+                        if r == -1:
+                            continue
+                        assert r in cache, f"Output for layer {r} not found in cache."
+                        inputs.append(cache[r])
+
+                    detection_outputs = module(inputs, image_size=(height, width))
+                    model_outputs.detection_logits = detection_outputs
+
+                    model_outputs.anchor_proposals = module._anchor_proposals
+                    model_outputs.proposal_shape = module._proposal_shape
+                    model_outputs.anchor_cxcy = module._anchor_cxcy
+                    model_outputs.anchor_wh = module._anchor_wh
+                    model_outputs.anchor_strides = module._anchor_strides
+
+                    if not self.training:
+                        model_outputs.detection_predictions = module.activation(detection_outputs)
+
+                elif self.module_names[i] == "LaneDetect":
+                    inputs = []
+                    for r in route:
+                        if r == -1:
+                            continue
+                        assert r in cache, f"Output for layer {r} not found in cache."
+                        inputs.append(cache[r])
+
+                    lane_detection_outputs, seg_logits = module(inputs, image_size=(height, width))
+                    model_outputs.lane_detection_logits = lane_detection_outputs
+                    model_outputs.lane_seg_logits = seg_logits
+
+                    if not self.training:
+                        model_outputs.lane_detection_predictions = module.activation(lane_detection_outputs)
+
+                else:
+                    pass  # TODO: future modules
+
+            # Segmentation head captures (mirrors forward())
+            if self.module_names[i] == "DrivableAreaSegmentation":
+                model_outputs.drivable_segmentation_logits = x
+                if not self.training:
+                    model_outputs.drivable_segmentation_predictions = torch.softmax(x, dim=1)
+
+            elif self.module_names[i] == "LaneSegmentation":
+                model_outputs.lane_segmentation_logits = x
+                if not self.training:
+                    model_outputs.lane_segmentation_predictions = torch.softmax(x, dim=1)
+
+            if i in self._cache_layer_idx:
+                cache[i] = x
+
+        if targets is not None:
+            self._compute_loss(
+                model_outputs,
+                targets,
+                height, width,
+                batch_size,
+                device,
+            )
+
+        return model_outputs
+
 
 @ModelFactory.register_task_model("yolov8p")
 class YOLOv8P(BaseTaskModel):

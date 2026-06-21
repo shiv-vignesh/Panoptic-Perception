@@ -108,7 +108,7 @@ class Trainer:
         self.callbacks.on_train_begin(self)
 
         self.start_epoch = self.cur_epoch
-        for epoch in range(self.cur_epoch, self.training_args.epochs + 1):
+        for epoch in range(self.cur_epoch, self.training_args.epochs):
             self.cur_epoch = epoch
             self.logger.log_line()
 
@@ -175,17 +175,35 @@ class Trainer:
             total_loss += loss.item()
             ten_percent_batch_total_loss += loss.item()
 
-            if model_outputs.detection_loss is not None:
-                ten_percent_det_loss += model_outputs.detection_loss.item()
-            if model_outputs.drivable_segmentation_loss is not None:
-                ten_percent_drivable_loss += model_outputs.drivable_segmentation_loss.item()
-            if model_outputs.lane_segmentation_loss is not None:
-                ten_percent_lane_seg_loss += model_outputs.lane_segmentation_loss.item()
-            if model_outputs.lane_detection_loss is not None:
-                ten_percent_lane_det_loss += model_outputs.lane_detection_loss.item()
-            if model_outputs.lane_detection_loss_items is not None:
-                for k, v in model_outputs.lane_detection_loss_items.items():
-                    ten_percent_lane_det_items[k] = ten_percent_lane_det_items.get(k, 0.0) + v
+            # Per-iter loss log (smoke / debug aid). Decoupled from the
+            # ten-percent aggregator above so it works at any iter count.
+            if (self.training_args.log_every_n_iters
+                    and (batch_idx + 1) % self.training_args.log_every_n_iters == 0):
+                det = (model_outputs.detection_loss.item()
+                       if model_outputs is not None and model_outputs.detection_loss is not None
+                       else 0.0)
+                drv = (model_outputs.drivable_segmentation_loss.item()
+                       if model_outputs is not None and model_outputs.drivable_segmentation_loss is not None
+                       else 0.0)
+                self.logger.log_message(
+                    f"[iter {batch_idx:4d}] loss={loss.item():.4f} "
+                    f"det={det:.4f} drv={drv:.4f}"
+                )
+
+            # model_outputs is None when _train_one_step skipped the batch
+            # (all-targets-None diagnostic path). Skip per-loss accumulation too.
+            if model_outputs is not None:
+                if model_outputs.detection_loss is not None:
+                    ten_percent_det_loss += model_outputs.detection_loss.item()
+                if model_outputs.drivable_segmentation_loss is not None:
+                    ten_percent_drivable_loss += model_outputs.drivable_segmentation_loss.item()
+                if model_outputs.lane_segmentation_loss is not None:
+                    ten_percent_lane_seg_loss += model_outputs.lane_segmentation_loss.item()
+                if model_outputs.lane_detection_loss is not None:
+                    ten_percent_lane_det_loss += model_outputs.lane_detection_loss.item()
+                if model_outputs.lane_detection_loss_items is not None:
+                    for k, v in model_outputs.lane_detection_loss_items.items():
+                        ten_percent_lane_det_items[k] = ten_percent_lane_det_items.get(k, 0.0) + v
 
             epoch_training_time += (step_end_time - step_begin_time)
             ten_percent_training_time += (step_end_time - step_begin_time)
@@ -245,7 +263,19 @@ class Trainer:
                 
             self.callbacks.on_step_end(self)
 
-        avg_epoch_loss = total_loss / self.total_train_batch
+            # Smoke / debug iter cap.
+            if (self.training_args.max_train_iters
+                    and (batch_idx + 1) >= self.training_args.max_train_iters):
+                self.logger.log_message(
+                    f"[smoke] max_train_iters={self.training_args.max_train_iters} reached; "
+                    f"breaking out of epoch {self.cur_epoch}"
+                )
+                break
+
+        # Use observed batch count for the loss average so the smoke cap doesn't
+        # underestimate by dividing by total_train_batch.
+        observed_batches = (batch_idx + 1) if self.total_train_batch else 1
+        avg_epoch_loss = total_loss / observed_batches
 
         self.logger.log_message(
             f'Epoch {self.cur_epoch} - Average Loss {avg_epoch_loss:.4f} -- current_lr: {current_lr}'
@@ -266,23 +296,55 @@ class Trainer:
             "train/epoch": self.cur_epoch
         }, step=self.cur_epoch)
             
+    def _build_targets(self, data_items: dict) -> dict:
+        """Slice of `data_items` the model consumes as `targets`. Override-friendly."""
+        return {
+            "drivable_area_seg": data_items.get("drivable_area_seg"),
+            "lane_seg":          data_items.get("segmentation_masks"),
+            "detections":        data_items["detections"],
+            "lanes_detections":  data_items.get("lanes_detections"),
+            "lane_seg_masks":    data_items.get("lane_seg_masks"),
+            "clean_images":      data_items.get("clean_images"),
+        }
+
+    def _forward_model(self, data_items: dict) -> PanopticModelOutputs:
+        """Single-tensor forward. Subclasses with extra inputs (e.g. depth for
+        TeacherFusion) override this to dispatch the right call signature.
+        Returns a PanopticModelOutputs from whichever model self.model resolves to.
+        """
+        return self.model(
+            data_items["images"],
+            targets=self._build_targets(data_items),
+        )
+
     def _train_one_step(self, data_items:dict) -> PanopticModelOutputs:
-        
+
         for k, v in data_items.items():
             if torch.is_tensor(v):
                 data_items[k] = v.to(self.device)
-                
-        outputs = self.model(
-            data_items["images"],
-            targets={
-                "drivable_area_seg": data_items.get("drivable_area_seg"),
-                "lane_seg": data_items.get("segmentation_masks"),
-                "detections": data_items["detections"],
-                "lanes_detections": data_items.get("lanes_detections"),
-                "lane_seg_masks": data_items.get("lane_seg_masks"),
-                "clean_images": data_items.get("clean_images")
+
+        # Diagnostic: MultiTaskLoss raises when no model output matches any
+        # registered loss task — typically because the only target the model
+        # consumes (e.g., detections for a detection-only cfg) is None for this
+        # batch. Catch, log image_paths, and skip the step so training continues.
+        try:
+            outputs = self._forward_model(data_items)
+        except ValueError as e:
+            if "model produced no outputs" not in str(e):
+                raise
+            paths = data_items.get("image_paths", [])
+            present = {
+                k: (None if data_items.get(k) is None
+                    else (tuple(data_items[k].shape) if torch.is_tensor(data_items[k])
+                          else "non-tensor"))
+                for k in ("detections", "drivable_area_seg", "segmentation_masks",
+                          "lanes_detections", "lane_seg_masks")
             }
-        )
+            self.logger.log_message(
+                f"[skip-batch] iter {getattr(self, 'train_batch_idx', '?')}: "
+                f"empty loss_items — skipping. paths={paths} targets={present}"
+            )
+            return torch.zeros(1, device=self.device), None
 
         loss = torch.zeros(1, device=self.device)
 
@@ -330,19 +392,26 @@ class Trainer:
                 if torch.is_tensor(v):
                     data_items[k] = v.to(self.device)
 
-            # Forward pass
-            with torch.no_grad():
-                outputs = self.model(
-                    data_items["images"],
-                    targets={
-                        "drivable_area_seg": data_items.get("drivable_area_seg"),
-                        "lane_seg": data_items.get("segmentation_masks"),
-                        "detections": data_items["detections"],
-                        "lanes_detections": data_items.get("lanes_detections"),
-                        "lane_seg_masks": data_items.get("lane_seg_masks"),
-                        "clean_images": data_items.get("clean_images")
-                    }
+            # Forward pass — same skip-batch diagnostic as _train_one_step.
+            try:
+                with torch.no_grad():
+                    outputs = self._forward_model(data_items)
+            except ValueError as e:
+                if "model produced no outputs" not in str(e):
+                    raise
+                paths = data_items.get("image_paths", [])
+                present = {
+                    k: (None if data_items.get(k) is None
+                        else (tuple(data_items[k].shape) if torch.is_tensor(data_items[k])
+                              else "non-tensor"))
+                    for k in ("detections", "drivable_area_seg", "segmentation_masks",
+                              "lanes_detections", "lane_seg_masks")
+                }
+                self.logger.log_message(
+                    f"[skip-batch] eval iter {batch_idx} ({metric_prefix}): "
+                    f"empty loss_items — skipping. paths={paths} targets={present}"
                 )
+                continue
 
             self.eval_batch_idx = batch_idx
             self.eval_batch_ctx.cur_eval_model_outputs = outputs
@@ -359,6 +428,15 @@ class Trainer:
             self.eval_batch_ctx.cur_eval_gt_lane_detections = data_items.get("lanes_detections")
 
             self.callbacks.on_eval_batch_end(self)
+
+            # Smoke / debug iter cap (mirrors max_train_iters).
+            if (self.training_args.max_eval_iters
+                    and (batch_idx + 1) >= self.training_args.max_eval_iters):
+                self.logger.log_message(
+                    f"[smoke] max_eval_iters={self.training_args.max_eval_iters} reached; "
+                    f"breaking out of eval ({metric_prefix})"
+                )
+                break
 
         self.callbacks.on_eval_end(self)
 

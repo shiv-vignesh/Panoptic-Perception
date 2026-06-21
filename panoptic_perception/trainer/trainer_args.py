@@ -61,6 +61,17 @@ class TrainingArgument:
 
     eval_visualize_outputs : bool = True
 
+    # ----- Smoke / debug iter caps -----
+    # When set (int > 0), _train_one_epoch and _eval_one_epoch break after this
+    # many batches. None disables the cap (production default).
+    max_train_iters : int = None
+    max_eval_iters  : int = None
+
+    # When set, log per-iter loss every N steps (useful for smoke runs where the
+    # default ten-percent log interval = total_train_batch//100 is too sparse).
+    # None disables — falls back to existing ten-percent logging.
+    log_every_n_iters : int = None
+
     # ----- Base -----
     lambda_defog : float = 0.2
     

@@ -1,0 +1,149 @@
+{
+    "_description": "Teacher fusion training — privileged information (clean image + depth). Based on train_kwargs_optimized_drivable.json with teacher-specific additions: fusion_kwargs, apply_fog=false, per-backbone optimizer groups, optional YOLOP warm-start.",
+
+    "model_kwargs": {
+        "model_type":  "yolop",
+        "cfg_path":    "panoptic_perception/configs/models/yolo-768-1280-detection.cfg",
+        "device":      "cpu",
+
+        "_warm_start_description": "Optional YOLOP checkpoints loaded into image/depth backbones non-strictly. depth_backbone_init=null reuses image weights for the depth backbone. null on this smoke run.",
+        "image_backbone_init": null,
+        "depth_backbone_init": null
+    },
+
+    "fusion_kwargs": {
+        "_description": "Fusion stacks per (task, tap_layer). Channels MUST match the cfg's output at those layer indices — verify with forward_backbone(dummy_image, [17,20,23]).",
+        "backbone_intercepts": {
+            "detection": [[17, 128], [20, 256], [23, 512]]
+        },
+        "fusion_type":       "attention",
+        "_fusion_type_note": "AttentionBasedFusion is non-square-rejected; use 'simple' at 768x1280 or switch image_resize to a square size (640x640) for attention.",
+        "weighted_fusion":   false,
+        "num_fusion_blocks": 1,
+        "_num_blocks_note":  "Start at 1 for the first feasibility run; bump to 3 once loss is decreasing."
+    },
+
+    "dataset_kwargs": {
+        "_teacher_required_description": "dataset_class=foggy + apply_fog=false produces (clean image + depth) — the privileged-information input. train_teacher.py asserts both.",
+        "dataset_class": "foggy",
+        "apply_fog":     false,
+        "collate_path":  "cpu",
+        "adverse_params": {
+            "depth_backend": "heuristic",
+            "depth_device":  "cpu",
+            "_backend_note": "Heuristic for fast iteration. Swap to depth_anything (+ collate_path=gpu) when wall-clock allows."
+        },
+
+        "images_dir":                   "../data/100k/100k",
+        "detection_annotations_dir":    "../data/bdd100k_labels/100k",
+        "segmentation_annotations_dir": "",
+        "drivable_annotations_dir":     "../data/drivable_maps/labels",
+
+        "train_batch_size":  2,
+        "train_shuffle":     true,
+        "train_num_workers": 0,
+        "_workers_note":     "Foggy path forces num_workers=0 regardless. Set to 0 here for clarity.",
+        "train_preprocessor_kwargs": {
+            "image_resize":         [640, 640],
+            "original_image_size":  [720, 1280],
+            "perform_augmentation": true,
+            "augment_params": {
+                "degrees": 5, "translate": 0.05, "scale": 0.15, "shear": 2,
+                "hsv_h": 0.015, "hsv_s": 0.7, "hsv_v": 0.4,
+                "salt_prob": 0.005, "pepper_prob": 0.005,
+                "flip_prob": 0.5,
+                "img_size": [640, 640]
+            },
+            "advanced_aug": {"mosaic_prob": 0.0, "mixup_prob": 0.0, "copy_paste_prob": 0.0}
+        },
+        "val_batch_size":   2,
+        "val_shuffle":      false,
+        "val_num_workers":  0,
+        "val_preprocessor_kwargs": {
+            "image_resize":         [640, 640],
+            "original_image_size":  [720, 1280]
+        }
+    },
+
+    "optimizer_kwargs": {
+        "_description": "Per-backbone freeze groups. image_backbone_kwargs / depth_backbone_kwargs each shape what get_param_groups produces; fusion_lr_scale gates the new fusion params.",
+        "_type":          "AdamW",
+        "initial_lr":     1e-3,
+        "weight_decay":   0.01,
+        "momentum":       0.937,
+        "warmup_bias_lr": 0.1,
+        "warmup_momentum": 0.8,
+        "warmup_epochs":  3,
+
+        "image_backbone_kwargs": {
+            "_description": "Image backbone: warm-started from YOLOP, all layers trainable so fusion can adapt the representation. Freeze early layers if you want to preserve the pretrained features more strictly.",
+            "groups": {
+                "backbone":     {"group": [0, 9],   "trainable": true},
+                "fpn":          {"group": [10, 16], "trainable": true},
+                "det_pan":      {"group": [17, 23], "trainable": true},
+                "detect_head":  {"group": [24],     "trainable": true},
+                "segmentation": {"group": [25, 33], "trainable": true}
+            }
+        },
+
+        "depth_backbone_kwargs": {
+            "_description": "Depth backbone: forward_backbone early-exits at max(tap)=23, so head layers (24+) are never invoked. Freeze them to keep the param count honest and avoid optimizer overhead.",
+            "groups": {
+                "backbone":     {"group": [0, 9],   "trainable": true},
+                "fpn":          {"group": [10, 16], "trainable": true},
+                "det_pan":      {"group": [17, 23], "trainable": true},
+                "detect_head":  {"group": [24],     "trainable": false},
+                "segmentation": {"group": [25, 33], "trainable": false}
+            }
+        },
+
+        "fusion_lr_scale": 1.0
+    },
+
+    "lr_scheduler_kwargs": {
+        "_type": "cosine",
+        "linear_lr_kwargs":           {"start_factor": 1.0, "end_factor": 0.01},
+        "cosine_annealing_lr_kwargs": {"eta_min": 5e-6}
+    },
+
+    "trainer_kwargs": {
+        "output_dir":           "yolop-teacher-fusion-smoke",
+        "is_training":          true,
+        "first_val_epoch":      0,
+        "metric_eval_mode":     "strict",
+        "metric_average_mode":  "macro",
+        "epochs":               1,
+        "monitor_train":        true,
+        "monitor_val":          true,
+        "gradient_clipping":    1.0,
+        "checkpoint_idx":       2,
+        "gradient_accumulation_steps": 2,
+        "lr_scheduler_start_epoch":    1,
+        "reload_optimizer":            false,
+        "reload_optimizer_with_initial_lr": false,
+        "_checkpoint_path_note": "Set to a previous teacher checkpoint to RESUME training; null on first run. Distinct from model_kwargs.image_backbone_init which only warm-starts backbone weights.",
+        "checkpoint_path":             null,
+        "_smoke_cap_note":             "max_train_iters/max_eval_iters early-break each epoch's loop. Drop these for full training.",
+        "max_train_iters":             100,
+        "max_eval_iters":              100,
+        "log_every_n_iters":           1,
+        "wandb_project":               "teacher-fusion",
+        "wandb_enabled":               false,
+        "use_ema":                     false,
+        "ema_decay":                   0.9999,
+        "ema_warmup_steps":            2000
+    },
+
+    "loss_kwargs": {
+        "detection":             {"_type": "detection-loss-ATSS", "kwargs": {}},
+        "drivable_segmentation": {"_type": "segmentation-loss",   "kwargs": {}},
+        "lane_detection":        {"_type": "lane-detection-loss", "kwargs": {}},
+        "loss_weights": {
+            "_description":          "Match drivable config; lane_segmentation=0 since no seg annotations dir.",
+            "detection":             1.0,
+            "drivable_segmentation": 1.0,
+            "lane_detection":        1.0,
+            "lane_segmentation":     0.0
+        }
+    }
+}
