@@ -115,8 +115,8 @@ class BDDPreprocessor:
         for frames in data["frames"]:
             for item in frames["objects"]:
                 if "box2d" in item:
-                    bbox = Bbox(item["box2d"]["x1"], item["box2d"]["x2"], 
-                               item["box2d"]["y1"], item["box2d"]["y2"])
+                    bbox = Bbox(item["box2d"]["x1"], item["box2d"]["y1"],
+                                item["box2d"]["x2"], item["box2d"]["y2"])
                     
                     if bbox.valid_bbox:
                         if filter_by_area:
@@ -837,9 +837,10 @@ class FoggyBDDPreprocessor(BDDPreprocessor):
 
         # Optional masks/targets stay on CPU — trainer handles device placement,
         # matching the behavior of `collate_fn`.
-        def _stack_optional(items):
+        def _stack_optional(items, dtype=None):
             present = [torch.as_tensor(x) for x in items if x is not None]
-            return torch.stack(present, dim=0) if present else None
+            stacked = torch.stack(present, dim=0) if present else None
+            return stacked.to(dtype=dtype) if stacked is not None and dtype is not None else stacked
 
         return {
             "images":             degraded_full,                                # (B, 3, H, W) float32 in [0,1], on depth device
@@ -847,8 +848,8 @@ class FoggyBDDPreprocessor(BDDPreprocessor):
             "depth_maps":         depth_full,                                   # (B, H, W)    float32, zeros at non-fogged positions
             "fog_mask":           torch.tensor(fog_mask, dtype=torch.bool),     # (B,)         bool, True where fog applied
             "detections":         batch_targets_tensor,                        # (N_total, 6) [batch_idx, cls, cx, cy, w, h] or None
-            "segmentation_masks": _stack_optional(segs),                        # (B, H, W)    long or None
-            "drivable_area_seg":  _stack_optional(drivables),                   # (B, H, W)    long or None
+            "segmentation_masks": _stack_optional(segs, dtype=torch.long),
+            "drivable_area_seg":  _stack_optional(drivables, dtype=torch.long),
             "lanes_detections":   _stack_optional(lane_targets_list),           # (B, ...) or None
             "lane_seg_masks":     _stack_optional(lane_seg_masks),              # (B, H, W) or None
             "lane_categories":    _stack_optional(lane_categories),             # (B, ...) or None
@@ -935,9 +936,10 @@ class FoggyBDDPreprocessor(BDDPreprocessor):
             batch_targets_tensor[:, 2:4] = batch_targets_tensor[:, 2:4].clamp(0.0, 1.0)
             batch_targets_tensor[:, 4:6] = batch_targets_tensor[:, 4:6].clamp(0.001, 1.0)
 
-        def _stack_optional(items):
+        def _stack_optional(items, dtype=None):
             present = [torch.as_tensor(x) for x in items if x is not None]
-            return torch.stack(present, dim=0) if present else None
+            stacked = torch.stack(present, dim=0) if present else None
+            return stacked.to(dtype=dtype) if stacked is not None and dtype is not None else stacked
 
         return {
             "images":             batch_images_tensor,                          # (B, 3, H, W) float32 in [0,1], CPU
@@ -945,8 +947,8 @@ class FoggyBDDPreprocessor(BDDPreprocessor):
             "depth_maps":         batch_depth_tensor,                           # (B, H, W)    float32, zeros at non-fogged positions, CPU
             "fog_mask":           torch.tensor(fog_mask, dtype=torch.bool),     # (B,)         bool, True where fog applied
             "detections":         batch_targets_tensor,                        # (N_total, 6) [batch_idx, cls, cx, cy, w, h] or None
-            "segmentation_masks": _stack_optional(segs),                        # (B, H, W)    long or None
-            "drivable_area_seg":  _stack_optional(drivables),                   # (B, H, W)    long or None
+            "segmentation_masks": _stack_optional(segs, dtype=torch.long),
+            "drivable_area_seg":  _stack_optional(drivables, dtype=torch.long),
             "lanes_detections":   _stack_optional(lane_targets_list),           # (B, ...) or None
             "lane_seg_masks":     _stack_optional(lane_seg_masks),              # (B, H, W) or None
             "lane_categories":    _stack_optional(lane_categories),             # (B, ...) or None
@@ -1007,9 +1009,10 @@ class FoggyBDDPreprocessor(BDDPreprocessor):
             batch_targets_tensor[:, 2:4] = batch_targets_tensor[:, 2:4].clamp(0.0, 1.0)
             batch_targets_tensor[:, 4:6] = batch_targets_tensor[:, 4:6].clamp(0.001, 1.0)
 
-        def _stack_optional(items):
+        def _stack_optional(items, dtype=None):
             present = [torch.as_tensor(x) for x in items if x is not None]
-            return torch.stack(present, dim=0) if present else None
+            stacked = torch.stack(present, dim=0) if present else None
+            return stacked.to(dtype=dtype) if stacked is not None and dtype is not None else stacked
 
         return {
             "images":             batch_images_tensor,
@@ -1017,8 +1020,8 @@ class FoggyBDDPreprocessor(BDDPreprocessor):
             "depth_maps":         batch_depth_tensor,
             "fog_mask":           torch.tensor(fog_mask, dtype=torch.bool),
             "detections":         batch_targets_tensor,
-            "segmentation_masks": _stack_optional(segs),
-            "drivable_area_seg":  _stack_optional(drivables),
+            "segmentation_masks": _stack_optional(segs, dtype=torch.long),
+            "drivable_area_seg":  _stack_optional(drivables, dtype=torch.long),
             "lanes_detections":   _stack_optional(lane_targets_list),
             "lane_seg_masks":     _stack_optional(lane_seg_masks),
             "lane_categories":    _stack_optional(lane_categories),

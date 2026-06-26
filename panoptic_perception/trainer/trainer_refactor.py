@@ -107,6 +107,13 @@ class Trainer:
         self.logger.log_new_line()
         self.callbacks.on_train_begin(self)
 
+        if self.training_args.eval_before_train and self.val_dataloaders and self.training_args.monitor_val:
+            self.logger.log_line()
+            self.logger.log_message("=== Pre-Training Evaluation ===")
+            for prefix, dataloader in self.val_dataloaders.items():
+                self.eval_metrics[prefix].reset()
+                self._eval_one_epoch(dataloader, prefix)
+
         self.start_epoch = self.cur_epoch
         for epoch in range(self.cur_epoch, self.training_args.epochs + 1):
             self.cur_epoch = epoch
@@ -151,11 +158,14 @@ class Trainer:
         train_iter = tqdm(self.train_dataloader, desc=f'Training Epoch: {self.cur_epoch}')
         for batch_idx, data_items in enumerate(train_iter):
 
+            self.train_batch_idx = batch_idx
+            self._apply_warmup()
+            current_lr = self.optimizer.param_groups[0]['lr']
+
             step_begin_time = time.time()
             loss, model_outputs = self._train_one_step(data_items)
             step_end_time = time.time()
 
-            self.train_batch_idx = batch_idx
             self.batch_images = data_items["images"]
 
             if ((batch_idx + 1) % self.training_args.gradient_accumulation_steps == 0) or (batch_idx == self.total_train_batch - 1):
@@ -191,8 +201,6 @@ class Trainer:
             ten_percent_training_time += (step_end_time - step_begin_time)
 
             if (batch_idx + 1) % self.ten_percent_train_batch == 0:
-                self._apply_warmup()
-
                 n = self.ten_percent_train_batch
                 average_loss = ten_percent_batch_total_loss / n
                 average_time = ten_percent_training_time / n
@@ -302,7 +310,8 @@ class Trainer:
             if hasattr(outputs, "defogging_loss") and outputs.defogging_loss is not None:
                 loss += self.training_args.lambda_defog * outputs.defogging_loss
                 
-        loss.backward()
+        accumulation_steps = max(1, self.training_args.gradient_accumulation_steps)
+        (loss / accumulation_steps).backward()
 
         return loss, outputs
     

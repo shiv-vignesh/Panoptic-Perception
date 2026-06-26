@@ -1,6 +1,7 @@
 {
     "model_kwargs":{
-        "cfg_path":"panoptic_perception/configs/models/yolo-detection-drivable.cfg",
+        "model_type":"yolop",
+        "cfg_path":"panoptic_perception/configs/models/yolo-detection-drivable-unet.cfg",
         "device":"cuda:0"
     },
 
@@ -23,7 +24,7 @@
             "atmospheric_light_min_pixels": 10,
             "atmospheric_light": [0.85, 0.85, 0.85]
         },
-        "train_batch_size":24,
+        "train_batch_size":4,
         "train_shuffle":true,
         "train_num_workers":4,
         "train_preprocessor_kwargs":{
@@ -31,7 +32,7 @@
             "original_image_size": [720, 1280],
             "perform_augmentation":true
         },
-        "val_batch_size":16,
+        "val_batch_size":4,
         "val_shuffle":false,
         "val_num_workers":4,
         "val_preprocessor_kwargs":{
@@ -42,7 +43,7 @@
     "optimizer_kwargs":{
         "_description": "AdamW optimizer configuration",
         "_type": "AdamW",
-        "initial_lr": 1e-3,
+        "initial_lr": 1e-4,
         "weight_decay": 0.01,
         "momentum":0.937,
         "warmup_bias_lr":0.1,
@@ -50,16 +51,29 @@
         "warmup_epochs":3,
         "groups": {
             "backbone": {
-                "group":[0, 23],
-                "trainable":false
+                "group":[0, 9],
+                "trainable":true,
+                "lr_scale":0.1
             },
-            "detect": {
+            "fpn": {
+                "group":[10, 16],
+                "trainable":true,
+                "lr_scale":0.25
+            },
+            "det_pan": {
+                "group":[17, 23],
+                "trainable":true,
+                "lr_scale":0.25
+            },
+            "detect_head": {
                 "group":[24],
-                "trainable":false
+                "trainable":true,
+                "lr_scale":0.25
             },
             "segmentation": {
-                "group":[25, 33],
-                "trainable":true
+                "group":[25, 35],
+                "trainable":true,
+                "lr_scale":0.5
             }
         },
         "gdip_groups":{
@@ -78,9 +92,10 @@
         }
     },
     "trainer_kwargs":{
-        "output_dir": "yolop-depth-fog-stage2a",
+        "output_dir": "yolop-depth-fog-stage2a-pretrain-eval",
         "is_training":true,
-        "first_val_epoch": 0,
+        "eval_before_train": true,
+        "first_val_epoch": 1,
         "metric_eval_mode": "strict",
         "metric_average_mode": "macro",
         "epochs": 100,
@@ -88,15 +103,46 @@
         "monitor_val": true,
         "gradient_clipping": 1.0,
         "checkpoint_idx":2,
-        "gradient_accumulation_steps":2,
+        "gradient_accumulation_steps":12,
         "lr_scheduler_start_epoch":1,
-        "checkpoint_path":"yolop-detection-detection-rectified/ckpt_49/ckpt-49.pt",
+        "checkpoint_path":"/home/owl/ashu1069/Panoptic-Perception/best_model.pt",
         "reload_optimizer":false,
+        "resume_training_state":false,
         "reload_optimizer_with_initial_lr":false,
 
         "wandb_project":"yolop-depth-fog-stage2a",
-        "use_ema": true,
+        "use_ema": false,
         "ema_decay": 0.9999,
         "ema_warmup_steps": 2000
+    },
+    "loss_kwargs": {
+        "detection":{
+            "_type":"detection-loss-ATSS",
+            "kwargs":{}
+        },
+        "drivable_segmentation":{
+            "_type":"segmentation-loss",
+            "kwargs":{}
+        },
+        "lane_detection":{
+            "_type":"lane-detection-loss",
+            "kwargs":{}
+        },
+        "loss_weights": {
+            "_description": "Multi-task loss weights",
+            "detection": 1.0,
+            "drivable_segmentation": 1.0,
+            "lane_detection": 1.0,
+            "lane_segmentation": 0.0
+        }
+    },
+    "callbacks": {
+        "checkpoint": {},
+        "eval_metrics": {
+            "conf_threshold": 0.001,
+            "iou_threshold": 0.45,
+            "max_detections": 300,
+            "stats_iou_threshold": 0.5
+        }
     }
 }

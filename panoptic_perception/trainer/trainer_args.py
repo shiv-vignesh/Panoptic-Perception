@@ -54,10 +54,12 @@ class TrainingArgument:
 
     monitor_train : bool = True
     monitor_val : bool = True
+    eval_before_train : bool = False
     first_val_epoch : int = 0
 
     wandb_enabled : bool = True
     reload_optimizer : bool = False
+    resume_training_state : bool = True
 
     eval_visualize_outputs : bool = True
 

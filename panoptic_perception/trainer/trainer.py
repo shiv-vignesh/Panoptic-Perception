@@ -772,6 +772,28 @@ class Trainer:
 
         train_iter = tqdm(self.train_dataloader, desc=f'Training Epoch: {self.cur_epoch}')
         for batch_idx, data_items in enumerate(train_iter):
+
+            if self.cur_epoch < self.warmup_epochs:
+                warmup_factor = (self.cur_epoch + (batch_idx + 1)/self.total_train_batch) / self.warmup_epochs
+                warmup_factor = min(1.0, warmup_factor)
+
+                # LR warmup per param group (bias gets special warmup LR)
+                # Skip groups frozen by staged training (lr == 0)
+                for pg in self.optimizer.param_groups:
+                    if self.staged_training_enabled and pg['lr'] == 0.0:
+                        continue
+                    scale = pg.get('lr_scale', 1.0)
+                    if 'bias' in pg.get('name',''):
+                        pg['lr'] = (self.warmup_bias_lr + warmup_factor * (self.lr0 - self.warmup_bias_lr)) * scale
+                    else:
+                        pg['lr'] = warmup_factor * self.lr0 * scale
+
+                # Momentum warmup if optimizer supports momentum
+                if 'momentum' in self.optimizer.param_groups[0]:
+                    self.optimizer.param_groups[0]['momentum'] = \
+                        self.warmup_momentum + warmup_factor * (self.main_momentum - self.warmup_momentum)
+
+            current_lr = self.optimizer.param_groups[0]['lr']
             
             step_begin_time = time.time()
             loss, model_outputs = self.train_one_step(data_items)
@@ -858,27 +880,6 @@ class Trainer:
             ten_percent_training_time += (step_end_time - step_begin_time)
 
             if (batch_idx + 1) % self.ten_percent_train_batch == 0:
-
-                if self.cur_epoch < self.warmup_epochs:
-                    warmup_factor = (self.cur_epoch + (batch_idx + 1)/self.total_train_batch) / self.warmup_epochs
-                    warmup_factor = min(1.0, warmup_factor)
-
-                    # LR warmup per param group (bias gets special warmup LR)
-                    # Skip groups frozen by staged training (lr == 0)
-                    for pg in self.optimizer.param_groups:
-                        if self.staged_training_enabled and pg['lr'] == 0.0:
-                            continue
-                        scale = pg.get('lr_scale', 1.0)
-                        if 'bias' in pg.get('name',''):
-                            pg['lr'] = (self.warmup_bias_lr + warmup_factor * (self.lr0 - self.warmup_bias_lr)) * scale
-                        else:
-                            pg['lr'] = warmup_factor * self.lr0 * scale
-
-                    # Momentum warmup if optimizer supports momentum
-                    if 'momentum' in self.optimizer.param_groups[0]:
-                        self.optimizer.param_groups[0]['momentum'] = \
-                            self.warmup_momentum + warmup_factor * (self.main_momentum - self.warmup_momentum)
-
                 average_loss = ten_percent_batch_total_loss/self.ten_percent_train_batch
                 average_time = ten_percent_training_time/self.ten_percent_train_batch
 
@@ -949,7 +950,8 @@ class Trainer:
             if hasattr(outputs, "defogging_loss") and outputs.defogging_loss is not None:
                 loss += self.lambda_defog * outputs.defogging_loss
 
-        loss.backward()
+        accumulation_steps = max(1, self.gradient_accumulation_steps)
+        (loss / accumulation_steps).backward()
 
         return loss, outputs
 
