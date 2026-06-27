@@ -1,5 +1,5 @@
 import torch
-from typing import Tuple, Optional, Any
+from typing import Tuple, Optional, Any, Dict
 
 from dataclasses import dataclass
 from typing import List, Tuple
@@ -25,6 +25,7 @@ class PanopticModelOutputs:
     lane_detection_loss: torch.Tensor = None
     lane_detection_loss_items: dict = None
     defogging_loss: torch.Tensor = None
+    depth_reconstruction_loss: torch.Tensor = None
 
     # ---- ATSS - Detection Head -----
     # List[torch.Tensor]: pre-computed (x, y) center locations per grid
@@ -39,6 +40,9 @@ class PanopticModelOutputs:
     cls_logits_raw: torch.Tensor = None
     anchor_points: torch.Tensor = None
     strides_v8: torch.Tensor = None
+
+    # ---- TeacherFusion auxiliary depth reconstruction ----
+    depth_reconstruction: Optional["DepthReconstructionLossItems"] = None
 
     def keys(self):
         return self.__dict__.keys()
@@ -82,6 +86,14 @@ class DrivableSegmentationLossItems:
 
     drivable_segmentation_logits: Optional[torch.Tensor] = None
     targets: Optional[torch.Tensor] = None
+
+
+@dataclass
+class DepthReconstructionLossItems:
+    # predictions: {task_name: {"full_res": (B,1,H,W), "<tap_idx>": (B,1,h,w), ...}}
+    # target: (B, 1, H, W) reference depth in [0, 1].
+    predictions: Optional[Dict[str, Dict[str, torch.Tensor]]] = None
+    target: Optional[torch.Tensor] = None
 
 
 @dataclass

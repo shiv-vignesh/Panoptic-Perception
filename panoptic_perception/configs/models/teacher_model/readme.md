@@ -1,0 +1,4 @@
+- Maintaining different cfg files for each backbone to enable customizability of individual backbone
+- Can extend image_backbone beyond FPN to drivable and depth reconstruction for pretraining
+- Enables config level pruning of depth, else depth backbone unnecessarily mirrors image
+- Enables addition of fusion module with similar cfg as backbone

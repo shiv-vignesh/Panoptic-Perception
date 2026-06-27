@@ -5,7 +5,9 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from panoptic_perception.models.models import BaseTaskModel
+from panoptic_perception.models.models import BaseTaskModel, create_modules
+from panoptic_perception.models.types import DepthReconstructionLossItems
+from panoptic_perception.models.utils import parse_model_config
 
 
 class SimpleCrossAdaptiveFusion(nn.Module):
@@ -56,18 +58,29 @@ class AttentionBasedFusion(nn.Module):
                 f"image_grid_channels must be even (we project to channels // 2); got {image_grid_channels}"
             )
 
-        proj_channels = image_grid_channels // 2
+        if weighted_fusion:
+            # The gated path mixes the image-indexed fusion_features into the
+            # depth-indexed stream — same coordinate-system bug we're avoiding
+            # by passing depth through unchanged in the non-weighted path.
+            # Gate symmetrically (Fix B) before re-enabling.
+            raise NotImplementedError(
+                "AttentionBasedFusion.weighted_fusion is disabled — the gated path still "
+                "writes image-indexed fusion into the depth stream. Use weighted_fusion=False "
+                "until symmetric (Fix-B) cross-attention is implemented."
+            )
 
-        self.image_dim_reduce = nn.Conv2d(image_grid_channels, proj_channels, kernel_size=1)
-        self.depth_dim_reduce = nn.Conv2d(depth_grid_channels, proj_channels, kernel_size=1)
+        self.proj_channel = image_grid_channels // 2
 
-        self.query_conv = nn.Conv2d(proj_channels, proj_channels, kernel_size=1)
-        self.key_conv   = nn.Conv2d(proj_channels, proj_channels, kernel_size=1)
-        self.value_conv = nn.Conv2d(proj_channels, proj_channels, kernel_size=1)
+        self.image_dim_reduce = nn.Conv2d(image_grid_channels, self.proj_channel, kernel_size=1)
+        self.depth_dim_reduce = nn.Conv2d(depth_grid_channels, self.proj_channel, kernel_size=1)
 
-        self.output_proj = nn.Conv2d(proj_channels, image_grid_channels, kernel_size=1)
+        self.query_conv = nn.Conv2d(self.proj_channel, self.proj_channel, kernel_size=1)
+        self.key_conv = nn.Conv2d(self.proj_channel, self.proj_channel, kernel_size=1)
+        self.value_conv = nn.Conv2d(self.proj_channel, self.proj_channel, kernel_size=1)
 
-        self.norm1 = nn.LayerNorm(proj_channels)
+        self.output_proj = nn.Conv2d(self.proj_channel, image_grid_channels, kernel_size=1)
+
+        self.norm1 = nn.LayerNorm(self.proj_channel)
         self.norm2 = nn.LayerNorm(image_grid_channels)
 
         self.dropout_p = dropout_p
@@ -87,6 +100,7 @@ class AttentionBasedFusion(nn.Module):
             )
 
         self.apply(self._weights_init_kaiming)
+        self._pe_cache : Dict[Tuple[int, int], torch.Tensor] = {}
 
     @staticmethod
     def _weights_init_kaiming(m: nn.Module):
@@ -99,6 +113,35 @@ class AttentionBasedFusion(nn.Module):
     def _ln_chw(norm: nn.LayerNorm, x: torch.Tensor) -> torch.Tensor:
         # LayerNorm wants channels last; conv tensors are channels-first.
         return norm(x.permute(0, 2, 3, 1)).permute(0, 3, 1, 2)
+
+    def _get_pe(self, h:int, w:int, device:torch.device, dtype:torch.dtype):
+
+        if (h, w) not in self._pe_cache or self._pe_cache[(h, w)].device != device:
+
+            # Create 2D grid
+            y_embed = torch.arange(h, dtype=torch.float32, device=device)
+            x_embed = torch.arange(w, dtype=torch.float32, device=device)
+            
+            # Calculate frequencies (using half of channels for each dimension)
+            dim_t = torch.arange(self.proj_channel // 2, dtype=torch.float32, device=device)
+            dim_t = 10000 ** (2 * (dim_t // 2) / (self.proj_channel // 2))
+            
+            pos_y = y_embed[:, None] / dim_t
+            pos_x = x_embed[:, None] / dim_t
+            
+            # Interleave sine and cosine
+            pos_y = torch.stack((pos_y[:, 0::2].sin(), pos_y[:, 1::2].cos()), dim=2).flatten(1)
+            pos_x = torch.stack((pos_x[:, 0::2].sin(), pos_x[:, 1::2].cos()), dim=2).flatten(1)
+            
+            # Combine and reshape to match query/key dimensions: (1, C, H, W)
+            pos = torch.cat((
+                pos_y.unsqueeze(1).expand(h, w, -1),
+                pos_x.unsqueeze(0).expand(h, w, -1)
+            ), dim=-1).permute(2, 0, 1).unsqueeze(0)
+
+            self._pe_cache[(h, w)] = pos
+
+        return self._pe_cache[(h, w)].to(dtype)
 
     def forward(self, image_grid_features: torch.Tensor, depth_grid_features: torch.Tensor):
         bs, _, h, w = image_grid_features.shape
@@ -115,15 +158,19 @@ class AttentionBasedFusion(nn.Module):
         image_feat = self._ln_chw(self.norm1, image_feat)
         depth_feat = self._ln_chw(self.norm1, depth_feat)
 
-        queries = self.query_conv(image_feat)
-        keys    = self.key_conv(depth_feat)
-        values  = self.value_conv(depth_feat)
+        pe = self._get_pe(h, w, image_feat.device, image_feat.dtype)   # (1, C, h, w)
+        image_feat_pe = image_feat + pe
+        depth_feat_pe = depth_feat + pe
+
+        queries = self.query_conv(image_feat_pe)
+        keys = self.key_conv(depth_feat_pe)
+        values = self.value_conv(depth_feat)
 
         # SDPA expects (B, n_heads, seq, head_dim). n_heads=1 keeps math
         # identical to the original single-head attention but with O(N) memory.
         q = queries.view(bs, -1, h * w).transpose(1, 2).unsqueeze(1)
-        k = keys   .view(bs, -1, h * w).transpose(1, 2).unsqueeze(1)
-        v = values .view(bs, -1, h * w).transpose(1, 2).unsqueeze(1)
+        k = keys.view(bs, -1, h * w).transpose(1, 2).unsqueeze(1)
+        v = values.view(bs, -1, h * w).transpose(1, 2).unsqueeze(1)
 
         fusion_features = F.scaled_dot_product_attention(
             q, k, v,
@@ -135,16 +182,10 @@ class AttentionBasedFusion(nn.Module):
         fusion_features = self._ln_chw(self.norm2, fusion_features)
 
         if self.weighted_fusion:
-            combined = torch.cat([image_grid_features, depth_grid_features], dim=1)
-            w_ia, w_im, w_da, w_dm = self.gate_network(combined).chunk(4, dim=1)
-
-            image_out = (image_grid_features + fusion_features) * w_ia \
-                      + (image_grid_features * fusion_features) * w_im
-            depth_out = (depth_grid_features + fusion_features) * w_da \
-                      + (depth_grid_features * fusion_features) * w_dm
-            return image_out, depth_out
-
-        return image_grid_features + fusion_features, depth_grid_features + fusion_features
+            raise NotImplementedError("weighted_fusion is incompatible with the asymmetric depth-queries-image branch")
+        
+        #TODO, symmetric depth-queries-image branch
+        return image_grid_features + fusion_features, depth_grid_features
 
 
 class CrossAdaptiveFusionModule(nn.Module):
@@ -185,6 +226,58 @@ class CrossAdaptiveFusionModule(nn.Module):
             image_features, depth_features = block(image_features, depth_features)
         return image_features, depth_features
 
+class DepthReconstructionDecoder(nn.Module):
+    # Cfg-driven U-Net decoder over fused taps. Routes inside the cfg reference
+    # backbone tap layer_idxs; create_modules resolves them via external_channels.
+    # forward pre-seeds a cache with the fused tap tensors, then dispatches each
+    # module by route exactly like YOLOP.forward.
+
+    def __init__(self, cfg_path: str, tap_channels: Dict[int, int]):
+        super().__init__()
+
+        module_defs = parse_model_config(cfg_path)
+        if module_defs[0]["type"] == "heads":
+            module_defs = module_defs[1:]
+
+        self._module_defs = module_defs
+        self.module_list, self.routes, self.module_names, _ = create_modules(
+            module_defs, external_channels=tap_channels,
+        )
+
+        last_c = self._last_out_channels(module_defs)
+        self.depth_pred = nn.Conv2d(last_c, 1, kernel_size=1)
+        self.aux_heads = nn.ModuleDict({
+            str(tap): nn.Conv2d(c, 1, kernel_size=1) for tap, c in tap_channels.items()
+        })
+
+    @staticmethod
+    def _last_out_channels(module_defs: list) -> int:
+        for d in reversed(module_defs):
+            if "out_channels" in d:
+                return int(d["out_channels"])
+        raise ValueError("depth_recon cfg has no out_channels declaration")
+
+    def forward(self, fused_by_tap: Dict[int, torch.Tensor]) -> Dict[str, torch.Tensor]:
+        cache = dict(fused_by_tap)
+
+        aux = {
+            f"tap_{tap}": torch.sigmoid(head(fused_by_tap[int(tap)]))
+            for tap, head in self.aux_heads.items()
+        }
+
+        x = None
+        for module, route, mdef in zip(self.module_list, self.routes, self._module_defs):
+            if len(route) == 1:
+                x = module(x if route[0] == -1 else cache[route[0]])
+            else:
+                tensors = [x if r == -1 else cache[r] for r in route]
+                x = torch.cat(tensors, dim=1)
+            cache[int(mdef["layer_idx"])] = x
+
+        full_res = torch.sigmoid(self.depth_pred(x))
+        return {"full_res": full_res, **aux}
+
+
 class TeacherFusion(nn.Module):
     def __init__(self, image_model: BaseTaskModel, depth_model: BaseTaskModel,
                  fusion_kwargs: dict):
@@ -200,6 +293,21 @@ class TeacherFusion(nn.Module):
             )
 
         self._initialize_fusion_block(fusion_kwargs)
+        self._initialize_depth_decoders(fusion_kwargs)
+
+    def _initialize_depth_decoders(self, fusion_kwargs: dict):
+        aux_cfg = fusion_kwargs.get("aux_depth_recon_cfg")
+        if not aux_cfg:
+            self.depth_decoders = None
+            return
+
+        self.depth_decoders = nn.ModuleDict({
+            task: DepthReconstructionDecoder(
+                cfg_path=aux_cfg,
+                tap_channels={tap: ch for tap, ch in layer_specs},
+            )
+            for task, layer_specs in self._backbone_intercepts.items()
+        })
 
     def _initialize_fusion_block(self, fusion_kwargs: dict):
         backbone_intercepts = fusion_kwargs.get("backbone_intercepts", {})
@@ -272,12 +380,33 @@ class TeacherFusion(nn.Module):
                 )
                 fused_for_head[tap_layer] = fused_image
 
-        return self.image_model.forward_task_head(
+        outputs = self.image_model.forward_task_head(
             fused_intercepts=fused_for_head,
             cache=image_cache,
             image_shape=image.shape,
             targets=targets,
         )
+
+        if self.depth_decoders is not None:
+            predictions: Dict[str, Dict[str, torch.Tensor]] = {}
+            for task, layer_specs in self._backbone_intercepts.items():
+                fused_by_tap = {tap: fused_for_head[tap] for tap, _ in layer_specs}
+                predictions[task] = self.depth_decoders[task](fused_by_tap)
+
+            outputs.depth_reconstruction = DepthReconstructionLossItems(
+                predictions=predictions,
+                target=depth.detach()[:, :1],
+            )
+
+            loss_fn = self.image_model.loss_function
+            if loss_fn is not None and "depth_reconstruction" in getattr(loss_fn, "task_losses", {}):
+                weighted, _ = loss_fn(
+                    {"depth_reconstruction": outputs.depth_reconstruction},
+                    device=depth.device,
+                )
+                outputs.depth_reconstruction_loss = weighted["depth_reconstruction"]
+
+        return outputs
 
     def get_active_tasks(self) -> str:
         """Delegate to image_model — the teacher's task structure mirrors it."""
@@ -311,10 +440,20 @@ class TeacherFusion(nn.Module):
             g["name"] = f"depth.{g.get('name', '?')}"
 
         fusion_group = {
-            "params":    list(self.fusion_blocks.parameters()),
-            "name":      "fusion_blocks",
-            "lr_scale":  optimizer_kwargs.get("fusion_lr_scale", 1.0),
+            "params": list(self.fusion_blocks.parameters()),
+            "name": "fusion_blocks",
+            "lr_scale": optimizer_kwargs.get("fusion_lr_scale", 1.0),
             "trainable": True,
         }
 
-        return image_groups + depth_groups + [fusion_group]
+        groups = image_groups + depth_groups + [fusion_group]
+
+        if self.depth_decoders is not None:
+            groups.append({
+                "params": list(self.depth_decoders.parameters()),
+                "name": "depth_decoders",
+                "lr_scale": optimizer_kwargs.get("depth_decoder_lr_scale", 1.0),
+                "trainable": True,
+            })
+
+        return groups

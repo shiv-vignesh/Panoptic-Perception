@@ -360,6 +360,9 @@ class Trainer:
         if outputs.lane_detection_loss is not None:
             loss += outputs.lane_detection_loss
 
+        if outputs.depth_reconstruction_loss is not None:
+            loss += outputs.depth_reconstruction_loss
+
         if self.has_enhancement:
             if hasattr(outputs, "defogging_loss") and outputs.defogging_loss is not None:
                 loss += self.training_args.lambda_defog * outputs.defogging_loss

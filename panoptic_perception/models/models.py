@@ -29,8 +29,13 @@ from panoptic_perception.models.model_factory import ModelFactory
 
 def create_modules(module_defs: list,
                    segmentation_head_idx: int = -1,
-                   lane_segmentation_head_idx: int = -1) -> Tuple[nn.ModuleList, list, list, list]:
+                   lane_segmentation_head_idx: int = -1,
+                   external_channels: dict = None) -> Tuple[nn.ModuleList, list, list, list]:
     """
+    TODO, migrate this code to a class that is generic to build any cfg module
+        - requires migrating common.py modules to registry pattern
+        - builder_pattern for create_modules?
+        
     Create modules from config definitions.
 
     Args:
@@ -46,6 +51,15 @@ def create_modules(module_defs: list,
     routes = []
     module_names = []
     output_channels = []  # Track the output channels for each layer
+
+    external_channels = external_channels or {}
+
+    def _ch_at(r):
+        if r == -1:
+            return output_channels[-1]
+        if r >= len(output_channels) and r in external_channels:
+            return external_channels[r]
+        return output_channels[r]
 
     for i, module_def in enumerate(module_defs):
         mtype = module_def["type"]
@@ -137,7 +151,7 @@ def create_modules(module_defs: list,
         elif mtype == "Concat":
             module = nn.Identity()
             # Compute total channels = sum of channels from each route layer
-            concat_ch = sum(output_channels[r] if r != -1 else output_channels[-1] for r in route)
+            concat_ch = sum(_ch_at(r) for r in route)
             output_channels.append(concat_ch)
 
         elif mtype == "ResidualAdd":
@@ -148,7 +162,7 @@ def create_modules(module_defs: list,
         elif mtype == "Detect":
             num_classes = int(module_def.get("num_classes"))
             anchors, _ = ast.literal_eval(module_def["anchors"])
-            channels = [output_channels[r] if r != -1 else output_channels[-1] for r in route]
+            channels = [_ch_at(r) for r in route]
 
             module = Detect(anchors, num_classes, channels)
 
@@ -158,7 +172,7 @@ def create_modules(module_defs: list,
         
         elif mtype == "DetectV8":
             num_classes = int(module_def.get("num_classes"))
-            channels = [output_channels[r] if r != -1 else output_channels[-1] for r in route]
+            channels = [_ch_at(r) for r in route]
             reg_max = int(module_def.get("reg_max", 16))
 
             module = DetectV8(num_classes, channels, reg_max=reg_max)
@@ -175,8 +189,8 @@ def create_modules(module_defs: list,
             sample_points = int(module_def.get("sample_points", 36))
             refine_layers = int(module_def.get("refine_layers", 3))
 
-            channels = [output_channels[r] if r != -1 else output_channels[-1] for r in route]
-            
+            channels = [_ch_at(r) for r in route]
+
             assert all([ch > 0 for ch in channels]), \
                 f'LaneDetect: invalid channel dims {channels} from route={route}. ' \
                 f'A routed layer may not have appended to output_channels (len={len(output_channels)})'
@@ -531,10 +545,12 @@ class YOLOP(BaseTaskModel):
 
         if module_defs[0]['type'] == 'heads':
             self.module_defs = module_defs[1:]
+        else:
+            self.module_defs = module_defs
 
-            self.segmentation_head_idx = int(module_defs[0].get('segmentation_head_idx', -1))
-            self.lane_segmentation_head_idx = int(module_defs[0].get('lane_segmentation_head_idx', -1))
-            self.detection_head_idx = int(module_defs[0].get('detection_head_idx', -1))
+        self.segmentation_head_idx = int(module_defs[0].get('segmentation_head_idx', -1))
+        self.lane_segmentation_head_idx = int(module_defs[0].get('lane_segmentation_head_idx', -1))
+        self.detection_head_idx = int(module_defs[0].get('detection_head_idx', -1))
 
         self.in_channels = int(self.module_defs[0].get('in_channels', 3))
         self.module_list, self.routes, self.module_names, self._cache_layer_idx = create_modules(

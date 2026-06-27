@@ -27,24 +27,16 @@ from panoptic_perception.scripts.train.train_v2 import (
 )
 
 
-def create_teacher_model(model_kwargs: dict, fusion_kwargs: dict, loss_kwargs: dict):
-    """
-    Builds two independent backbones from the same cfg, wraps them in a
-    TeacherFusion. The loss function lives on image_model only because the
-    teacher routes through image_model.forward_task_head; depth_model never
-    has forward() called (forward_backbone is the only entry point).
-    """
+def create_teacher_model(image_model_kwargs: dict, depth_model_kwargs: dict,
+                         fusion_kwargs: dict, loss_kwargs: dict):
     if not fusion_kwargs:
         raise ValueError("teacher training requires non-empty fusion_kwargs")
 
-    image_model, device = create_model(model_kwargs, loss_kwargs)
-    depth_model, _      = create_model(model_kwargs, loss_kwargs)
+    image_model, device = create_model(image_model_kwargs, loss_kwargs)
+    depth_model, _ = create_model(depth_model_kwargs, loss_kwargs)
 
-    assert image_model is not depth_model, "image_model and depth_model must be independent instances"
-
-    # Detach loss from depth_model — only image_model's task head computes loss.
-    # Leaving the extra MultiTaskLoss attached wastes memory (state buffers) and
-    # invites confusion if anyone ever calls depth_model.forward() directly.
+    # Depth backbone is forward_backbone-only; loss function attached here would
+    # be dead state and wastes optimizer/buffer memory.
     depth_model.loss_function = None
 
     teacher_model = TeacherFusion(
@@ -124,12 +116,15 @@ def main(args: argparse.Namespace):
     logger.log_new_line()
 
     # --- Model ---------------------------------------------------------------
-    if "model_kwargs" not in config or "fusion_kwargs" not in config:
-        raise ValueError("teacher config requires both model_kwargs and fusion_kwargs")
+    required = ("image_model_kwargs", "depth_model_kwargs", "fusion_kwargs")
+    missing = [k for k in required if k not in config]
+    if missing:
+        raise ValueError(f"teacher config missing required keys: {missing}")
 
     logger.log_message("=== Creating Teacher Model ===")
     model, device = create_teacher_model(
-        model_kwargs=config["model_kwargs"],
+        image_model_kwargs=config["image_model_kwargs"],
+        depth_model_kwargs=config["depth_model_kwargs"],
         fusion_kwargs=config["fusion_kwargs"],
         loss_kwargs=config.get("loss_kwargs"),
     )
@@ -144,8 +139,8 @@ def main(args: argparse.Namespace):
     logger.log_new_line()
 
     # --- Warm-start backbones from YOLOP checkpoints (optional) --------------
-    image_init = config["model_kwargs"].get("image_backbone_init")
-    depth_init = config["model_kwargs"].get("depth_backbone_init")
+    image_init = config["image_model_kwargs"].get("backbone_init")
+    depth_init = config["depth_model_kwargs"].get("backbone_init")
     if image_init:
         logger.log_message("=== Loading YOLOP checkpoints into backbones ===")
         load_yolop_into_backbones(
@@ -246,13 +241,15 @@ def main(args: argparse.Namespace):
         "model/depth_params":     sum(p.numel() for p in model.depth_model.parameters()),
         "model/fusion_params":    sum(p.numel() for p in model.fusion_blocks.parameters()),
         "model/active_tasks":     model.image_model.get_active_tasks(),
-        "model/cfg_path":         config["model_kwargs"].get("cfg_path"),
+        "model/image_cfg_path":   config["image_model_kwargs"].get("cfg_path"),
+        "model/depth_cfg_path":   config["depth_model_kwargs"].get("cfg_path"),
         "model/image_backbone_init": image_init,
         "model/depth_backbone_init": depth_init,
         "fusion/type":            config["fusion_kwargs"].get("fusion_type"),
         "fusion/num_blocks":      config["fusion_kwargs"].get("num_fusion_blocks"),
         "fusion/weighted":        config["fusion_kwargs"].get("weighted_fusion"),
         "fusion/intercepts":      str(config["fusion_kwargs"].get("backbone_intercepts")),
+        "fusion/aux_depth_recon_cfg": config["fusion_kwargs"].get("aux_depth_recon_cfg"),
         "optimizer/type":         optimizer.__class__.__name__ if optimizer else None,
         "optimizer/initial_lr":   config.get("optimizer_kwargs", {}).get("initial_lr"),
         "optimizer/weight_decay": config.get("optimizer_kwargs", {}).get("weight_decay"),
