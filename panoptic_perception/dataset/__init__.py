@@ -150,7 +150,11 @@ class DataLoaderBuilder:
         )
 
         if self._dataset_class != "foggy":
-            return {"val": self._make_loader(clean_dataset, batch_size, False, num_workers)}
+            return {"val": self._make_loader(
+                clean_dataset, batch_size, False,
+                collate_fn=BDDPreprocessor.collate_fn,
+                num_workers=num_workers,
+            )}
 
         foggy_kwargs = self._add_foggy_kwargs({**kwargs})
         foggy_dataset = FoggyBDD100KDataset(
