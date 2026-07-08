@@ -265,24 +265,62 @@ class Trainer:
             "train/epoch_time": epoch_training_time,
             "train/epoch": self.cur_epoch
         }, step=self.cur_epoch)
-            
+
+    def _build_targets(self, data_items: dict) -> dict:
+        """Slice of `data_items` the model consumes as `targets`. Override-friendly."""
+        return {
+            "drivable_area_seg": data_items.get("drivable_area_seg"),
+            "lane_seg":          data_items.get("segmentation_masks"),
+            "detections":        data_items["detections"],
+            "lanes_detections":  data_items.get("lanes_detections"),
+            "lane_seg_masks":    data_items.get("lane_seg_masks"),
+            "clean_images":      data_items.get("clean_images"),
+        }
+
+    def _forward_model(self, data_items: dict) -> PanopticModelOutputs:
+        """Single-tensor forward. Returns a PanopticModelOutputs from whichever model self.model resolves to."""
+        return self.model(
+            data_items["images"],
+            targets=self._build_targets(data_items),
+        )
+
     def _train_one_step(self, data_items:dict) -> PanopticModelOutputs:
         
         for k, v in data_items.items():
             if torch.is_tensor(v):
                 data_items[k] = v.to(self.device)
-                
-        outputs = self.model(
-            data_items["images"],
-            targets={
-                "drivable_area_seg": data_items.get("drivable_area_seg"),
-                "lane_seg": data_items.get("segmentation_masks"),
-                "detections": data_items["detections"],
-                "lanes_detections": data_items.get("lanes_detections"),
-                "lane_seg_masks": data_items.get("lane_seg_masks"),
-                "clean_images": data_items.get("clean_images")
+
+        try:
+            outputs = self._forward_model(data_items)
+        except ValueError as e:
+            if "model produced no outputs" not in str(e):
+                raise
+            paths = data_items.get("image_paths", [])
+            present = {
+                k: (None if data_items.get(k) is None
+                    else (tuple(data_items[k].shape) if torch.is_tensor(data_items[k])
+                          else "non-tensor"))
+                for k in ("detections", "drivable_area_seg", "segmentation_masks",
+                          "lanes_detections", "lane_seg_masks")
             }
-        )
+            self.logger.log_message(
+                f"[skip-batch] iter {getattr(self, 'train_batch_idx', '?')}: "
+                f"empty loss_items — skipping. paths={paths} targets={present}"
+            )
+            
+            return torch.zeros(1, device=self.device), None
+
+        # outputs = self.model(
+        #     data_items["images"],
+        #     targets={
+        #         "drivable_area_seg": data_items.get("drivable_area_seg"),
+        #         "lane_seg": data_items.get("segmentation_masks"),
+        #         "detections": data_items["detections"],
+        #         "lanes_detections": data_items.get("lanes_detections"),
+        #         "lane_seg_masks": data_items.get("lane_seg_masks"),
+        #         "clean_images": data_items.get("clean_images")
+        #     }
+        # )
 
         loss = torch.zeros(1, device=self.device)
 
@@ -330,19 +368,26 @@ class Trainer:
                 if torch.is_tensor(v):
                     data_items[k] = v.to(self.device)
 
-            # Forward pass
-            with torch.no_grad():
-                outputs = self.model(
-                    data_items["images"],
-                    targets={
-                        "drivable_area_seg": data_items.get("drivable_area_seg"),
-                        "lane_seg": data_items.get("segmentation_masks"),
-                        "detections": data_items["detections"],
-                        "lanes_detections": data_items.get("lanes_detections"),
-                        "lane_seg_masks": data_items.get("lane_seg_masks"),
-                        "clean_images": data_items.get("clean_images")
-                    }
+            # Forward pass — same skip-batch diagnostic as _train_one_step.
+            try:
+                with torch.no_grad():
+                    outputs = self._forward_model(data_items)
+            except ValueError as e:
+                if "model produced no outputs" not in str(e):
+                    raise
+                paths = data_items.get("image_paths", [])
+                present = {
+                    k: (None if data_items.get(k) is None
+                        else (tuple(data_items[k].shape) if torch.is_tensor(data_items[k])
+                              else "non-tensor"))
+                    for k in ("detections", "drivable_area_seg", "segmentation_masks",
+                              "lanes_detections", "lane_seg_masks")
+                }
+                self.logger.log_message(
+                    f"[skip-batch] eval iter {batch_idx} ({metric_prefix}): "
+                    f"empty loss_items — skipping. paths={paths} targets={present}"
                 )
+                continue
 
             self.eval_batch_idx = batch_idx
             self.eval_batch_ctx.cur_eval_model_outputs = outputs
