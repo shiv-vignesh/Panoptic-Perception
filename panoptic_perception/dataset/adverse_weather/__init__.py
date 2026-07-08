@@ -8,11 +8,6 @@ This package focuses on:
 5) Analysis hooks for synthetic-vs-real comparison
 """
 
-from .analysis import (
-    compute_distribution_features,
-    summarize_feature_distributions,
-    visualize_random_triplets,
-)
 from .augmentors import (
     ApplyOrder,
     FogParameters,
@@ -38,6 +33,20 @@ from .depth_estimators import (
     TensorRTDepthEstimator,
     TorchCompiledDepthEstimator,
 )
+
+_ANALYSIS_EXPORTS = {
+    "compute_distribution_features",
+    "summarize_feature_distributions",
+    "visualize_random_triplets",
+}
+
+
+def __getattr__(name):
+    if name in _ANALYSIS_EXPORTS:
+        from . import analysis
+        return getattr(analysis, name)
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+
 
 __all__ = [
     "DEFAULT_CONFIG_PATH",

@@ -63,7 +63,7 @@ class DataLoaderBuilder:
                 device=depth_device, normalization_epsilon=1e-8,
             )
 
-        if depth_backend != "heuristic":
+        if depth_backend != "heuristic" and depth_backend != "cached":
             if logger:
                 logger.log_message(
                     f"[Dataloader] depth_backend={depth_backend} requires CUDA "

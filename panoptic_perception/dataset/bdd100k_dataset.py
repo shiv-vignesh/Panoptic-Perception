@@ -24,7 +24,6 @@ from panoptic_perception.dataset.augmentations import (
 )
 from panoptic_perception.dataset.mosaic_augmentation import mosaic_augmentation
 from panoptic_perception.dataset.adverse_weather import (
-    apply_nighttime_fog,
     FogParameters, SyntheticFogGenerator, SyntheticLowLightGenerator,
     HeuristicDepthEstimator, DepthAnythingEstimator, ONNXDepthEstimator,
     RadialDistance
@@ -115,8 +114,8 @@ class BDDPreprocessor:
         for frames in data["frames"]:
             for item in frames["objects"]:
                 if "box2d" in item:
-                    bbox = Bbox(item["box2d"]["x1"], item["box2d"]["y1"], 
-                               item["box2d"]["x2"], item["box2d"]["y2"])
+                    bbox = Bbox(item["box2d"]["x1"], item["box2d"]["y1"],
+                                item["box2d"]["x2"], item["box2d"]["y2"])
                     
                     if bbox.valid_bbox:
                         if filter_by_area:
@@ -603,10 +602,18 @@ class FoggyBDDPreprocessor(BDDPreprocessor):
 
         self.fog_betas = self.adverse_params.get("fog_betas", [0.010, 0.020, 0.035])
         self.darkness_gammas = self.adverse_params.get("darkness_gammas", [1.5, 2.0, 3.5])
+        self.apply_darkness = self.adverse_params.get("apply_darkness", True)
         self.atmospheric_light_quantile = self.adverse_params.get("atmospheric_light_quantile", 0.9)
         self.atmospheric_light_min_pixels = self.adverse_params.get("atmospheric_light_min_pixels", 10)
         self.atmospheric_light = self.adverse_params.get("atmospheric_light", None)
         self.max_depth_meters = self.adverse_params.get("max_depth_meters", 150.0)
+        self.fog_mode = self.adverse_params.get("fog_mode", "depth")
+        self.homogeneous_depth = float(self.adverse_params.get("homogeneous_depth", 0.723))
+
+        if self.fog_mode not in ("depth", "homogeneous"):
+            raise ValueError(f"Unsupported fog_mode: {self.fog_mode}")
+        if not 0.0 <= self.homogeneous_depth <= 1.0:
+            raise ValueError("homogeneous_depth must be in [0, 1]")
 
         self.apply_fog_prob = apply_fog_prob
 
@@ -627,11 +634,13 @@ class FoggyBDDPreprocessor(BDDPreprocessor):
         self.fog_generator = SyntheticFogGenerator(
             depth_estimator=self.depth_estimator
         )
-        self.lowlight_generator = SyntheticLowLightGenerator(
-            gamma_min=min(self.darkness_gammas),
-            gamma_max=max(self.darkness_gammas),
-            gamma_min_threshold=1.0,
-        )
+        self.lowlight_generator = None
+        if self.apply_darkness:
+            self.lowlight_generator = SyntheticLowLightGenerator(
+                gamma_min=min(self.darkness_gammas),
+                gamma_max=max(self.darkness_gammas),
+                gamma_min_threshold=1.0,
+            )
 
     def _select_degradation(self, scene_attributes, beta=None, gamma=None):
         """Adjust or skip degradation based on scene context."""
@@ -661,6 +670,8 @@ class FoggyBDDPreprocessor(BDDPreprocessor):
             return beta
         
         def sample_gamma():
+            if not self.apply_darkness:
+                return None
             return np.random.uniform(self.lowlight_generator.gamma_min, self.lowlight_generator.gamma_max)
 
         weather = scene_attributes.get("weather", "undefined") if scene_attributes else "undefined"
@@ -690,6 +701,7 @@ class FoggyBDDPreprocessor(BDDPreprocessor):
 
     def _apply_degradation(self, image:np.ndarray, depth_map_arr:np.ndarray, beta, gamma):
         """Apply fog and/or darkness to the raw image. Returns degraded uint8 RGB."""
+        use_spatial_beta = self.fog_mode == "depth"
         if beta is not None and gamma is not None:
             params = FogParameters(
                 beta=beta,
@@ -698,14 +710,12 @@ class FoggyBDDPreprocessor(BDDPreprocessor):
                 atmospheric_light_min_pixels=self.atmospheric_light_min_pixels,
                 atmospheric_light=np.array(self.atmospheric_light) if self.atmospheric_light is not None else None,
             )
-            image, _, _ = apply_nighttime_fog(
+            image = self.lowlight_generator.apply(image, gamma)
+            image, _, _ = self.fog_generator.generate(
                 image_rgb=image,
-                fog_generator=self.fog_generator,
-                fog_params=params,
-                gamma_generator=self.lowlight_generator,
-                gamma=gamma,
-                apply_order="dark_then_fog",
+                params=params,
                 precomputed_depth=depth_map_arr,
+                use_spatial_beta=use_spatial_beta,
             )
         elif beta is not None:
             params = FogParameters(
@@ -719,6 +729,7 @@ class FoggyBDDPreprocessor(BDDPreprocessor):
                 image_rgb=image,
                 params=params,
                 precomputed_depth=depth_map_arr,
+                use_spatial_beta=use_spatial_beta,
             )
         elif gamma is not None:
             image = self.lowlight_generator.apply(image, gamma)
@@ -832,9 +843,10 @@ class FoggyBDDPreprocessor(BDDPreprocessor):
 
         # Optional masks/targets stay on CPU — trainer handles device placement,
         # matching the behavior of `collate_fn`.
-        def _stack_optional(items):
+        def _stack_optional(items, dtype=None):
             present = [torch.as_tensor(x) for x in items if x is not None]
-            return torch.stack(present, dim=0) if present else None
+            stacked = torch.stack(present, dim=0) if present else None
+            return stacked.to(dtype=dtype) if stacked is not None and dtype is not None else stacked
 
         return {
             "images":             degraded_full,                                # (B, 3, H, W) float32 in [0,1], on depth device
@@ -842,8 +854,8 @@ class FoggyBDDPreprocessor(BDDPreprocessor):
             "depth_maps":         depth_full,                                   # (B, H, W)    float32, zeros at non-fogged positions
             "fog_mask":           torch.tensor(fog_mask, dtype=torch.bool),     # (B,)         bool, True where fog applied
             "detections":         batch_targets_tensor,                        # (N_total, 6) [batch_idx, cls, cx, cy, w, h] or None
-            "segmentation_masks": _stack_optional(segs),                        # (B, H, W)    long or None
-            "drivable_area_seg":  _stack_optional(drivables),                   # (B, H, W)    long or None
+            "segmentation_masks": _stack_optional(segs, dtype=torch.long),
+            "drivable_area_seg":  _stack_optional(drivables, dtype=torch.long),
             "lanes_detections":   _stack_optional(lane_targets_list),           # (B, ...) or None
             "lane_seg_masks":     _stack_optional(lane_seg_masks),              # (B, H, W) or None
             "lane_categories":    _stack_optional(lane_categories),             # (B, ...) or None
@@ -852,6 +864,8 @@ class FoggyBDDPreprocessor(BDDPreprocessor):
         }
 
     def collate_fn(self, batch):
+        if batch and "depth_map" in batch[0]:
+            return self._collate_cached_depth(batch)
 
         images_rgb : List[np.ndarray] = []
         image_paths : List[str] = []
@@ -928,9 +942,10 @@ class FoggyBDDPreprocessor(BDDPreprocessor):
             batch_targets_tensor[:, 2:4] = batch_targets_tensor[:, 2:4].clamp(0.0, 1.0)
             batch_targets_tensor[:, 4:6] = batch_targets_tensor[:, 4:6].clamp(0.001, 1.0)
 
-        def _stack_optional(items):
+        def _stack_optional(items, dtype=None):
             present = [torch.as_tensor(x) for x in items if x is not None]
-            return torch.stack(present, dim=0) if present else None
+            stacked = torch.stack(present, dim=0) if present else None
+            return stacked.to(dtype=dtype) if stacked is not None and dtype is not None else stacked
 
         return {
             "images":             batch_images_tensor,                          # (B, 3, H, W) float32 in [0,1], CPU
@@ -938,13 +953,86 @@ class FoggyBDDPreprocessor(BDDPreprocessor):
             "depth_maps":         batch_depth_tensor,                           # (B, H, W)    float32, zeros at non-fogged positions, CPU
             "fog_mask":           torch.tensor(fog_mask, dtype=torch.bool),     # (B,)         bool, True where fog applied
             "detections":         batch_targets_tensor,                        # (N_total, 6) [batch_idx, cls, cx, cy, w, h] or None
-            "segmentation_masks": _stack_optional(segs),                        # (B, H, W)    long or None
-            "drivable_area_seg":  _stack_optional(drivables),                   # (B, H, W)    long or None
+            "segmentation_masks": _stack_optional(segs, dtype=torch.long),
+            "drivable_area_seg":  _stack_optional(drivables, dtype=torch.long),
             "lanes_detections":   _stack_optional(lane_targets_list),           # (B, ...) or None
             "lane_seg_masks":     _stack_optional(lane_seg_masks),              # (B, H, W) or None
             "lane_categories":    _stack_optional(lane_categories),             # (B, ...) or None
             "image_paths":        image_paths,                                  # list[str], len B
             "scene_attributes":   scene_attrs,                                  # list[dict], len B
+        }
+
+    def _collate_cached_depth(self, batch):
+        images_rgb : List[np.ndarray] = []
+        clean_rgb : List[np.ndarray] = []
+        depth_maps : List[np.ndarray] = []
+        fog_mask : List[bool] = []
+        image_paths : List[str] = []
+        scene_attrs : List[dict] = []
+        segs : List = []
+        drivables : List = []
+        det_targets : List = []
+        lane_targets_list : List = []
+        lane_categories : List = []
+        lane_seg_masks : List = []
+
+        for s in batch:
+            images_rgb.append(s["image"])
+            clean_rgb.append(s.get("clean_image", s["image"]))
+            depth_maps.append(s["depth_map"])
+            fog_mask.append(bool(s.get("fog_applied", False)))
+            image_paths.append(s["image_path"])
+            scene_attrs.append(s["scene_attributes"])
+            segs.append(s.get("segmentation_mask"))
+            drivables.append(s.get("drivable_mask"))
+            det_targets.append(s.get("detection_targets"))
+            lane_targets_list.append(s.get("lane_targets"))
+            lane_categories.append(s.get("lane_categories"))
+            lane_seg_masks.append(s.get("lane_seg_mask"))
+
+        def _to_chw_tensor(img_uint8_rgb):
+            return self.normalize_tensor(
+                torch.from_numpy(img_uint8_rgb).permute(2, 0, 1).contiguous()
+            )
+
+        batch_images_tensor = torch.stack([
+            _to_chw_tensor(img) for img in images_rgb
+        ], dim=0)
+        batch_clean_images_tensor = torch.stack([
+            _to_chw_tensor(img) for img in clean_rgb
+        ], dim=0)
+        batch_depth_tensor = torch.from_numpy(np.stack(depth_maps)).float()
+
+        det_rows : List[torch.Tensor] = []
+        for batch_idx, det in enumerate(det_targets):
+            if det is not None and len(det) > 0:
+                det_t = torch.as_tensor(det, dtype=torch.float32)
+                prefix = torch.full((det_t.shape[0], 1), batch_idx, dtype=det_t.dtype)
+                det_rows.append(torch.cat([prefix, det_t], dim=1))
+
+        batch_targets_tensor = torch.cat(det_rows, dim=0) if det_rows else None
+        if batch_targets_tensor is not None:
+            batch_targets_tensor[:, 2:4] = batch_targets_tensor[:, 2:4].clamp(0.0, 1.0)
+            batch_targets_tensor[:, 4:6] = batch_targets_tensor[:, 4:6].clamp(0.001, 1.0)
+
+        def _stack_optional(items, dtype=None):
+            present = [torch.as_tensor(x) for x in items if x is not None]
+            stacked = torch.stack(present, dim=0) if present else None
+            return stacked.to(dtype=dtype) if stacked is not None and dtype is not None else stacked
+
+        return {
+            "images":             batch_images_tensor,
+            "clean_images":       batch_clean_images_tensor,
+            "depth_maps":         batch_depth_tensor,
+            "fog_mask":           torch.tensor(fog_mask, dtype=torch.bool),
+            "detections":         batch_targets_tensor,
+            "segmentation_masks": _stack_optional(segs, dtype=torch.long),
+            "drivable_area_seg":  _stack_optional(drivables, dtype=torch.long),
+            "lanes_detections":   _stack_optional(lane_targets_list),
+            "lane_seg_masks":     _stack_optional(lane_seg_masks),
+            "lane_categories":    _stack_optional(lane_categories),
+            "image_paths":        image_paths,
+            "scene_attributes":   scene_attrs,
         }
 
 class FoggyBDD100KDataset(BDD100KDataset):
@@ -959,6 +1047,13 @@ class FoggyBDD100KDataset(BDD100KDataset):
             ):
 
         super().__init__(dataset_kwargs, dataset_type, perform_augmentation, mode, merge_alt2driv)
+        self.depth_map_dir = dataset_kwargs.get("depth_map_dir")
+        self.strict_map = strict_map
+        self.fog_mode = dataset_kwargs.get("adverse_params", {}).get("fog_mode", "depth")
+        self.use_cached_depth = (
+            self.fog_mode == "depth"
+            and dataset_kwargs.get("adverse_params", {}).get("depth_backend") == "cached"
+        )
 
         self.preprocessor = self._init_preprocessor(
             preprocessor_kwargs=dataset_kwargs.get("preprocessor_kwargs", {}),
@@ -979,9 +1074,91 @@ class FoggyBDD100KDataset(BDD100KDataset):
             depth_estimator=depth_estimator
         )
 
+    def _load_cached_depth(self, image_path: str):
+        if not self.depth_map_dir:
+            if self.strict_map:
+                raise ValueError("depth_map_dir is required when depth_backend='cached'.")
+            return None
+
+        image_id = os.path.splitext(os.path.basename(image_path))[0]
+        candidates = [
+            os.path.join(self.depth_map_dir, self.dataset_type, f"{image_id}.png"),
+            os.path.join(self.depth_map_dir, self.dataset_type, f"{image_id}.npy"),
+        ]
+
+        depth_path = next((path for path in candidates if os.path.exists(path)), None)
+        if depth_path is None:
+            if self.strict_map:
+                raise FileNotFoundError(
+                    f"Cached depth not found for {image_id}; checked {candidates}"
+                )
+            return None
+
+        if depth_path.endswith(".npy"):
+            depth = np.load(depth_path).astype(np.float32)
+        else:
+            depth = cv2.imread(depth_path, cv2.IMREAD_UNCHANGED)
+            if depth is None:
+                raise ValueError(f"Failed to read cached depth map: {depth_path}")
+            depth = depth.astype(np.float32)
+            if depth.max() > 1.0:
+                depth = depth / np.iinfo(np.uint16).max
+
+        return np.clip(depth, 0.0, 1.0)
+
+    def _maybe_apply_cached_fog(self, frame: FrameData) -> Tuple[FrameData, np.ndarray, bool]:
+        apply_fog = True if self.mode != DatasetMode.TRAIN else random.random() < self.preprocessor.apply_fog_prob
+        depth = self._load_cached_depth(frame.image_path)
+
+        if depth is None:
+            depth = np.zeros(frame.image.shape[:2], dtype=np.float32)
+            frame.clean_image = frame.image.copy()
+            frame.depth_map = depth
+            return frame, depth, False
+
+        frame.clean_image = frame.image.copy()
+        frame.depth_map = depth.astype(np.float32)
+
+        if apply_fog:
+            scene_attributes = (
+                frame.frame_detections.attributes
+                if frame.frame_detections is not None else {}
+            )
+            beta, gamma = self.preprocessor._select_degradation(scene_attributes)
+            frame.image = self.preprocessor._apply_degradation(frame.image, depth, beta, gamma)
+
+        return frame, depth.astype(np.float32), apply_fog
+
+    def _maybe_apply_homogeneous_fog(self, frame: FrameData) -> Tuple[FrameData, np.ndarray, bool]:
+        apply_fog = True if self.mode != DatasetMode.TRAIN else random.random() < self.preprocessor.apply_fog_prob
+        depth = np.full(
+            frame.image.shape[:2],
+            self.preprocessor.homogeneous_depth,
+            dtype=np.float32,
+        )
+        frame.clean_image = frame.image.copy()
+        frame.depth_map = depth
+
+        if apply_fog:
+            scene_attributes = (
+                frame.frame_detections.attributes
+                if frame.frame_detections is not None else {}
+            )
+            beta, gamma = self.preprocessor._select_degradation(scene_attributes)
+            frame.image = self.preprocessor._apply_degradation(frame.image, depth, beta, gamma)
+
+        return frame, depth, apply_fog
+
     def prepare_training_sample(self, index):
         
         frame = self._load_raw(index)
+        depth = None
+        fog_applied = False
+
+        if self.fog_mode == "homogeneous":
+            frame, depth, fog_applied = self._maybe_apply_homogeneous_fog(frame)
+        elif self.use_cached_depth:
+            frame, depth, fog_applied = self._maybe_apply_cached_fog(frame)
 
         # Only perform standard augmentation
         if self.perform_augmentation:
@@ -1014,8 +1191,9 @@ class FoggyBDD100KDataset(BDD100KDataset):
         # np.array: seg, drivable and frame_labels_array
 
         # perform tensor conversion, depth estimation inside collate_fn
-        return {
+        sample = {
             "image":             frame.image,
+            "clean_image":       frame.clean_image,
             "segmentation_mask": frame.seg,
             "drivable_mask":     frame.drivable,
             "detection_targets": frame.labels_array(),
@@ -1026,3 +1204,9 @@ class FoggyBDD100KDataset(BDD100KDataset):
             "scene_attributes":  scene_attributes,
             "mode":self.mode
         }
+
+        if self.use_cached_depth or self.fog_mode == "homogeneous":
+            sample["depth_map"] = frame.depth_map.astype(np.float32)
+            sample["fog_applied"] = fog_applied
+
+        return sample

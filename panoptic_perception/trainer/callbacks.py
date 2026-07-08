@@ -123,7 +123,7 @@ class CheckpointCallback(TrainerCallback):
         trainer.logger.log_message(f"Unexpected : {len(unexpected)} keys")
         trainer.logger.log_new_line()
 
-        if "epoch" in checkpoint:        
+        if trainer.training_args.resume_training_state and "epoch" in checkpoint:
             trainer.cur_epoch = checkpoint["epoch"] + 1
 
         if trainer.training_args.reload_optimizer:
@@ -410,11 +410,14 @@ class EvalMetricsCallback(TrainerCallback):
                 else:
                     self.dets_by_image[self.global_image_idx] = None
                 
-                mask = trainer.eval_batch_ctx.cur_eval_gt_detections[:, 0] == image_idx
-                img_targets = trainer.eval_batch_ctx.cur_eval_gt_detections[mask]
+                gt_detections = trainer.eval_batch_ctx.cur_eval_gt_detections
+                img_targets = None
+                if gt_detections is not None:
+                    mask = gt_detections[:, 0] == image_idx
+                    img_targets = gt_detections[mask]
                 gts = None
                 
-                if img_targets.shape[0] > 0:
+                if img_targets is not None and img_targets.shape[0] > 0:
                     boxes_xywh = img_targets[:, 2:6]
                     boxes_xywh[:, [0,2]] *= trainer.eval_batch_ctx.cur_eval_image_w
                     boxes_xywh[:, [1,3]] *= trainer.eval_batch_ctx.cur_eval_image_h
