@@ -86,6 +86,8 @@ class FrameData:
     image: np.array
     image_path: str
 
+    clean_image: Optional[np.ndarray] = None
+    depth_map: Optional[np.ndarray] = None
     seg: Optional[np.ndarray] = None
     drivable: Optional[np.ndarray] = None
 

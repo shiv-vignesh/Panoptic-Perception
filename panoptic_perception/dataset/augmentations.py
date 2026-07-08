@@ -17,6 +17,7 @@ from panoptic_perception.dataset.types import FrameData
 
 def _random_perspective_arrays(
     img, seg, drivable, labels, lane_polys=None,
+    clean_img=None, depth_map=None,
     degrees=10, translate=0.1, scale=0.1, shear=10
 ):
     h, w = img.shape[:2]
@@ -43,6 +44,12 @@ def _random_perspective_arrays(
 
     # --- WARP IMAGE/MASKS ---
     img = cv2.warpAffine(img, M[:2], (w, h), borderValue=114)
+    if clean_img is not None:
+        clean_img = cv2.warpAffine(clean_img, M[:2], (w, h), borderValue=114)
+    if depth_map is not None:
+        depth_map = cv2.warpAffine(
+            depth_map, M[:2], (w, h), flags=cv2.INTER_LINEAR, borderValue=0
+        )
     if seg is not None:
         seg = cv2.warpAffine(seg, M[:2], (w, h), flags=cv2.INTER_NEAREST)
     if drivable is not None:
@@ -100,12 +107,17 @@ def _random_perspective_arrays(
                 })
         lane_polys = new_lane_polys
 
-    return img, seg, drivable, labels, lane_polys
+    return img, clean_img, depth_map, seg, drivable, labels, lane_polys
 
 
-def _flip_horizontal_arrays(img, seg, drivable, labels, lane_polys=None):
+def _flip_horizontal_arrays(img, seg, drivable, labels, lane_polys=None,
+                            clean_img=None, depth_map=None):
     w = img.shape[1]
     img = np.fliplr(img).copy()
+    if clean_img is not None:
+        clean_img = np.fliplr(clean_img).copy()
+    if depth_map is not None:
+        depth_map = np.fliplr(depth_map).copy()
     if seg is not None:
         seg = np.fliplr(seg).copy()
     if drivable is not None:
@@ -115,11 +127,12 @@ def _flip_horizontal_arrays(img, seg, drivable, labels, lane_polys=None):
     if lane_polys is not None:
         for poly in lane_polys:
             poly["points"][:, 0] = w - 1 - poly["points"][:, 0]
-    return img, seg, drivable, labels, lane_polys
+    return img, clean_img, depth_map, seg, drivable, labels, lane_polys
 
 
 def _letterbox_arrays(img, seg, drivable, labels, lane_polys=None,
-                      new_shape=(640, 640), color=(114, 114, 114)):
+                      new_shape=(640, 640), color=(114, 114, 114),
+                      clean_img=None, depth_map=None):
     h0, w0 = img.shape[:2]
     new_h, new_w = new_shape
 
@@ -135,6 +148,20 @@ def _letterbox_arrays(img, seg, drivable, labels, lane_polys=None,
     left, right = int(round(dw - 0.1)), int(round(dw + 0.1))
     img = cv2.copyMakeBorder(img, top, bottom, left, right,
                              cv2.BORDER_CONSTANT, value=color)
+
+    if clean_img is not None:
+        clean_img = cv2.resize(clean_img, new_unpad, interpolation=cv2.INTER_LINEAR)
+        clean_img = cv2.copyMakeBorder(
+            clean_img, top, bottom, left, right,
+            cv2.BORDER_CONSTANT, value=color,
+        )
+
+    if depth_map is not None:
+        depth_map = cv2.resize(depth_map, new_unpad, interpolation=cv2.INTER_LINEAR)
+        depth_map = cv2.copyMakeBorder(
+            depth_map, top, bottom, left, right,
+            cv2.BORDER_CONSTANT, value=0,
+        )
 
     if seg is not None:
         seg = cv2.resize(seg, new_unpad, interpolation=cv2.INTER_NEAREST)
@@ -168,7 +195,7 @@ def _letterbox_arrays(img, seg, drivable, labels, lane_polys=None,
             poly["points"][:, 0] = poly["points"][:, 0] * r + left
             poly["points"][:, 1] = poly["points"][:, 1] * r + top
 
-    return img, seg, drivable, labels, lane_polys
+    return img, clean_img, depth_map, seg, drivable, labels, lane_polys
 
 
 def _mixup_arrays(img1, labels1, img2, labels2, seg1=None, seg2=None,
@@ -275,12 +302,15 @@ def random_perspective(frame: FrameData, degrees=10, translate=0.1,
     labels = frame.labels_array()
     lane_polys = frame.lane_polys_legacy()
 
-    img, seg, drivable, labels, lane_polys = _random_perspective_arrays(
+    img, clean_img, depth_map, seg, drivable, labels, lane_polys = _random_perspective_arrays(
         frame.image, frame.seg, frame.drivable, labels, lane_polys=lane_polys,
+        clean_img=frame.clean_image, depth_map=frame.depth_map,
         degrees=degrees, translate=translate, scale=scale, shear=shear,
     )
 
     frame.image = img
+    frame.clean_image = clean_img
+    frame.depth_map = depth_map
     frame.seg = seg
     frame.drivable = drivable
     frame.set_labels_array(labels)
@@ -296,19 +326,23 @@ def augment_hsv(frame: FrameData, hgain=0.5, sgain=0.5, vgain=0.5) -> FrameData:
 
     r = np.random.uniform(-1, 1, 3) * [hgain, sgain, vgain] + 1
 
-    hue, sat, val = cv2.split(cv2.cvtColor(img, cv2.COLOR_BGR2HSV))
-    dtype = img.dtype
-
     x = np.arange(0, 256, dtype=r.dtype)
-    lut_hue = ((x * r[0]) % 180).astype(dtype)
-    lut_sat = np.clip(x * r[1], 0, 255).astype(dtype)
-    lut_val = np.clip(x * r[2], 0, 255).astype(dtype)
 
-    img_hsv = cv2.merge((cv2.LUT(hue, lut_hue),
-                         cv2.LUT(sat, lut_sat),
-                         cv2.LUT(val, lut_val)))
+    def apply_luts(target):
+        hue, sat, val = cv2.split(cv2.cvtColor(target, cv2.COLOR_BGR2HSV))
+        lut_hue = ((x * r[0]) % 180).astype(target.dtype)
+        lut_sat = np.clip(x * r[1], 0, 255).astype(target.dtype)
+        lut_val = np.clip(x * r[2], 0, 255).astype(target.dtype)
+        target_hsv = cv2.merge((
+            cv2.LUT(hue, lut_hue),
+            cv2.LUT(sat, lut_sat),
+            cv2.LUT(val, lut_val),
+        ))
+        cv2.cvtColor(target_hsv, cv2.COLOR_HSV2BGR, dst=target)
 
-    cv2.cvtColor(img_hsv, cv2.COLOR_HSV2BGR, dst=img)
+    apply_luts(img)
+    if frame.clean_image is not None:
+        apply_luts(frame.clean_image)
     return frame
 
 
@@ -317,11 +351,14 @@ def flip_horizontal(frame: FrameData) -> FrameData:
     labels = frame.labels_array()
     lane_polys = frame.lane_polys_legacy()
 
-    img, seg, drivable, labels, lane_polys = _flip_horizontal_arrays(
+    img, clean_img, depth_map, seg, drivable, labels, lane_polys = _flip_horizontal_arrays(
         frame.image, frame.seg, frame.drivable, labels, lane_polys=lane_polys,
+        clean_img=frame.clean_image, depth_map=frame.depth_map,
     )
 
     frame.image = img
+    frame.clean_image = clean_img
+    frame.depth_map = depth_map
     frame.seg = seg
     frame.drivable = drivable
     frame.set_labels_array(labels)
@@ -336,12 +373,15 @@ def letterbox_with_masks(frame: FrameData,
     labels = frame.labels_array()
     lane_polys = frame.lane_polys_legacy()
 
-    img, seg, drivable, labels, lane_polys = _letterbox_arrays(
+    img, clean_img, depth_map, seg, drivable, labels, lane_polys = _letterbox_arrays(
         frame.image, frame.seg, frame.drivable, labels,
         lane_polys=lane_polys, new_shape=new_shape, color=color,
+        clean_img=frame.clean_image, depth_map=frame.depth_map,
     )
 
     frame.image = img
+    frame.clean_image = clean_img
+    frame.depth_map = depth_map
     frame.seg = seg
     frame.drivable = drivable
     frame.set_labels_array(labels)
@@ -366,6 +406,13 @@ def apply_salt_pepper(frame: FrameData, salt_prob=0.01,
         noisy_img[pepper_mask] = 0
 
     frame.image = noisy_img
+    if frame.clean_image is not None:
+        clean_noisy = frame.clean_image.copy()
+        if salt_prob > 0:
+            clean_noisy[salt_mask] = 255
+        if pepper_prob > 0:
+            clean_noisy[pepper_mask] = 0
+        frame.clean_image = clean_noisy
     return frame
 
 

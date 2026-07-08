@@ -24,7 +24,6 @@ from panoptic_perception.dataset.augmentations import (
 )
 from panoptic_perception.dataset.mosaic_augmentation import mosaic_augmentation
 from panoptic_perception.dataset.adverse_weather import (
-    apply_nighttime_fog,
     FogParameters, SyntheticFogGenerator, SyntheticLowLightGenerator,
     HeuristicDepthEstimator, DepthAnythingEstimator, ONNXDepthEstimator,
     RadialDistance
@@ -608,6 +607,13 @@ class FoggyBDDPreprocessor(BDDPreprocessor):
         self.atmospheric_light_min_pixels = self.adverse_params.get("atmospheric_light_min_pixels", 10)
         self.atmospheric_light = self.adverse_params.get("atmospheric_light", None)
         self.max_depth_meters = self.adverse_params.get("max_depth_meters", 150.0)
+        self.fog_mode = self.adverse_params.get("fog_mode", "depth")
+        self.homogeneous_depth = float(self.adverse_params.get("homogeneous_depth", 0.723))
+
+        if self.fog_mode not in ("depth", "homogeneous"):
+            raise ValueError(f"Unsupported fog_mode: {self.fog_mode}")
+        if not 0.0 <= self.homogeneous_depth <= 1.0:
+            raise ValueError("homogeneous_depth must be in [0, 1]")
 
         self.apply_fog_prob = apply_fog_prob
 
@@ -695,6 +701,7 @@ class FoggyBDDPreprocessor(BDDPreprocessor):
 
     def _apply_degradation(self, image:np.ndarray, depth_map_arr:np.ndarray, beta, gamma):
         """Apply fog and/or darkness to the raw image. Returns degraded uint8 RGB."""
+        use_spatial_beta = self.fog_mode == "depth"
         if beta is not None and gamma is not None:
             params = FogParameters(
                 beta=beta,
@@ -703,14 +710,12 @@ class FoggyBDDPreprocessor(BDDPreprocessor):
                 atmospheric_light_min_pixels=self.atmospheric_light_min_pixels,
                 atmospheric_light=np.array(self.atmospheric_light) if self.atmospheric_light is not None else None,
             )
-            image, _, _ = apply_nighttime_fog(
+            image = self.lowlight_generator.apply(image, gamma)
+            image, _, _ = self.fog_generator.generate(
                 image_rgb=image,
-                fog_generator=self.fog_generator,
-                fog_params=params,
-                gamma_generator=self.lowlight_generator,
-                gamma=gamma,
-                apply_order="dark_then_fog",
+                params=params,
                 precomputed_depth=depth_map_arr,
+                use_spatial_beta=use_spatial_beta,
             )
         elif beta is not None:
             params = FogParameters(
@@ -724,6 +729,7 @@ class FoggyBDDPreprocessor(BDDPreprocessor):
                 image_rgb=image,
                 params=params,
                 precomputed_depth=depth_map_arr,
+                use_spatial_beta=use_spatial_beta,
             )
         elif gamma is not None:
             image = self.lowlight_generator.apply(image, gamma)
@@ -1043,8 +1049,10 @@ class FoggyBDD100KDataset(BDD100KDataset):
         super().__init__(dataset_kwargs, dataset_type, perform_augmentation, mode, merge_alt2driv)
         self.depth_map_dir = dataset_kwargs.get("depth_map_dir")
         self.strict_map = strict_map
+        self.fog_mode = dataset_kwargs.get("adverse_params", {}).get("fog_mode", "depth")
         self.use_cached_depth = (
-            dataset_kwargs.get("adverse_params", {}).get("depth_backend") == "cached"
+            self.fog_mode == "depth"
+            and dataset_kwargs.get("adverse_params", {}).get("depth_backend") == "cached"
         )
 
         self.preprocessor = self._init_preprocessor(
@@ -1103,7 +1111,13 @@ class FoggyBDD100KDataset(BDD100KDataset):
         depth = self._load_cached_depth(frame.image_path)
 
         if depth is None:
-            return frame, np.zeros(frame.image.shape[:2], dtype=np.float32), False
+            depth = np.zeros(frame.image.shape[:2], dtype=np.float32)
+            frame.clean_image = frame.image.copy()
+            frame.depth_map = depth
+            return frame, depth, False
+
+        frame.clean_image = frame.image.copy()
+        frame.depth_map = depth.astype(np.float32)
 
         if apply_fog:
             scene_attributes = (
@@ -1115,13 +1129,35 @@ class FoggyBDD100KDataset(BDD100KDataset):
 
         return frame, depth.astype(np.float32), apply_fog
 
+    def _maybe_apply_homogeneous_fog(self, frame: FrameData) -> Tuple[FrameData, np.ndarray, bool]:
+        apply_fog = True if self.mode != DatasetMode.TRAIN else random.random() < self.preprocessor.apply_fog_prob
+        depth = np.full(
+            frame.image.shape[:2],
+            self.preprocessor.homogeneous_depth,
+            dtype=np.float32,
+        )
+        frame.clean_image = frame.image.copy()
+        frame.depth_map = depth
+
+        if apply_fog:
+            scene_attributes = (
+                frame.frame_detections.attributes
+                if frame.frame_detections is not None else {}
+            )
+            beta, gamma = self.preprocessor._select_degradation(scene_attributes)
+            frame.image = self.preprocessor._apply_degradation(frame.image, depth, beta, gamma)
+
+        return frame, depth, apply_fog
+
     def prepare_training_sample(self, index):
         
         frame = self._load_raw(index)
         depth = None
         fog_applied = False
 
-        if self.use_cached_depth:
+        if self.fog_mode == "homogeneous":
+            frame, depth, fog_applied = self._maybe_apply_homogeneous_fog(frame)
+        elif self.use_cached_depth:
             frame, depth, fog_applied = self._maybe_apply_cached_fog(frame)
 
         # Only perform standard augmentation
@@ -1157,6 +1193,7 @@ class FoggyBDD100KDataset(BDD100KDataset):
         # perform tensor conversion, depth estimation inside collate_fn
         sample = {
             "image":             frame.image,
+            "clean_image":       frame.clean_image,
             "segmentation_mask": frame.seg,
             "drivable_mask":     frame.drivable,
             "detection_targets": frame.labels_array(),
@@ -1168,14 +1205,8 @@ class FoggyBDD100KDataset(BDD100KDataset):
             "mode":self.mode
         }
 
-        if self.use_cached_depth:
-            if depth.shape[:2] != frame.image.shape[:2]:
-                depth = cv2.resize(
-                    depth,
-                    (frame.image.shape[1], frame.image.shape[0]),
-                    interpolation=cv2.INTER_LINEAR,
-                )
-            sample["depth_map"] = depth.astype(np.float32)
+        if self.use_cached_depth or self.fog_mode == "homogeneous":
+            sample["depth_map"] = frame.depth_map.astype(np.float32)
             sample["fog_applied"] = fog_applied
 
         return sample
