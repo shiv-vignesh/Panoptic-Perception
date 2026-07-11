@@ -3,15 +3,15 @@
 
     "model_kwargs":{
         "model_type":"yolop",
-        "cfg_path":"/workspace/Panoptic-Perception/panoptic_perception/configs/models/yolo-768-1280-detection.cfg",
+        "cfg_path":"panoptic_perception/configs/models/yolov5-cfgs/yolo-768-1280-detection.cfg",
         "device":"cuda:0"
     },
 
     "dataset_kwargs":{
-        "images_dir": "/workspace/data/100k/100k",
-        "detection_annotations_dir": "/workspace/data/bdd100k_labels/100k",
+        "images_dir": "../data/100k/100k",
+        "detection_annotations_dir": "../data/bdd100k_labels/100k",
         "segmentation_annotations_dir": "",
-        "drivable_annotations_dir": "/workspace/data/drivable_maps/labels",
+        "drivable_annotations_dir": "../data/drivable_maps/labels",
         "train_batch_size": 6,
         "train_shuffle": true,
         "train_num_workers": 4,
@@ -98,7 +98,7 @@
         "metric_eval_mode": "strict",
         "metric_average_mode": "macro",
         "epochs": 100,
-        "monitor_train": true,
+        "monitor_train": false,
         "monitor_val": true,
         "gradient_clipping": 1.0,
         "checkpoint_idx": 2,
@@ -106,7 +106,7 @@
         "lr_scheduler_start_epoch": 1,
         "reload_optimizer": false,
         "reload_optimizer_with_initial_lr": false,
-        "checkpoint_path":"/workspace/yolop-detection-768x1280-new-anchors/best_model.pt",
+        "checkpoint_path":"",
         "wandb_project": "yolop-ATSS",
         "wandb_enabled": true,
         "use_ema": false,

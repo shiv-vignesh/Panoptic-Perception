@@ -9,7 +9,7 @@ from collections import defaultdict
 from terminaltables import AsciiTable
 
 if TYPE_CHECKING:
-    from panoptic_perception.trainer.trainer_refactor import Trainer
+    from panoptic_perception.trainer.trainer import Trainer
 
 from panoptic_perception.dataset.enums import BDD100KClassesReduced
 from panoptic_perception.models.models import BaseTaskModel, BaseEnhancementModel
@@ -292,7 +292,7 @@ class EnhancedImageLogger(TrainerCallback):
             trainer.model.gates = None        
     
     def on_step_end(self, trainer):
-        
+
         if trainer.has_enhancement and (trainer.train_batch_idx + 1) % self.train_log_idx == 0:
             step = trainer.cur_epoch * trainer.total_train_batch + trainer.train_batch_idx
             caption = f'train_{trainer.cur_epoch}_batch_{trainer.train_batch_idx}'
@@ -302,8 +302,7 @@ class EnhancedImageLogger(TrainerCallback):
                             step=step,
                             caption=caption,
                             images=trainer.batch_images)
-                
-                
+
     def on_eval_batch_end(self, trainer):
 
         if trainer.has_enhancement and (trainer.eval_batch_idx + 1) % self.eval_log_idx == 0:
@@ -822,3 +821,114 @@ class EvalMetricsCallback(TrainerCallback):
         self._compute_lane_detection_metrics(trainer)
 
         self._reset()
+
+class ImageClsMetricsCallback(TrainerCallback):
+
+    def __init__(self, num_classes: int = None, prefix: str = "val",
+                 ks=(1, 5), track_per_class: bool = True):
+        # num_classes defaults to None — resolved lazily on_train_begin from
+        # trainer.model.head.out_features. Explicit override still supported.
+        self.num_classes = num_classes
+        self.ks = ks
+        self.track_per_class = track_per_class
+        self.prefix = prefix
+        self._initialized = False
+
+    def _reset(self):
+        self._correct = {k: 0 for k in self.ks}
+        self._total = 0
+        self._loss_sum = 0.0
+        self._loss_batches = 0
+        if self.track_per_class:
+            self._pc_correct = torch.zeros(self.num_classes, dtype=torch.long)
+            self._pc_total = torch.zeros(self.num_classes, dtype=torch.long)
+
+    def on_train_begin(self, trainer):
+        if self.num_classes is None:
+            head = getattr(trainer.model, "head", None)
+            if head is None or not hasattr(head, "out_features"):
+                raise RuntimeError(
+                    "ImageClsMetricsCallback: could not infer num_classes from "
+                    "trainer.model.head.out_features; pass num_classes explicitly."
+                )
+            self.num_classes = head.out_features
+        self._initialized = True
+        self._reset()
+
+    def on_eval_begin(self, trainer):
+        if not self._initialized:
+            self.on_train_begin(trainer)
+        self._reset()
+
+    def on_eval_batch_end(self, trainer):
+        outputs = trainer.eval_batch_ctx.cur_eval_model_outputs
+        gt_labels = trainer.eval_batch_ctx.cur_eval_gt_cls_labels
+
+        if outputs.logits is None or not isinstance(outputs.logits, torch.Tensor):
+            raise ValueError("ImageClsMetricsCallback: outputs.logits missing or non-tensor")
+        if gt_labels is None or not isinstance(gt_labels, torch.Tensor):
+            raise ValueError("ImageClsMetricsCallback: cur_eval_gt_cls_labels missing or non-tensor")
+
+        maxk = max(self.ks)
+        _, pred = outputs.logits.topk(maxk, dim=1)
+        correct = pred.eq(gt_labels.unsqueeze(1))
+
+        for k in self.ks:
+            self._correct[k] += correct[:, :k].any(dim=1).sum().item()
+        self._total += gt_labels.size(0)
+
+        if outputs.loss is not None:
+            self._loss_sum += outputs.loss.item()
+            self._loss_batches += 1
+
+        if self.track_per_class:
+            top1 = pred[:, 0]
+            hits = (top1 == gt_labels).cpu()
+            labels_cpu = gt_labels.cpu()
+            self._pc_correct.index_add_(0, labels_cpu, hits.long())
+            self._pc_total.index_add_(0, labels_cpu, torch.ones_like(labels_cpu))
+
+    def on_eval_end(self, trainer):
+        n = max(self._total, 1)
+        out = {f"top{k}": self._correct[k] / n for k in self.ks}
+        out["loss"] = self._loss_sum / self._loss_batches if self._loss_batches else 0.0
+
+        if self.track_per_class:
+            valid = self._pc_total > 0
+            pc_acc = torch.zeros_like(self._pc_correct, dtype=torch.float)
+            pc_acc[valid] = self._pc_correct[valid].float() / self._pc_total[valid].float()
+            out["balanced_top1"] = pc_acc[valid].mean().item()
+            out["worst5_top1"] = pc_acc[valid].sort().values[:5].mean().item()
+            out["per_class_top1"] = pc_acc.tolist()
+
+        # Log
+        parts = [f"loss {out['loss']:.4f}",
+                 f"top1 {out['top1']:.4f}",
+                 f"top5 {out['top5']:.4f}"]
+        if self.track_per_class:
+            parts += [f"balanced_top1 {out['balanced_top1']:.4f}",
+                      f"worst5 {out['worst5_top1']:.4f}"]
+        trainer.logger.log_message(
+            f"[{trainer.eval_metric_prefix}] Epoch {trainer.cur_epoch} - " + " ".join(parts)
+        )
+
+        metrics = {
+            f"{trainer.eval_metric_prefix}/loss": out["loss"],
+            f"{trainer.eval_metric_prefix}/top1": out["top1"],
+            f"{trainer.eval_metric_prefix}/top5": out["top5"],
+        }
+        if self.track_per_class:
+            metrics[f"{trainer.eval_metric_prefix}/balanced_top1"] = out["balanced_top1"]
+            metrics[f"{trainer.eval_metric_prefix}/worst5_top1"] = out["worst5_top1"]
+        trainer.wandb_logger.log_metrics(metrics, step=trainer.cur_epoch)
+
+        # Bridge to CheckpointCallback: it tracks "best" via
+        # trainer.eval_metrics[prefix].ap_per_class["mAP"]. Alias top1 as mAP
+        # so the existing checkpoint machinery saves best-top1 without changes.
+        prefix = trainer.eval_metric_prefix
+        if prefix in trainer.eval_metrics:
+            trainer.eval_metrics[prefix].ap_per_class = {
+                "mAP": out["top1"],
+                "top1": out["top1"],
+                "top5": out["top5"],
+            }

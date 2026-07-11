@@ -36,7 +36,18 @@ mkdir -p "${DATA_DIR}"
 echo "Data directory created at ${DATA_DIR}"
 echo ""
 
-# ---- Step 3: Download BDD100K data ----
+# ---- Step 3: Download BDD100K data (skipped when no source URLs provided) ----
+BDD_HAVE_GDRIVE=$([ -n "${GDRIVE_IMAGES_ID}" ] || [ -n "${GDRIVE_DET_LABELS_ID}" ] || [ -n "${GDRIVE_DRIVABLE_MAPS_ID}" ] && echo 1 || echo 0)
+
+if [ "${BDD_HAVE_GDRIVE}" -eq 0 ]; then
+    echo "[3/6] Skipping BDD100K download"
+    echo "----------------------------------------"
+    echo "No GDRIVE_IMAGES_ID / GDRIVE_DET_LABELS_ID / GDRIVE_DRIVABLE_MAPS_ID set."
+    echo "Set at least one of these env vars (see comments at top of this script)"
+    echo "to enable BDD100K download. Continuing to Python installation..."
+    echo ""
+else
+
 echo "[3/6] Downloading BDD100K data"
 echo "----------------------------------------"
 download_and_extract() {
@@ -99,6 +110,8 @@ for dir in "${DATA_DIR}/100k/100k/train" "${DATA_DIR}/100k/100k/val" "${DATA_DIR
 done
 echo ""
 
+fi  # end BDD download block
+
 # ---- Step 5: Check Python version and install system deps ----
 echo "[5/6] Checking Python and installing system dependencies"
 echo "----------------------------------------"
@@ -136,6 +149,11 @@ pip install \
     pydantic==2.12.4 \
     Pillow==11.0.0 \
     transformers \
+    timm \
+    torchmetrics \
+    datasets \
+    hf_transfer \
+    huggingface_hub \
     onnxruntime-gpu \
     tensorrt \
     pycuda
@@ -146,6 +164,10 @@ python3 -c "import torch; print(f'PyTorch: {torch.__version__}, CUDA: {torch.cud
 python3 -c "import torchvision; print(f'TorchVision: {torchvision.__version__}')"
 python3 -c "import albumentations; print(f'Albumentations: {albumentations.__version__}')"
 python3 -c "import wandb; print(f'WandB: {wandb.__version__}')"
+python3 -c "import timm; print(f'timm: {timm.__version__}')"
+python3 -c "import torchmetrics; print(f'torchmetrics: {torchmetrics.__version__}')"
+python3 -c "import datasets; print(f'datasets: {datasets.__version__}')"
+python3 -c "import transformers; print(f'transformers: {transformers.__version__}')"
 
 # ---- Setup complete ----
 echo ""

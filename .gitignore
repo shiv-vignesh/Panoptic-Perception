@@ -22,5 +22,10 @@ venv/
 .DS_Store
 Thumbs.db
 
-data/
-checkpoints/
+/data/
+/checkpoints/
+
+imagenet-tiny/
+archive.zip
+wandb/
+runs/

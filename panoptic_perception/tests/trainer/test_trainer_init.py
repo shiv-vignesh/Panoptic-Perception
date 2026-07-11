@@ -10,7 +10,7 @@ from unittest.mock import MagicMock, patch
 from torch.utils.data import DataLoader, TensorDataset
 
 from panoptic_perception.trainer.trainer_args import TrainingArgument
-from panoptic_perception.trainer.trainer_refactor import Trainer
+from panoptic_perception.trainer.trainer import PanopticTrainer
 from panoptic_perception.trainer.utils import EvalMetrics
 from panoptic_perception.models.models import BaseTaskModel
 from panoptic_perception.models.types import PanopticModelOutputs
@@ -70,7 +70,7 @@ class TestTrainerValidation:
 
     def test_model_none_raises(self, tmp_path):
         with pytest.raises(ValueError, match="requires a model"):
-            Trainer(
+            PanopticTrainer(
                 model=None,
                 logger=_make_logger(tmp_path),
                 wandb_logger=_make_wandb_logger(),
@@ -79,12 +79,12 @@ class TestTrainerValidation:
     def test_logger_none_raises(self):
         model = StubTaskModel()
         with pytest.raises(ValueError, match="requires a logger"):
-            Trainer(model=model, logger=None, wandb_logger=_make_wandb_logger())
+            PanopticTrainer(model=model, logger=None, wandb_logger=_make_wandb_logger())
 
     def test_wandb_logger_none_raises(self, tmp_path):
         model = StubTaskModel()
         with pytest.raises(ValueError, match="requires a wandb_logger"):
-            Trainer(model=model, logger=_make_logger(tmp_path), wandb_logger=None)
+            PanopticTrainer(model=model, logger=_make_logger(tmp_path), wandb_logger=None)
 
 
 # ─────────────────────────────────────────────
@@ -95,7 +95,7 @@ class TestTrainerAttributes:
 
     def test_default_training_args(self, tmp_path):
         model = StubTaskModel()
-        trainer = Trainer(
+        trainer = PanopticTrainer(
             model=model,
             logger=_make_logger(tmp_path),
             wandb_logger=_make_wandb_logger(),
@@ -106,7 +106,7 @@ class TestTrainerAttributes:
     def test_custom_training_args(self, tmp_path):
         model = StubTaskModel()
         args = TrainingArgument(epochs=5, output_dir="runs/custom")
-        trainer = Trainer(
+        trainer = PanopticTrainer(
             model=model,
             training_args=args,
             logger=_make_logger(tmp_path),
@@ -117,7 +117,7 @@ class TestTrainerAttributes:
 
     def test_device_from_model(self, tmp_path):
         model = StubTaskModel()  # on CPU
-        trainer = Trainer(
+        trainer = PanopticTrainer(
             model=model,
             logger=_make_logger(tmp_path),
             wandb_logger=_make_wandb_logger(),
@@ -126,7 +126,7 @@ class TestTrainerAttributes:
 
     def test_has_enhancement_false(self, tmp_path):
         model = StubTaskModel()
-        trainer = Trainer(
+        trainer = PanopticTrainer(
             model=model,
             logger=_make_logger(tmp_path),
             wandb_logger=_make_wandb_logger(),
@@ -135,7 +135,7 @@ class TestTrainerAttributes:
 
     def test_cur_epoch_zero(self, tmp_path):
         model = StubTaskModel()
-        trainer = Trainer(
+        trainer = PanopticTrainer(
             model=model,
             logger=_make_logger(tmp_path),
             wandb_logger=_make_wandb_logger(),
@@ -144,7 +144,7 @@ class TestTrainerAttributes:
 
     def test_checkpoint_path_stored(self, tmp_path):
         model = StubTaskModel()
-        trainer = Trainer(
+        trainer = PanopticTrainer(
             model=model,
             checkpoint_path="/some/ckpt.pt",
             logger=_make_logger(tmp_path),
@@ -154,7 +154,7 @@ class TestTrainerAttributes:
 
     def test_callbacks_initialized(self, tmp_path):
         model = StubTaskModel()
-        trainer = Trainer(
+        trainer = PanopticTrainer(
             model=model,
             logger=_make_logger(tmp_path),
             wandb_logger=_make_wandb_logger(),
@@ -171,7 +171,7 @@ class TestTrainerOptimizerScheduler:
 
     def test_auto_creates_optimizer(self, tmp_path):
         model = StubTaskModel()
-        trainer = Trainer(
+        trainer = PanopticTrainer(
             model=model,
             logger=_make_logger(tmp_path),
             wandb_logger=_make_wandb_logger(),
@@ -180,7 +180,7 @@ class TestTrainerOptimizerScheduler:
 
     def test_auto_creates_scheduler(self, tmp_path):
         model = StubTaskModel()
-        trainer = Trainer(
+        trainer = PanopticTrainer(
             model=model,
             logger=_make_logger(tmp_path),
             wandb_logger=_make_wandb_logger(),
@@ -190,7 +190,7 @@ class TestTrainerOptimizerScheduler:
     def test_provided_optimizer_kept(self, tmp_path):
         model = StubTaskModel()
         optim = torch.optim.SGD(model.parameters(), lr=0.01)
-        trainer = Trainer(
+        trainer = PanopticTrainer(
             model=model,
             optimizer=optim,
             logger=_make_logger(tmp_path),
@@ -208,7 +208,7 @@ class TestTrainerEvalMetrics:
     def test_eval_metrics_created_for_val_dataloaders(self, tmp_path):
         model = StubTaskModel()
         val_dls = _make_val_dataloaders()
-        trainer = Trainer(
+        trainer = PanopticTrainer(
             model=model,
             val_dataloaders=val_dls,
             logger=_make_logger(tmp_path),
@@ -219,7 +219,7 @@ class TestTrainerEvalMetrics:
 
     def test_eval_metrics_empty_when_no_val(self, tmp_path):
         model = StubTaskModel()
-        trainer = Trainer(
+        trainer = PanopticTrainer(
             model=model,
             logger=_make_logger(tmp_path),
             wandb_logger=_make_wandb_logger(),
@@ -233,7 +233,7 @@ class TestTrainerEvalMetrics:
             "val_clean": DataLoader(ds, batch_size=2),
             "val_foggy": DataLoader(ds, batch_size=2),
         }
-        trainer = Trainer(
+        trainer = PanopticTrainer(
             model=model,
             val_dataloaders=val_dls,
             logger=_make_logger(tmp_path),

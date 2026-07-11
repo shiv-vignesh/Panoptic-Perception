@@ -1,1480 +1,481 @@
-import os, math, time, copy, warnings
-from tqdm import tqdm
-from datetime import datetime
-
-from typing import Iterable, Union, Optional
-
-warnings.warn(
-    "panoptic_perception.trainer.trainer.Trainer is deprecated and will be removed. "
-    "Use panoptic_perception.trainer.trainer_refactor.Trainer, which integrates with "
-    "MultiTaskLoss, LossFactory, and the new TrainingArgument config schema. "
-    "See panoptic_perception/configs/trainer/README.md.",
-    DeprecationWarning,
-    stacklevel=2,
-)
-from collections import defaultdict
+import time
+from typing import Union, Optional
 
 import torch
-from torch import nn
 from torch.utils.data.dataloader import DataLoader
+from tqdm import tqdm
 
-import numpy as np
-
-from panoptic_perception.dataset.bdd100k_dataset import BDD100KDataset, FoggyBDD100KDataset, BDDPreprocessor
-
-import gc
-
-from panoptic_perception.dataset.types import DatasetMode
+from panoptic_perception.models.models import BaseTaskModel, BaseEnhancementModel
 from panoptic_perception.models.types import PanopticModelOutputs
-
-class ModelEMA:
-    """
-    Exponential Moving Average of model weights.
-    Keeps a moving average of model parameters for more stable predictions.
-
-    Usage:
-        ema = ModelEMA(model, decay=0.9999)
-        # During training:
-        ema.update(model)
-        # For evaluation:
-        ema.apply_shadow(model)  # Apply EMA weights
-        # ... evaluate ...
-        ema.restore(model)       # Restore original weights
-    """
-
-    def __init__(self, model: nn.Module, decay: float = 0.9999, warmup_steps: int = 2000):
-        """
-        Args:
-            model: The model to track
-            decay: EMA decay rate (higher = slower update, more smoothing)
-            warmup_steps: Number of steps before reaching full decay rate
-        """
-        self.decay = decay
-        self.warmup_steps = warmup_steps
-        self.step = 0
-
-        # Create shadow copy of model weights
-        self.shadow = {}
-        self.backup = {}
-
-        for name, param in model.named_parameters():
-            if param.requires_grad:
-                self.shadow[name] = param.data.clone()
-
-    def _get_decay(self) -> float:
-        """Get current decay rate with warmup."""
-        if self.step < self.warmup_steps:
-            # Linear warmup from 0 to decay
-            return min(self.decay, (1 + self.step) / (10 + self.step))
-        return self.decay
-
-    def update(self, model: nn.Module):
-        """Update EMA weights with current model weights."""
-        self.step += 1
-        decay = self._get_decay()
-
-        with torch.no_grad():
-            for name, param in model.named_parameters():
-                if param.requires_grad and name in self.shadow:
-                    # EMA update: shadow = decay * shadow + (1 - decay) * param
-                    self.shadow[name].mul_(decay).add_(param.data, alpha=1 - decay)
-
-    def apply_shadow(self, model: nn.Module):
-        """Apply EMA weights to model (backup original weights first)."""
-        self.backup = {}
-        for name, param in model.named_parameters():
-            if param.requires_grad and name in self.shadow:
-                self.backup[name] = param.data.clone()
-                param.data.copy_(self.shadow[name])
-
-    def restore(self, model: nn.Module):
-        """Restore original weights from backup."""
-        for name, param in model.named_parameters():
-            if param.requires_grad and name in self.backup:
-                param.data.copy_(self.backup[name])
-        self.backup = {}
-
-    def state_dict(self) -> dict:
-        """Return EMA state for checkpointing."""
-        return {
-            'shadow': self.shadow,
-            'step': self.step,
-            'decay': self.decay
-        }
-
-    def load_state_dict(self, state_dict: dict):
-        """Load EMA state from checkpoint."""
-        self.shadow = state_dict['shadow']
-        self.step = state_dict['step']
-        self.decay = state_dict.get('decay', self.decay)
-
-
-from panoptic_perception.dataset.enums import BDD100KClassesReduced
-
-from panoptic_perception.models.models import YOLOP, YOLOv8P, GDIPYolo, DENetYolo, get_model_param_groups
-from panoptic_perception.models.utils import WeightsManager
 
 from panoptic_perception.utils.logger import Logger
 from panoptic_perception.utils.wandb_logger import WandBLogger
-from panoptic_perception.utils.detection_utils import DetectionHelper
-from panoptic_perception.utils.segmentation_utils import SegmentationUtils
-from panoptic_perception.utils.evaluation_helper import DetectionMetrics, SegmentationMetrics
-from terminaltables import AsciiTable
 
-CLASS_NAMES = [cls.name for cls in BDD100KClassesReduced]
+from panoptic_perception.trainer.trainer_optimizer import build_optmizer, OptimizerContext
+from panoptic_perception.trainer.trainer_schedulers import build_scheduler, SchedulerContext
+from panoptic_perception.trainer.trainer_args import TrainingArgument
+from panoptic_perception.trainer.callbacks import Callbacks
+from panoptic_perception.trainer.utils import EvalMetrics, EvalBatchContext
+
 
 class Trainer:
-    @staticmethod
-    def _default_stats_iou_threshold(metric_eval_mode: str) -> float:
-        if metric_eval_mode == "lenient":
-            return 0.25
-        return 0.5
-    
-    def __init__(self, model:Optional[Union[YOLOP, YOLOv8P, GDIPYolo, DENetYolo]], device:torch.device,
-                 dataset_kwargs:dict, 
-                 optimizer_kwargs:dict, lr_scheduler_kwargs:dict,
-                 trainer_kwargs:dict):
-        
+
+    def __init__(self, model: Optional[Union[BaseTaskModel, BaseEnhancementModel]],
+                 train_dataloader: DataLoader = None,
+                 val_dataloaders: dict = None,
+                 optimizer: torch.optim = None,
+                 lr_scheduler: torch.optim.lr_scheduler = None,
+                 training_args: TrainingArgument = None,
+                 wandb_logger: WandBLogger = None,
+                 logger: Logger = None,
+                 checkpoint_path: str = None):
+
+        if training_args is None:
+            training_args = TrainingArgument(output_dir="tmp_trainer")
+
+        self.training_args = training_args
+
+        if model is None:
+            raise ValueError("Trainer: requires a model")
+
         self.model = model
-        self.device = device
-        
-        self.output_dir = trainer_kwargs["output_dir"]
-        self.is_training = trainer_kwargs["is_training"]
-        self.first_val_epoch = trainer_kwargs["first_val_epoch"]
-        self.eval_visualize_outputs = trainer_kwargs.get("eval_visualize_outputs", False)
-        self.metric_eval_mode = trainer_kwargs.get("metric_eval_mode", "strict")
-        self.metric_average_mode = trainer_kwargs.get("metric_average_mode", "macro")
-        self.stats_iou_threshold = trainer_kwargs.get(
-            "stats_iou_threshold",
-            self._default_stats_iou_threshold(self.metric_eval_mode),
-        )
+        self.has_enhancement = isinstance(model, BaseEnhancementModel)
+        self.device = next(model.parameters()).device
 
-        self.epochs = trainer_kwargs["epochs"]
-        self.monitor_train = trainer_kwargs["monitor_train"]
-        self.monitor_val = trainer_kwargs["monitor_val"]
-        self.gradient_clipping = trainer_kwargs["gradient_clipping"]
-        
-        self.checkpoint_idx = trainer_kwargs['checkpoint_idx']
-        self.gradient_accumulation_steps = trainer_kwargs['gradient_accumulation_steps']
-        self.reload_optimizer_with_initial_lr = trainer_kwargs["reload_optimizer_with_initial_lr"]
-        self.lr_scheduler_start_epoch = trainer_kwargs["lr_scheduler_start_epoch"]
-        self.reload_optimizer = trainer_kwargs["reload_optimizer"]
+        self.train_dataloader = train_dataloader
+        self.val_dataloaders = val_dataloaders
 
-        # EMA settings
-        self.use_ema = trainer_kwargs.get('use_ema', True)
-        self.ema_decay = trainer_kwargs.get('ema_decay', 0.9999)
-        self.ema_warmup_steps = trainer_kwargs.get('ema_warmup_steps', 2000)
-        self.ema = None  # Initialized in train()
+        self.optimizer = optimizer
+        self.lr_scheduler = lr_scheduler
 
-        # Staged training (progressive unfreezing)
-        staged = trainer_kwargs.get("staged_training", {})
-        self.staged_training_enabled = staged.get("enabled", False)
-        self.staged_training_stages = staged.get("stages", [])
-        
-        self.compute_ssim = trainer_kwargs.get("compute_ssim", True) #GDIP-YOLO 
-        self.lambda_defog = trainer_kwargs.get("lambda_defog", 0.2) #GDIP-YOLO 
+        self._create_optimizer_and_scheduler()
 
-        # Best model tracking
-        self.best_map = 0.0
-        self.best_epoch = 0
-
-        if not os.path.exists(self.output_dir):
-            os.makedirs(self.output_dir)
-            
-        self.logger = Logger(
-            f'{self.output_dir}/training_logger_{datetime.now()}', f'training_logger_{datetime.now()}'
-        )
-
-        # Initialize WandB logger
-        wandb_config = {
-            "epochs": self.epochs,
-            "gradient_accumulation_steps": self.gradient_accumulation_steps,
-            "gradient_clipping": self.gradient_clipping,
-            **trainer_kwargs,
-            **optimizer_kwargs,
-            **lr_scheduler_kwargs
+        self.eval_metrics = {
+            metric_prefix: EvalMetrics(metric_prefix=metric_prefix)
+            for metric_prefix in (val_dataloaders or {})
         }
-        self.wandb_logger = WandBLogger(
-            project_name=trainer_kwargs.get("wandb_project", "yolop-panoptic"),
-            run_name=trainer_kwargs.get("wandb_run_name", f"run_{datetime.now()}"),
-            config=wandb_config,
-            entity=trainer_kwargs.get("wandb_entity", None),
-            tags=trainer_kwargs.get("wandb_tags", ["yolop", "panoptic"]),
-            enabled=trainer_kwargs.get("wandb_enabled", True)
-        )
 
-        # Watch model if WandB is enabled
-        if self.wandb_logger.enabled:
-            self.wandb_logger.watch_model(self.model, log_freq=100)
+        self.callbacks = Callbacks()
+        self.checkpoint_path = checkpoint_path
 
-        self._init_dataloader(dataset_kwargs)
-        self.total_train_batch = len(self.train_dataloader)
-        self.ten_percent_train_batch = self.total_train_batch // 100
-        
-        self.logger.log_message(f'  Training on BDD100k Dataset   ')
-        self.logger.log_message(f'Images Dir: {self.train_dataloader.dataset.images_dir}')        
-        self.logger.log_message(f'Detections Annotations Dir: {self.train_dataloader.dataset.detection_annotations_dir}')
-        self.logger.log_message(f'Segmentations Dir: {self.train_dataloader.dataset.segmentation_annotations_dir}')
-        self.logger.log_message(f'Drivable Segmentations Dir: {self.train_dataloader.dataset.drivable_annotations_dir}')
-        
-        self.logger.log_new_line()
-        
-        self.logger.log_message(f'Number of Train Images: {self.train_dataloader.dataset.__len__()}')
-        self.logger.log_message(f'Train Batch Size: {self.train_dataloader.batch_size}')
-        
-        self.logger.log_new_line()
-        
-        self.logger.log_message(f'Number of Val Images: {self.val_dataloader.dataset.__len__()}')
-        self.logger.log_message(f'Val Batch Size: {self.val_dataloader.batch_size}')
+        if logger is None:
+            raise ValueError("Trainer: requires a logger")
+        if wandb_logger is None:
+            raise ValueError("Trainer: requires a wandb_logger")
 
-        if self.val_foggy_dataloader is not None:
-            self.logger.log_new_line()
-            self.logger.log_message(f'Number of Foggy Val Images: {self.val_foggy_dataloader.dataset.__len__()}')
-            self.logger.log_message(f'Foggy Val Batch Size: {self.val_foggy_dataloader.batch_size}')
+        self.logger = logger
+        self.wandb_logger = wandb_logger
 
-        self.logger.log_line()
-
-        self.logger.log_line()
-
-        self._init_optimizer(optimizer_kwargs)
-        self.logger.log_line()
-        self.logger.log_message(f'  Optimizer: {self.optimizer.__class__.__name__}  ')        
-        self.logger.log_new_line()        
-        
-        if lr_scheduler_kwargs:
-            self._init_lr_scheduler(lr_scheduler_kwargs)          
-    
-    def _init_dataloader(self, dataset_kwargs:dict):
-
-        dataset_class = dataset_kwargs.get("dataset_class", "default")
-
-        # Build depth estimator for foggy datasets
-        depth_estimator = None
-        if dataset_class == "foggy":
-            adverse_params = dataset_kwargs.get("adverse_params", {})
-            depth_backend = adverse_params.get("depth_backend", "heuristic")
-            depth_device = adverse_params.get("depth_device", str(self.device))
-
-            if depth_backend == "onnx":
-                from panoptic_perception.dataset.adverse_weather.depth_estimators import ONNXDepthEstimator
-                depth_estimator = ONNXDepthEstimator(
-                    onnx_path=adverse_params["onnx_backend_path"],
-                    device=depth_device, input_size=518, normalization_epsilon=1e-8,
-                )
-            elif depth_backend == "depth_anything":
-                from panoptic_perception.dataset.adverse_weather.depth_estimators import DepthAnythingEstimator
-                depth_estimator = DepthAnythingEstimator(
-                    model_name="LiheYoung/depth-anything-small-hf",
-                    device=depth_device, normalization_epsilon=1e-8,
-                )
-            elif depth_backend == "torch_compile":
-                from panoptic_perception.dataset.adverse_weather.depth_estimators import TorchCompiledDepthEstimator
-                depth_estimator = TorchCompiledDepthEstimator(
-                    model_name="LiheYoung/depth-anything-small-hf",
-                    device=depth_device, normalization_epsilon=1e-8,
-                )
-            # else: None → FoggyBDD100KDataset defaults to heuristic
-
-            if depth_backend != "heuristic":
-                self.logger.log_message(
-                    f"[Dataloader] depth_backend={depth_backend} requires CUDA "
-                    f"-> overriding num_workers to 0 (CUDA unavailable in forked workers)"
-                )
-                dataset_kwargs["train_num_workers"] = 0
-                dataset_kwargs["val_num_workers"] = 0
-
-        def create_base_dataset_kwargs(images_dir, detection_annotations_dir,
-                                        segmentation_annotations_dir, drivable_annotations_dir,
-                                        preprocessor_kwargs):
-            return {
-                "images_dir": images_dir,
-                "detection_annotations_dir": detection_annotations_dir,
-                "segmentation_annotations_dir": segmentation_annotations_dir,
-                "drivable_annotations_dir": drivable_annotations_dir,
-                "preprocessor_kwargs": preprocessor_kwargs
-            }
-
-        def create_dataloader(images_dir:str, detection_annotations_dir:dict,
-                            segmentation_annotations_dir:dict, drivable_annotations_dir:dict,
-                            preprocessor_kwargs:dict, dataset_type:str, batch_size:int,
-                            perform_augmentation:bool=False, shuffle:bool=False, num_workers:int=1):
-
-            base_kwargs = create_base_dataset_kwargs(
-                images_dir, detection_annotations_dir,
-                segmentation_annotations_dir, drivable_annotations_dir,
-                preprocessor_kwargs
-            )
-
-            if dataset_class == "foggy" and dataset_type == "train":
-                adverse_params = dataset_kwargs.get("adverse_params", {})
-                base_kwargs["depth_map_dir"] = dataset_kwargs.get("depth_map_dir", None)
-                base_kwargs["adverse_params"] = adverse_params
-
-                dataset = FoggyBDD100KDataset(
-                    base_kwargs,
-                    dataset_type=dataset_type,
-                    perform_augmentation=perform_augmentation,
-                    strict_map=dataset_kwargs.get("strict_map", True),
-                    apply_fog_prob=dataset_kwargs.get("apply_fog_prob", 0.67),
-                    depth_estimator=depth_estimator,
-                )
-            else:
-                dataset_mode = DatasetMode.TRAIN if dataset_type == "train" else DatasetMode.EVAL
-                dataset = BDD100KDataset(
-                    base_kwargs,
-                    dataset_type=dataset_type,
-                    perform_augmentation=perform_augmentation,
-                    mode=dataset_mode,
-                )
-
-            return DataLoader(
-                dataset,
-                batch_size=batch_size,
-                shuffle=shuffle,
-                num_workers=num_workers,
-                collate_fn=BDDPreprocessor.collate_fn
-            )
-
-        self.train_dataloader = create_dataloader(
-            dataset_kwargs["images_dir"],
-            dataset_kwargs["detection_annotations_dir"],
-            dataset_kwargs["segmentation_annotations_dir"],
-            dataset_kwargs["drivable_annotations_dir"],
-            dataset_kwargs["train_preprocessor_kwargs"],
-            dataset_type="train",
-            batch_size=dataset_kwargs["train_batch_size"],
-            shuffle=dataset_kwargs.get("train_shuffle", True),
-            num_workers=dataset_kwargs.get("train_num_workers", 1),
-            perform_augmentation=dataset_kwargs.get("train_preprocessor_kwargs", False).get("perform_augmentation", False)
-        )
-
-        self.val_dataloader = create_dataloader(
-            dataset_kwargs["images_dir"],
-            dataset_kwargs["detection_annotations_dir"],
-            dataset_kwargs["segmentation_annotations_dir"],
-            dataset_kwargs["drivable_annotations_dir"],
-            dataset_kwargs["val_preprocessor_kwargs"],
-            dataset_type="val",
-            batch_size=dataset_kwargs["val_batch_size"],
-            shuffle=dataset_kwargs.get("val_shuffle", True),
-            num_workers=dataset_kwargs.get("val_num_workers", 1)
-        )
-
-        self.val_foggy_dataloader = None
-        if dataset_class == "foggy":
-            adverse_params = dataset_kwargs.get("adverse_params", {})
-            foggy_val_kwargs = create_base_dataset_kwargs(
-                dataset_kwargs["images_dir"],
-                dataset_kwargs["detection_annotations_dir"],
-                dataset_kwargs["segmentation_annotations_dir"],
-                dataset_kwargs["drivable_annotations_dir"],
-                dataset_kwargs["val_preprocessor_kwargs"]
-            )
-            foggy_val_kwargs["depth_map_dir"] = dataset_kwargs.get("depth_map_dir", None)
-            foggy_val_kwargs["adverse_params"] = adverse_params
-
-            foggy_val_dataset = FoggyBDD100KDataset(
-                foggy_val_kwargs,
-                dataset_type="val",
-                perform_augmentation=False,
-                mode=DatasetMode.EVAL,
-                strict_map=dataset_kwargs.get("strict_map", True),
-                apply_fog_prob=1.0,
-                depth_estimator=depth_estimator,
-            )
-
-            self.val_foggy_dataloader = DataLoader(
-                foggy_val_dataset,
-                batch_size=dataset_kwargs["val_batch_size"],
-                shuffle=False,
-                num_workers=dataset_kwargs.get("val_num_workers", 1),
-                collate_fn=BDDPreprocessor.collate_fn
-            )
-    
-    def _init_optimizer(self, optimizer_kwargs):
-        
-        self.warmup_bias_lr = optimizer_kwargs.get("warmup_bias_lr", 0.1)
-        self.warmup_momentum = optimizer_kwargs.get("warmup_momentum", 0.8)
-        self.warmup_epochs = optimizer_kwargs.get("warmup_epochs", 3)
-        self.main_momentum = optimizer_kwargs.get("momentum", 0.937)
-        
-        self.groups = optimizer_kwargs.get("groups", {})
-        self.dcn_lr_mult = optimizer_kwargs.get("dcn_lr_mult", 0.1)  # DCN offset LR = base_lr * 0.1
-        
-        #TODO, replace 
-        if isinstance(self.model, GDIPYolo):
-            if not self.groups:
-                # No custom groups: train all task_network layers
-                param_groups = [{"params": list(self.model.task_network.parameters()), "name": "task_network", "lr_scale": 1.0}]
-                self.logger.log_message('Full task_network training (all layers trainable)')
-                self.logger.log_new_line()
-            else:
-                # Custom groups: get param groups with DCN-aware differential LR
-                param_groups = get_model_param_groups(self.model.task_network, self.groups, self.dcn_lr_mult, allow_empty=True)
-                self.logger.log_message('Training with specified groups:')
-                for group_name in self.groups:
-                    group_info = self.groups[group_name]
-                    self.logger.log_message(
-                        f'  Group name: {group_name} - '
-                        f'trainable: {group_info["trainable"]} - '
-                        f'layer start/end: {group_info["group"]}'
-                    )
-                # Log DCN-specific param groups
-                for pg in param_groups:
-                    if pg.get("name", "").startswith("dcn"):
-                        self.logger.log_message(
-                            f'  DCN Group: {pg["name"]} - '
-                            f'params: {len(pg["params"])} - '
-                            f'lr_scale: {pg["lr_scale"]}'
-                        )
-                self.logger.log_new_line()
-
-            gdip_groups = optimizer_kwargs.get("gdip_groups", {})
-            if not gdip_groups:
-                # Default: train both GDIP components with lr_scale=1.0
-                param_groups.append({"params": list(self.model.vision_encoder.parameters()), "name": "vision_encoder", "lr_scale": 1.0})
-                param_groups.append({"params": list(self.model.gdip_module.parameters()), "name": "gdip_module", "lr_scale": 1.0})
-            else:
-                for component_name, cfg in gdip_groups.items():
-                    component = getattr(self.model, component_name)
-                    trainable = cfg["trainable"]
-
-                    for p in component.parameters():
-                        p.requires_grad = trainable
-
-                    if trainable:
-                        param_groups.append({
-                            "params": list(component.parameters()),
-                            "name": component_name,
-                            "lr_scale": cfg.get("lr_scale", 1.0)
-                        })
-            
-        #TODO, replace 
-        elif isinstance(self.model, DENetYolo):
-            if not self.groups:
-                param_groups = [{"params": list(self.model.task_network.parameters()), "name": "task_network", "lr_scale": 1.0}]
-                self.logger.log_message('Full task_network training (all layers trainable)')
-                self.logger.log_new_line()
-            else:
-                # Custom groups: get param groups with DCN-aware differential LR
-                param_groups = get_model_param_groups(self.model.task_network, self.groups, self.dcn_lr_mult, allow_empty=True)
-                self.logger.log_message('Training with specified groups:')
-                for group_name in self.groups:
-                    group_info = self.groups[group_name]
-                    self.logger.log_message(
-                        f'  Group name: {group_name} - '
-                        f'trainable: {group_info["trainable"]} - '
-                        f'layer start/end: {group_info["group"]}'
-                    )
-                # Log DCN-specific param groups
-                for pg in param_groups:
-                    if pg.get("name", "").startswith("dcn"):
-                        self.logger.log_message(
-                            f'  DCN Group: {pg["name"]} - '
-                            f'params: {len(pg["params"])} - '
-                            f'lr_scale: {pg["lr_scale"]}'
-                        )
-                self.logger.log_new_line()
-            
-            param_groups.append({
-                "params": list(self.model.denet.parameters()), "name": "DENet", "lr_scale": 1.0
-            })
-        
-        #TODO, replace 
-        elif isinstance(self.model, YOLOP) or isinstance(self.model, YOLOv8P):
-            if not self.groups:
-                # No custom groups: train full model
-                param_groups = list(self.model.parameters())
-                self.logger.log_message('Full model training (all layers trainable)')
-                self.logger.log_new_line()
-            else:
-                # Custom groups: get param groups with DCN-aware differential LR
-                param_groups = get_model_param_groups(self.model, self.groups, self.dcn_lr_mult)
-                self.logger.log_message('Training with specified groups:')
-                for group_name in self.groups:
-                    group_info = self.groups[group_name]
-                    self.logger.log_message(
-                        f'  Group name: {group_name} - '
-                        f'trainable: {group_info["trainable"]} - '
-                        f'layer start/end: {group_info["group"]}'
-                    )
-                # Log DCN-specific param groups
-                for pg in param_groups:
-                    if pg.get("name", "").startswith("dcn"):
-                        self.logger.log_message(
-                            f'  DCN Group: {pg["name"]} - '
-                            f'params: {len(pg["params"])} - '
-                            f'lr_scale: {pg["lr_scale"]}'
-                        )
-                self.logger.log_new_line()
-
-        if optimizer_kwargs["_type"] == "SGD":
-            self.lr0 = optimizer_kwargs.get("initial_lr", 3e-5)
-            if param_groups:
-                for pg in param_groups:
-                    pg['lr'] = self.lr0 * pg.get("lr_scale", 1.0)
-                    
-                self.optimizer = torch.optim.SGD(
-                    param_groups,
-                    momentum=optimizer_kwargs.get("momentum", 0.7)
-                )                
-            else:
-                self.optimizer = torch.optim.SGD(
-                    self.model.parameters(),
-                    lr=optimizer_kwargs.get("initial_lr", 3e-3),
-                    momentum=optimizer_kwargs.get("momentum", 0.7)
-                )                
-
-            self.inital_lr = optimizer_kwargs.get("initial_lr", 3e-5)
-            
-        elif optimizer_kwargs["_type"] == "AdamW":
-            self.lr0 = optimizer_kwargs.get("initial_lr", 3e-4)
-            
-            if param_groups:
-                for pg in param_groups:
-                    pg['lr'] = self.lr0 * pg.get("lr_scale", 1.0)
-
-                self.optimizer = torch.optim.AdamW(
-                    param_groups,
-                    weight_decay=optimizer_kwargs.get("weight_decay", 0.01),
-                    betas=(0.937, 0.999)
-                )
-                
-            else:
-                self.optimizer = torch.optim.AdamW(
-                    self.model.parameters(),
-                    lr=self.lr0,
-                    weight_decay=optimizer_kwargs.get("weight_decay", 0.01),
-                    betas=(0.937, 0.999)
-                )                
-            
-            self.inital_lr = optimizer_kwargs.get("initial_lr", 3e-5)
-    
-    def _init_lr_scheduler(self, lr_scheduler_kwargs:dict):
-
-        if lr_scheduler_kwargs['_type'] == "linear":
-            lr_scheduler_kwargs = lr_scheduler_kwargs['linear_lr_kwargs']            
-            self.lr_scheduler = torch.optim.lr_scheduler.LinearLR(
-                self.optimizer, 
-                start_factor=lr_scheduler_kwargs['start_factor'],
-                end_factor=lr_scheduler_kwargs['end_factor'],
-                total_iters=self.epochs
-            )
-
-            self.logger.log_message(f'LR Scheduler: {self.lr_scheduler.__class__.__name__}')
-            self.logger.log_message(f'LR Scheduler Start Factor: {lr_scheduler_kwargs["start_factor"]}')
-            self.logger.log_message(f'LR Scheduler End Factor: {lr_scheduler_kwargs["end_factor"]}')
-            self.logger.log_new_line()            
-
-        elif lr_scheduler_kwargs['_type'] == "cosine":
-            lr_scheduler_kwargs = lr_scheduler_kwargs['cosine_annealing_lr_kwargs']            
-            self.lr_scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
-                self.optimizer,
-                T_max=self.epochs,
-                eta_min=lr_scheduler_kwargs['eta_min']
-            )
-
-            self.logger.log_message(f'LR Scheduler: {self.lr_scheduler.__class__.__name__}')
-            self.logger.log_message(f'LR Scheduler TMax: {self.epochs}')
-            self.logger.log_message(f'LR Scheduler ETA Min: {lr_scheduler_kwargs["eta_min"]}')            
-            self.logger.log_new_line()
-    
-    def resume_from_ckpt(self, ckpt_path:str):
-
-        if ckpt_path and os.path.exists(ckpt_path):
-            ckpt = torch.load(ckpt_path, map_location=self.device, weights_only=False)
-
-            # Detect if checkpoint was saved from a bare YOLOP/YOLOv8P but loading into GDIPYolo
-            # If so, remap keys with "task_network." prefix
-            key_prefix = None
-            if isinstance(self.model, GDIPYolo) or isinstance(self.model, DENetYolo):
-                ckpt_state = ckpt.get("model_state", ckpt)
-                sample_key = next(iter(ckpt_state), "")
-                if not sample_key.startswith("task_network."):
-                    key_prefix = "task_network"
-
-            missing, unexpected, loaded_keys = WeightsManager().load(self.model, ckpt_path, key_prefix=key_prefix)
-            # self.model.load_state_dict(ckpt["model_state"])
-            self.logger.log_message("=== Weights Loaded ===")
-            self.logger.log_message(f"Loaded     : {len(loaded_keys)} keys")
-            self.logger.log_message(f"Missing    : {len(missing)} keys")
-            self.logger.log_message(f"Unexpected : {len(unexpected)} keys")            
-
-            if self.reload_optimizer:
-                if "optimizer_state" in ckpt and ckpt["optimizer_state"] is not None:
-                    self.optimizer.load_state_dict(ckpt["optimizer_state"])
-                    
-                    if self.reload_optimizer_with_initial_lr:
-                        for param_group in self.optimizer.param_groups:
-                            param_group['lr'] = self.inital_lr                    
-
-                if "scheduler_state" in ckpt and ckpt["scheduler_state"] is not None:
-                    if hasattr(self, "lr_scheduler"):
-                        self.lr_scheduler.load_state_dict(ckpt["scheduler_state"])
-
-                self.start_epoch = ckpt.get("epoch", 1)
-                self.logger.log_message(f"Resuming from epoch {self.start_epoch}")
-    
-    def _apply_stage(self, epoch):
-        """Progressive unfreezing: adjust trainability and LR per param group based on epoch."""
-        if not self.staged_training_enabled:
-            return
-
-        current_stage = None
-        for stage in self.staged_training_stages:
-            end = stage["end_epoch"] if stage["end_epoch"] != -1 else float("inf")
-            if stage["start_epoch"] <= epoch <= end:
-                current_stage = stage
-                break
-
-        if current_stage is None:
-            return
-
-        trainable_set = set(current_stage["trainable"])
-        lr_scales = current_stage["lr_scales"]
-
-        for pg in self.optimizer.param_groups:
-            name = pg.get("name", "")
-            if name in ("vision_encoder", "gdip_module"):
-                component = "gdip"
-            elif name == "backbone":
-                component = "backbone"
-            elif name == "detect":
-                component = "detect"
-            else:
-                continue
-
-            is_trainable = component in trainable_set
-            for p in pg["params"]:
-                p.requires_grad = is_trainable
-            pg["lr"] = self.lr0 * lr_scales.get(component, 0.0) if is_trainable else 0.0
-
-        if epoch == current_stage["start_epoch"]:
-            self.logger.log_message(
-                f"[Stage] epoch {epoch}: trainable={list(trainable_set)}, lr_scales={lr_scales}"
-            )
-
-    def train(self, checkpoint_path:str=None):
-        self.logger.log_line()
-        
-        tasks = []
-        
-        #replace, TODO
-        if isinstance(self.model, YOLOP) or isinstance(self.model, YOLOv8P):        
-            if self.model.detection_head_idx != -1:
-                tasks.append("Detection, ")
-            if self.model.segmentation_head_idx != -1:
-                tasks.append("Drivable Segmentation, ")
-            if self.model.lane_segmentation_head_idx != -1:
-                tasks.append("Lane Segmentation")
-        elif isinstance(self.model, GDIPYolo) or isinstance(self.model, DENetYolo):
-            if self.model.task_network.detection_head_idx != -1:
-                tasks.append("Detection, ")
-            if self.model.task_network.segmentation_head_idx != -1:
-                tasks.append("Drivable Segmentation, ")
-            if self.model.task_network.lane_segmentation_head_idx != -1:
-                tasks.append("Lane Segmentation")            
-
-        tasks = 'Tasks: '.join(tasks)
-        
-        self.logger.log_message(
-            f'Training: Max Epoch - {self.epochs} -- {tasks} -- Device: {self.device}'
-        )
-        self.logger.log_new_line()
-
-        self.total_training_time = 0.0
         self.cur_epoch = 0
-        # self.best_score = 0.0
-        self.best_score = defaultdict(float)
 
-        # Reset best model tracking
-        self.best_map = 0.0
-        self.best_epoch = 0
+    def _create_optimizer_and_scheduler(self):
+        if self.optimizer is None:
+            self._create_optimizer()
+        if self.lr_scheduler is None:
+            self._create_scheduler()
 
-        self.start_epoch = 1
-        self.resume_from_ckpt(checkpoint_path)
+    def _create_optimizer(self):
+        param_groups = self.model.get_param_groups()
+        ctx = OptimizerContext(param_groups, self.training_args)
+        self.optimizer = build_optmizer(ctx)
 
-        # Initialize EMA after loading checkpoint
-        if self.use_ema:
-            self.ema = ModelEMA(self.model, decay=self.ema_decay, warmup_steps=self.ema_warmup_steps)
-            self.logger.log_message(f'EMA enabled with decay={self.ema_decay}, warmup_steps={self.ema_warmup_steps}')
+    def _create_scheduler(self):
+        ctx = SchedulerContext(
+            self.optimizer, self.training_args,
+            total_epochs=self.training_args.epochs,
+        )
+        self.lr_scheduler = build_scheduler(ctx)
 
-            # If resuming, try to load EMA state
-            if checkpoint_path and os.path.exists(checkpoint_path):
-                ckpt = torch.load(checkpoint_path, map_location=self.device, weights_only=False)
-                if 'ema_state' in ckpt and ckpt['ema_state'] is not None:
-                    self.ema.load_state_dict(ckpt['ema_state'])
-                    self.logger.log_message('EMA state loaded from checkpoint')
-                if 'best_map' in ckpt:
-                    self.best_map = ckpt['best_map']
-                    self.best_epoch = ckpt.get('best_epoch', 0)
-                    self.logger.log_message(f'Best mAP from checkpoint: {self.best_map:.4f} (epoch {self.best_epoch})')
+    # ---- outer loop --------------------------------------------------------
 
-        for epoch in range(self.start_epoch, self.epochs + 1):
+    def train(self):
+        if self.train_dataloader is None and self.training_args.monitor_train:
+            raise ValueError("Trainer: training requires a train_dataset.")
+
+        if hasattr(self.model, "get_active_tasks"):
+            tasks = self.model.get_active_tasks()
+            self.logger.log_message(
+                f'Training: Max Epoch - {self.training_args.epochs} -- {tasks} -- Device: {self.device}'
+            )
+        else:
+            self.logger.log_message(
+                f'Training: Max Epoch - {self.training_args.epochs} -- Device: {self.device}'
+            )
+
+        self.logger.log_new_line()
+        self.callbacks.on_train_begin(self)
+
+        self.start_epoch = self.cur_epoch
+        for epoch in range(self.cur_epoch, self.training_args.epochs + 1):
             self.cur_epoch = epoch
-            self._apply_stage(epoch)
             self.logger.log_line()
 
-            if self.monitor_train:
-                self.train_one_epoch()
+            if self.training_args.monitor_train:
+                self.callbacks.on_epoch_begin(self)
+                self._train_one_epoch()
 
-                if (self.cur_epoch + 1) % self.checkpoint_idx == 0:
-                    ckpt_dir = f'{self.output_dir}/checkpoints/ckpt_{self.cur_epoch}'
-                    if not os.path.exists(ckpt_dir):
-                        os.makedirs(ckpt_dir)
+            if self.val_dataloaders and self.training_args.monitor_val:
+                if self.cur_epoch >= self.training_args.first_val_epoch:
+                    for prefix, dataloader in self.val_dataloaders.items():
+                        self.eval_metrics[prefix].reset()
+                        self._eval_one_epoch(dataloader, prefix)
 
-                    checkpoint = {
-                        "epoch": self.cur_epoch,
-                        "model_state": self.model.state_dict(),
-                        "optimizer_state": self.optimizer.state_dict(),
-                        "scheduler_state": self.lr_scheduler.state_dict() if hasattr(self, "lr_scheduler") else None,
-                        "best_map": self.best_map,
-                        "best_epoch": self.best_epoch,
-                    }
+            self.callbacks.on_epoch_end(self)
 
-                    # Save EMA state
-                    if self.use_ema and self.ema is not None:
-                        checkpoint["ema_state"] = self.ema.state_dict()
+    # ---- task-agnostic epoch scaffold --------------------------------------
 
-                    torch.save(checkpoint, f"{ckpt_dir}/ckpt-{self.cur_epoch}.pt")
-
-            if self.monitor_val and self.cur_epoch >= self.first_val_epoch:
-                if self.use_ema and self.ema is not None:
-                    self.ema.apply_shadow(self.model)
-                    self.logger.log_message('Using EMA weights for evaluation')
-
-                self.eval_one_epoch()
-                if self.val_foggy_dataloader is not None:
-                    self.eval_one_epoch(self.val_foggy_dataloader, metric_prefix="val_foggy")
-
-                if self.use_ema and self.ema is not None:
-                    self.ema.restore(self.model)
-
-        # Finish WandB run
-        self.logger.log_line()
-        self.logger.log_message("Training completed!")
-        self.logger.log_line()
-        self.wandb_logger.finish()
-
-    
-    def train_one_epoch(self):
-        
+    def _train_one_epoch(self):
         self.model.train()
 
+        self._init_train_window()
         total_loss = 0.0
-        ten_percent_batch_total_loss = 0
-
         epoch_training_time = 0.0
-        ten_percent_training_time = 0.0
 
-        # Initialize current_lr from optimizer (avoid UnboundLocalError if logging before first grad step)
+        self.train_batch_idx = 0
+        self.batch_images = None
+        self.total_train_batch = len(self.train_dataloader)
+        self.ten_percent_train_batch = max(1, self.total_train_batch // 100)
+
         current_lr = self.optimizer.param_groups[0]['lr']
 
         train_iter = tqdm(self.train_dataloader, desc=f'Training Epoch: {self.cur_epoch}')
         for batch_idx, data_items in enumerate(train_iter):
-            
-            step_begin_time = time.time()
-            loss, model_outputs = self.train_one_step(data_items)
-            step_end_time = time.time()
 
-            # Log GDIP enhanced images periodically
-            if isinstance(self.model, GDIPYolo) and (batch_idx + 1) % 200 == 0:
-                if self.model.enhanced_image is not None:
+            step_begin = time.time()
+            loss, model_outputs = self._train_one_step(data_items)
+            step_time = time.time() - step_begin
 
-                    enhanced_imgs = self.model.enhanced_image.clamp(0, 1)
-                    original_images = data_items["images"].clamp(0, 1)
+            self.train_batch_idx = batch_idx
+            self.batch_images = data_items.get("images")
 
-                    combined = torch.cat([original_images, enhanced_imgs], dim=3)
-                    combined = (combined * 255).to(torch.uint8)
-
-                    # enhanced_imgs = (self.model.enhanced_image.clamp(0, 1) * 255).to(torch.uint8)
-                    self.wandb_logger.log_images(
-                        "train/original_vs_enhanced",
-                        combined,
-                        step=self.cur_epoch * self.total_train_batch + batch_idx,
-                        caption=f'train_{self.cur_epoch}_batch_{batch_idx}'
+            if ((batch_idx + 1) % self.training_args.gradient_accumulation_steps == 0) or (batch_idx == self.total_train_batch - 1):
+                if self.training_args.gradient_clipping:
+                    grad_norm = torch.nn.utils.clip_grad_norm_(
+                        self.model.parameters(),
+                        self.training_args.gradient_clipping,
                     )
-                    self.model.enhanced_image = None
-
-                # Log GDIP gate firing pattern
-                if self.model.gates is not None:
-                    gate_names = ["white_balance", "gamma", "identity", "sharpening", "defog", "contrast", "tone"]
-                    step = self.cur_epoch * self.total_train_batch + batch_idx
-
-                    if isinstance(self.model.gates, torch.Tensor):
-                        # Single-level GDIP: gates shape (batch_size, 7)
-                        gate_means = self.model.gates.mean(dim=0)
-                        gate_metrics = {f"train/gates/{name}": gate_means[i].item() for i, name in enumerate(gate_names)}
-                        self.wandb_logger.log_metrics(gate_metrics, step=step)
-                    elif isinstance(self.model.gates, list):
-                        # Multi-level GDIP: list of (batch_size, 7) tensors
-                        for block_idx, block_gates in enumerate(self.model.gates):
-                            gate_means = block_gates.mean(dim=0)
-                            gate_metrics = {f"train/gates/block{block_idx}/{name}": gate_means[i].item() for i, name in enumerate(gate_names)}
-                            self.wandb_logger.log_metrics(gate_metrics, step=step)
-
-                    self.model.gates = None
-
-            if isinstance(self.model, DENetYolo) and (batch_idx + 1) % 200 == 0:
-                if self.model.enhanced_image is not None:
-                    
-                    enhanced_imgs = self.model.enhanced_image.clamp(0, 1)
-                    original_images = data_items["images"].clamp(0, 1)
-                    
-                    combined = torch.cat([original_images, enhanced_imgs], dim=3)
-                    combined = (combined * 255).to(torch.uint8)
-                    
-                    # enhanced_imgs = (self.model.enhanced_image.clamp(0, 1) * 255).to(torch.uint8)
-                    self.wandb_logger.log_images(
-                        "train/original_vs_enhanced",
-                        combined,
-                        step=self.cur_epoch * self.total_train_batch + batch_idx,
-                        caption=f'train_{self.cur_epoch}_batch_{batch_idx}'
-                    )
-                    self.model.enhanced_image = None                    
-            
-            if ((batch_idx + 1) % self.gradient_accumulation_steps == 0) or (batch_idx == self.train_dataloader.__len__() - 1):
-
-                # Clip gradients and check for non-finite norms before optimizer step
-                # NaN/inf gradients from CIoU or other ops can poison all weights via AdamW
-                if self.gradient_clipping:
-                    grad_norm = torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.gradient_clipping)
                     if not torch.isfinite(grad_norm):
                         self.optimizer.zero_grad()
                         continue
-
                 self.optimizer.step()
                 self.optimizer.zero_grad()
-                current_lr = self.optimizer.param_groups[0]['lr']
-
-                # Update EMA weights after optimizer step
-                if self.use_ema and self.ema is not None:
-                    self.ema.update(self.model)
 
             total_loss += loss.item()
-            ten_percent_batch_total_loss += loss.item()
+            epoch_training_time += step_time
 
-            epoch_training_time += (step_end_time - step_begin_time)
-            ten_percent_training_time += (step_end_time - step_begin_time)
+            self._accumulate_train_iter(loss, model_outputs, step_time)
 
             if (batch_idx + 1) % self.ten_percent_train_batch == 0:
+                self._apply_warmup()
+                self._log_train_window(current_lr, batch_idx)
+                self._init_train_window()
 
-                if self.cur_epoch < self.warmup_epochs:
-                    warmup_factor = (self.cur_epoch + (batch_idx + 1)/self.total_train_batch) / self.warmup_epochs
-                    warmup_factor = min(1.0, warmup_factor)
+            self.callbacks.on_step_end(self)
 
-                    # LR warmup per param group (bias gets special warmup LR)
-                    # Skip groups frozen by staged training (lr == 0)
-                    for pg in self.optimizer.param_groups:
-                        if self.staged_training_enabled and pg['lr'] == 0.0:
-                            continue
-                        scale = pg.get('lr_scale', 1.0)
-                        if 'bias' in pg.get('name',''):
-                            pg['lr'] = (self.warmup_bias_lr + warmup_factor * (self.lr0 - self.warmup_bias_lr)) * scale
-                        else:
-                            pg['lr'] = warmup_factor * self.lr0 * scale
-
-                    # Momentum warmup if optimizer supports momentum
-                    if 'momentum' in self.optimizer.param_groups[0]:
-                        self.optimizer.param_groups[0]['momentum'] = \
-                            self.warmup_momentum + warmup_factor * (self.main_momentum - self.warmup_momentum)
-
-                average_loss = ten_percent_batch_total_loss/self.ten_percent_train_batch
-                average_time = ten_percent_training_time/self.ten_percent_train_batch
-
-                message = f'Epoch {self.cur_epoch} - iter {batch_idx}/{self.total_train_batch} - total loss {average_loss:.4f} -- current_lr: {current_lr}'
-                self.logger.log_message(message=message)
-
-                # Log to WandB
-                self.wandb_logger.log_metrics({
-                    "train/loss_10pct": average_loss,
-                    "train/lr": current_lr,
-                    "train/avg_step_time": average_time
-                }, step=self.cur_epoch * self.total_train_batch + batch_idx)
-
-                ten_percent_batch_total_loss = 0
-                ten_percent_training_time = 0.0
-                ten_percent_metric_per_grid = defaultdict(lambda:defaultdict(int))
-                
         avg_epoch_loss = total_loss / self.total_train_batch
 
-        self.logger.log_message(
-            f'Epoch {self.cur_epoch} - Average Loss {avg_epoch_loss:.4f} -- current_lr: {current_lr}'
-        )
-
-        # Step the learning rate scheduler at the end of epoch
         if hasattr(self, 'lr_scheduler'):
-            if self.lr_scheduler_start_epoch != -1 and self.cur_epoch > self.lr_scheduler_start_epoch:
+            if self.training_args.lr_scheduler_start_epoch != -1 and \
+                    self.cur_epoch > self.training_args.lr_scheduler_start_epoch:
                 self.lr_scheduler.step()
-                if self.staged_training_enabled:
-                    self._apply_stage(self.cur_epoch)
                 current_lr = self.optimizer.param_groups[0]['lr']
 
-        # Log epoch-level metrics to WandB
-        self.wandb_logger.log_metrics({
-            "train/epoch_loss": avg_epoch_loss,
-            "train/epoch_time": epoch_training_time,
-            "train/epoch": self.cur_epoch
-        }, step=self.cur_epoch)
-                
-    
-    def train_one_step(self, data_items:dict) -> PanopticModelOutputs:
-        
-        for k, v in data_items.items():
-            if torch.is_tensor(v):
-                data_items[k] = v.to(self.device)
-                
-        outputs = self.model(
-            data_items["images"],
-            targets={
-                "drivable_area_seg": data_items.get("drivable_area_seg"),
-                "lane_seg": data_items.get("segmentation_masks"),
-                "detections": data_items["detections"],
-                "clean_images": data_items.get("clean_images")
-            }            
-        )        
-        
-        loss = torch.zeros(1, device=self.device)
-        
-        if outputs.detection_loss is not None:
-            loss += outputs.detection_loss
-            
-        if outputs.drivable_segmentation_loss is not None:
-            loss += outputs.drivable_segmentation_loss
-            
-        if outputs.lane_segmentation_loss is not None:
-            loss += outputs.lane_segmentation_loss
-            
-        if isinstance(self.model, GDIPYolo) or isinstance(self.model, DENetYolo):
-            if hasattr(outputs, "defogging_loss") and outputs.defogging_loss is not None:
-                loss += self.lambda_defog * outputs.defogging_loss
+        self._log_train_epoch(avg_epoch_loss, current_lr, epoch_training_time)
 
-        loss.backward()
-
-        return loss, outputs
-
-    def _compute_confusion_matrix(self, preds: torch.Tensor, targets: torch.Tensor, num_classes: int) -> torch.Tensor:
-        """Compute confusion matrix for a batch of predictions and targets."""
-        preds_flat = preds.view(-1)
-        targets_flat = targets.view(-1)
-
-        # Filter valid indices (in case of ignore labels)
-        mask = (targets_flat >= 0) & (targets_flat < num_classes)
-        preds_flat = preds_flat[mask]
-        targets_flat = targets_flat[mask]
-
-        # Compute confusion matrix using bincount
-        indices = targets_flat * num_classes + preds_flat
-        conf_matrix = torch.bincount(indices, minlength=num_classes * num_classes)
-        return conf_matrix.reshape(num_classes, num_classes)
-
-    def _compute_metrics_from_confusion_matrix(self, conf_matrix: torch.Tensor, num_classes: int) -> tuple:
-        """Compute IoU and Dice metrics from confusion matrix."""
-        iou_dict = {}
-        dice_dict = {}
-
-        iou_per_class = []
-        dice_per_class = []
-
-        for cls in range(num_classes):
-            tp = conf_matrix[cls, cls].float()
-            fp = conf_matrix[:, cls].sum().float() - tp
-            fn = conf_matrix[cls, :].sum().float() - tp
-
-            # IoU = TP / (TP + FP + FN)
-            iou = tp / (tp + fp + fn + 1e-10)
-            iou_dict[f'IoU_class_{cls}'] = iou.item()
-            iou_per_class.append(iou.item())
-
-            # Dice = 2*TP / (2*TP + FP + FN)
-            dice = (2 * tp) / (2 * tp + fp + fn + 1e-10)
-            dice_dict[f'Dice_class_{cls}'] = dice.item()
-            dice_per_class.append(dice.item())
-
-        iou_dict['mIoU'] = np.mean(iou_per_class)
-        dice_dict['mDice'] = np.mean(dice_per_class)
-
-        return iou_dict, dice_dict
-
-    def eval_one_epoch(self, dataloader=None, metric_prefix="val"):
-        """Evaluate model on validation set."""
-
-        dataloader = dataloader or self.val_dataloader
+    def _eval_one_epoch(self, dataloader=None, metric_prefix="val"):
+        if not dataloader or len(dataloader) == 0:
+            return
 
         self.model.eval()
-        
-        # Collect detection predictions (smaller memory footprint)
-        # all_detections = []
-        # all_detection_targets = []
-        
-        dets_by_image = defaultdict(None) #image_id -> (num_dets, 6)
-        gt_by_image = defaultdict(None) #image_id -> (num_gt, 5)
-
-        # Use confusion matrices for segmentation (memory efficient)
-        num_drivable_classes = 2
-        num_lane_classes = 2  # Will be updated dynamically if needed
-        drivable_confusion_matrix = None
-        lane_confusion_matrix = None
-
-        total_val_loss = 0.0
-        total_det_loss = 0.0
-        total_drivable_loss = 0.0
-        total_lane_loss = 0.0
-        global_image_idx = 0
-
-        conf_threshold = 0.001
-        iou_threshold = 0.45
-        max_detections = 500
-
         self.logger.log_line()
         self.logger.log_message(f'[{metric_prefix}] Evaluating Epoch {self.cur_epoch}')
 
         val_iter = tqdm(dataloader, desc=f'[{metric_prefix}] Epoch: {self.cur_epoch}')
 
-        with torch.no_grad():
-            for batch_idx, data_items in enumerate(val_iter):
-                # Move data to device
-                for k, v in data_items.items():
-                    if torch.is_tensor(v):
-                        data_items[k] = v.to(self.device)
+        self.eval_batch_idx = 0
+        self.eval_metric_prefix = metric_prefix
+        self.total_eval_batch = len(dataloader)
+        self.eval_batch_ctx = EvalBatchContext()
 
-                # Forward pass
-                outputs = self.model(
-                    data_items["images"],
-                    targets={
-                        "drivable_area_seg": data_items.get("drivable_area_seg"),
-                        "lane_seg": data_items.get("segmentation_masks"),
-                        "detections": data_items["detections"],
-                        "clean_images": data_items.get("clean_images")
-                    }
-                )
+        self._init_eval_state(metric_prefix)
 
-                # Log GDIP enhanced images for first val batch each epoch
-                if isinstance(self.model, GDIPYolo) and batch_idx == 0:
-                    if self.model.enhanced_image is not None:
-                        # enhanced_imgs = (self.model.enhanced_image.clamp(0, 1) * 255).to(torch.uint8)
+        for batch_idx, data_items in enumerate(val_iter):
+            for k, v in data_items.items():
+                if torch.is_tensor(v):
+                    data_items[k] = v.to(self.device)
 
-                        enhanced_imgs = self.model.enhanced_image.clamp(0, 1)
-                        original_images = data_items["images"].clamp(0, 1)
+            try:
+                with torch.no_grad():
+                    outputs = self._forward_model(data_items)
+            except ValueError as e:
+                if "model produced no outputs" not in str(e):
+                    raise
+                self._log_eval_skip(batch_idx, metric_prefix, data_items)
+                continue
 
-                        combined = torch.cat([original_images, enhanced_imgs], dim=3)
-                        combined = (combined * 255).to(torch.uint8)                        
+            self.eval_batch_idx = batch_idx
+            self.eval_batch_ctx.cur_eval_model_outputs = outputs
 
-                        self.wandb_logger.log_images(
-                            f"{metric_prefix}/enhanced_images",
-                            combined,
-                            step=self.cur_epoch,
-                            caption=f'eval_{self.cur_epoch}'
-                        )
-                        self.model.enhanced_image = None
+            self._populate_eval_batch_ctx(data_items, outputs)
+            self._accumulate_eval_iter(outputs, data_items)
 
-                    # Log GDIP gate firing pattern for first val batch
-                    if self.model.gates is not None:
-                        gate_names = ["white_balance", "gamma", "identity", "sharpening", "defog", "contrast", "tone"]
+            self.callbacks.on_eval_batch_end(self)
 
-                        if isinstance(self.model.gates, torch.Tensor):
-                            gate_means = self.model.gates.mean(dim=0)
-                            gate_metrics = {f"{metric_prefix}/gates/{name}": gate_means[i].item() for i, name in enumerate(gate_names)}
-                            self.wandb_logger.log_metrics(gate_metrics, step=self.cur_epoch)
-                        elif isinstance(self.model.gates, list):
-                            for block_idx, block_gates in enumerate(self.model.gates):
-                                gate_means = block_gates.mean(dim=0)
-                                gate_metrics = {f"{metric_prefix}/gates/block{block_idx}/{name}": gate_means[i].item() for i, name in enumerate(gate_names)}
-                                self.wandb_logger.log_metrics(gate_metrics, step=self.cur_epoch)
+        self.callbacks.on_eval_end(self)
+        self._log_eval_epoch(metric_prefix)
 
-                        self.model.gates = None
-                        
-                if isinstance(self.model, DENetYolo) and batch_idx == 0:
-                    if self.model.enhanced_image is not None:
-                        # enhanced_imgs = (self.model.enhanced_image.clamp(0, 1) * 255).to(torch.uint8)
+    def _apply_warmup(self):
+        if self.cur_epoch < self.training_args.warmup_epochs:
+            warmup_factor = (self.cur_epoch + (self.train_batch_idx + 1) / self.total_train_batch) / self.training_args.warmup_epochs
+            warmup_factor = min(1.0, warmup_factor)
 
-                        enhanced_imgs = self.model.enhanced_image.clamp(0, 1)
-                        original_images = data_items["images"].clamp(0, 1)
+            for pg in self.optimizer.param_groups:
+                if pg['lr'] == 0.0:
+                    continue
+                scale = pg.get('lr_scale', 1.0)
+                if 'bias' in pg.get('name', ''):
+                    pg['lr'] = (self.training_args.warmup_bias_lr + warmup_factor * (self.training_args.initial_lr - self.training_args.warmup_bias_lr)) * scale
+                else:
+                    pg['lr'] = warmup_factor * self.training_args.initial_lr * scale
 
-                        combined = torch.cat([original_images, enhanced_imgs], dim=3)
-                        combined = (combined * 255).to(torch.uint8)                        
+            if 'momentum' in self.optimizer.param_groups[0]:
+                self.optimizer.param_groups[0]['momentum'] = \
+                    self.training_args.warmup_momentum + warmup_factor * (self.training_args.main_momentum - self.training_args.warmup_momentum)
 
-                        self.wandb_logger.log_images(
-                            f"{metric_prefix}/enhanced_images",
-                            combined,
-                            step=self.cur_epoch,
-                            caption=f'eval_{self.cur_epoch}'
-                        )
-                        self.model.enhanced_image = None                    
+    # ---- forward / loss surface (subclass extends) -------------------------
+    def _forward_model(self, data_items: dict):
+        raise NotImplementedError("Subclass must implement _forward_model")
 
-                # Accumulate losses
-                if outputs.detection_loss is not None:
-                    total_det_loss += outputs.detection_loss.item()
-                    total_val_loss += outputs.detection_loss.item()
+    def _build_targets(self, data_items: dict) -> dict:
+        return {}
 
-                if outputs.drivable_segmentation_loss is not None:
-                    total_drivable_loss += outputs.drivable_segmentation_loss.item()
-                    total_val_loss += outputs.drivable_segmentation_loss.item()
+    def _train_one_step(self, data_items: dict):
+        # Overrides for multi-task loss summing.
+        for k, v in data_items.items():
+            if torch.is_tensor(v):
+                data_items[k] = v.to(self.device)
 
-                if outputs.lane_segmentation_loss is not None:
-                    total_lane_loss += outputs.lane_segmentation_loss.item()
-                    total_val_loss += outputs.lane_segmentation_loss.item()
-
-                # Process detection predictions - concatenate layer outputs and apply NMS
-                if outputs.detection_predictions is not None:
-                    detection_preds = outputs.detection_predictions
-                    batch_size, _, image_h, image_w = data_items["images"].shape
-                    
-                    if isinstance(detection_preds, torch.Tensor):
-                        # yolov8 anchor-free postProcess
-                        nms_results = DetectionHelper.non_max_suppression_v8(
-                            detection_preds, 
-                            conf_threshold=conf_threshold,
-                            iou_threshold=iou_threshold,
-                            max_detections=max_detections                            
-                        )
-
-                    else:
-                        # Concatenate predictions from all detection layers
-                        batch_predictions = []
-                        for layer_pred in detection_preds:
-                            b, na, h, w, nc = layer_pred.shape
-                            layer_pred_flat = layer_pred.view(b, na * h * w, nc)
-                            batch_predictions.append(layer_pred_flat)
-
-                        concatenated_preds = torch.cat(batch_predictions, dim=1)
-
-                        # Apply NMS
-                        nms_results = DetectionHelper.non_max_suppression(
-                            concatenated_preds,
-                            conf_threshold=conf_threshold,
-                            iou_threshold=iou_threshold,
-                            max_detections=max_detections
-                        )
-                    
-                    image_paths = data_items.get("image_paths", [])
-
-                    for image_idx, dets in enumerate(nms_results):
-                        if dets is not None:
-                            dets_by_image[global_image_idx] = dets
-                        else:
-                            dets_by_image[global_image_idx] = None
-                        
-                        target_detections = data_items.get("detections")
-                        gts = None
-
-                        if target_detections is not None:
-                            mask = target_detections[:, 0] == image_idx
-                            img_targets = target_detections[mask]
-                        else:
-                            img_targets = None
-
-                        if img_targets is not None and img_targets.shape[0] > 0:
-                            boxes_xywh = img_targets[:, 2:6].clone()
-                            boxes_xywh[:, [0,2]] *= image_w
-                            boxes_xywh[:, [1,3]] *= image_h
-                            boxes_xyxy = DetectionHelper.xywh2xyxy(boxes_xywh)
-                            classes = img_targets[:, 1:2]
-                            gts = torch.cat([boxes_xyxy, classes], dim=1)
-                            gt_by_image[global_image_idx] = gts
-                        else:
-                            gt_by_image[global_image_idx] = None
-
-                        global_image_idx += 1
-                        
-                        if self.eval_visualize_outputs and (batch_idx + 1) % 100 == 0:
-                            if not os.path.exists(f'{self.output_dir}/visualizations/detections'):
-                                os.makedirs(f'{self.output_dir}/visualizations/detections')
-
-                            epoch_vis_dir = f'{self.output_dir}/visualizations/detections/eval_epoch_{self.cur_epoch}'
-                            if not os.path.exists(epoch_vis_dir):
-                                os.makedirs(epoch_vis_dir)
-
-                            if image_paths and image_idx < len(image_paths):
-                                img_name = os.path.basename(image_paths[image_idx])
-                                save_path = os.path.join(epoch_vis_dir, f'vis_{img_name}.png')
-                            else:
-                                save_path = os.path.join(epoch_vis_dir, f'vis_{image_idx}.png')
-                                
-                            DetectionHelper.visualize_detections(
-                                image=data_items["images"][image_idx],
-                                predictions=dets,
-                                targets=gts,
-                                class_names=CLASS_NAMES,
-                                save_path=save_path
-                            )
-
-                # Process segmentation with running confusion matrix (memory efficient)
-                if outputs.drivable_segmentation_predictions is not None:
-                    drivable_preds = torch.argmax(outputs.drivable_segmentation_predictions, dim=1)
-                    if data_items.get("drivable_area_seg") is not None:
-                        drivable_targets = data_items["drivable_area_seg"]
-                        # Initialize confusion matrix on first batch
-                        if drivable_confusion_matrix is None:
-                            drivable_confusion_matrix = torch.zeros(
-                                num_drivable_classes, num_drivable_classes, dtype=torch.int64
-                            )
-                        # Update confusion matrix
-                        drivable_confusion_matrix += SegmentationUtils._compute_confusion_matrix(
-                            drivable_preds.cpu(), drivable_targets.cpu(), num_drivable_classes
-                        )
-
-                        if self.eval_visualize_outputs and (batch_idx + 1) % 100 == 0:
-                            if not os.path.exists(f'{self.output_dir}/visualizations/drivable_area'):
-                                os.makedirs(f'{self.output_dir}/visualizations/drivable_area')
-
-                            epoch_vis_dir = f'{self.output_dir}/visualizations/drivable_area/eval_epoch_{self.cur_epoch}'
-                            if not os.path.exists(epoch_vis_dir):
-                                os.makedirs(epoch_vis_dir)
-                                
-                            batch_drivable_preds = SegmentationUtils.transparent_overlay(
-                                original_imgs=data_items["images"],
-                                masks=drivable_preds
-                            )
-
-                            batch_drivable_gts = SegmentationUtils.transparent_overlay(
-                                original_imgs=data_items["images"],
-                                masks=drivable_targets
-                            )
-
-                            image_paths = data_items.get("image_paths", [])
-                            for image_idx, (pred_overlay, gt_overlay) in enumerate(zip(batch_drivable_preds, batch_drivable_gts)):
-                                if image_paths and image_idx < len(image_paths):
-                                    img_name = os.path.basename(image_paths[image_idx])
-                                    pred_save_path = os.path.join(epoch_vis_dir, f'vis_{img_name}_pred.png')
-                                    gt_save_path = os.path.join(epoch_vis_dir, f'vis_{img_name}_gt.png')
-                                else:
-                                    pred_save_path = os.path.join(epoch_vis_dir, f'vis_{image_idx}_pred.png')
-                                    gt_save_path = os.path.join(epoch_vis_dir, f'vis_{image_idx}_gt.png')
-                                    
-                                SegmentationUtils.save_overlay_image(
-                                    vis_image=pred_overlay,
-                                    save_path=pred_save_path
-                                )
-                                
-                                SegmentationUtils.save_overlay_image(
-                                    vis_image=gt_overlay,
-                                    save_path=gt_save_path
-                                )
-
-                if outputs.lane_segmentation_predictions is not None:
-                    lane_preds = torch.argmax(outputs.lane_segmentation_predictions, dim=1)
-                    if data_items.get("segmentation_masks") is not None:
-                        lane_targets = data_items["segmentation_masks"]
-                        # Dynamically determine number of lane classes
-                        max_class = max(lane_preds.max().item(), lane_targets.max().item()) + 1
-                        if max_class > num_lane_classes:
-                            # Expand confusion matrix if needed
-                            if lane_confusion_matrix is not None:
-                                old_matrix = lane_confusion_matrix
-                                lane_confusion_matrix = torch.zeros(
-                                    max_class, max_class, dtype=torch.int64
-                                )
-                                lane_confusion_matrix[:old_matrix.shape[0], :old_matrix.shape[1]] = old_matrix
-                            num_lane_classes = max_class
-                        # Initialize confusion matrix on first batch
-                        if lane_confusion_matrix is None:
-                            lane_confusion_matrix = torch.zeros(
-                                num_lane_classes, num_lane_classes, dtype=torch.int64
-                            )
-                        # Update confusion matrix
-                        lane_confusion_matrix += SegmentationUtils._compute_confusion_matrix(
-                            lane_preds.cpu(), lane_targets.cpu(), num_lane_classes
-                        )
-
-        # Compute metrics
-        num_batches = len(dataloader)
-
-        # Average losses
-        avg_det_loss = total_det_loss / num_batches if num_batches > 0 else 0.0
-        avg_drivable_loss = total_drivable_loss / num_batches if num_batches > 0 else 0.0
-        avg_lane_loss = total_lane_loss / num_batches if num_batches > 0 else 0.0
-        avg_total_loss = (total_det_loss + total_drivable_loss + total_lane_loss) / num_batches
-
-        # Detection metrics
-        detection_metrics = {}
-        num_classes = len(BDD100KClassesReduced)
-        
-        stats_iou_threshold = self.stats_iou_threshold
-        ap_label = f"mAP@{stats_iou_threshold:g}"
-        ap_results, stats_per_class = DetectionMetrics.compute_stats(
-            dets_by_image,
-            gt_by_image,
-            iou_threshold=stats_iou_threshold,
-            num_classes=num_classes
-        )
-
-        detection_metrics = ap_results
-
-        # Create AP table for logging with class names
-        ap_table_data = [["Class", "AP"]]
-        for cls in range(num_classes):
-            class_name = BDD100KClassesReduced(cls).name
-            ap_value = ap_results.get(f'AP_class_{cls}', 0.0)
-            ap_table_data.append([f"{cls}: {class_name}", f"{ap_value:.4f}"])
-        ap_table_data.append([ap_label, f"{ap_results['mAP']:.4f}"])
-
-        ap_table_string = AsciiTable(ap_table_data).table
-        self.logger.log_message(f"\n[{metric_prefix}] Detection Metrics (AP@{stats_iou_threshold:g}):")
-        self.logger.log_message(ap_table_string)
-        
-        #Create Stats (TP, FP, FN)
-        stats_table_data = [["Class", "total GT", f"TP", f"FP", f"FN"]]
-        for cls in range(num_classes):
-            class_name = BDD100KClassesReduced(cls).name            
-            class_stats = stats_per_class[cls]        
-
-            total_gt = class_stats.get("total_gt", 0.0)
-            true_positives = class_stats.get("true_positives", 0.0)
-            false_positives = class_stats.get("false_positives", 0.0)
-            false_negatives = class_stats.get("false_negatives", 0.0)
-            
-            stats_table_data.append([f'{cls}: {class_name}', total_gt, 
-                                    true_positives, false_positives, false_negatives])
-            
-        stats_table_string = AsciiTable(stats_table_data).table
-        self.logger.log_message(f"\n[{metric_prefix}] Detection Metrics @{stats_iou_threshold}:")
-        self.logger.log_message(stats_table_string)
-
-        # Log AP table to WandB
-        wandb_ap_data = [[f"{cls}: {BDD100KClassesReduced(cls).name}", ap_results.get(f'AP_class_{cls}', 0.0)] for cls in range(num_classes)]
-        wandb_ap_data.append([ap_label, ap_results['mAP']])
-        self.wandb_logger.log_table(
-            f"{metric_prefix}/detection_ap",
-            columns=["Class", "AP"],
-            data=wandb_ap_data,
-            step=self.cur_epoch
-        )
-
-        # Free detection memory before computing segmentation metrics
-        del dets_by_image, gt_by_image
-        gc.collect()
-        torch.cuda.empty_cache()
-
-        # Drivable segmentation metrics (computed from confusion matrix)
-        drivable_metrics = {}
-        if drivable_confusion_matrix is not None:
-            drivable_iou, drivable_dice = SegmentationUtils._compute_metrics_from_confusion_matrix(
-                drivable_confusion_matrix, num_drivable_classes
+        outputs = self._forward_model(data_items)
+        loss = getattr(outputs, "loss", None)
+        if loss is None:
+            raise RuntimeError(
+                f"{type(outputs).__name__}.loss is None; base _train_one_step "
+                f"requires a scalar `.loss` on model outputs. Override in subclass "
+                f"or ensure the model computes loss when targets are provided."
             )
-            drivable_metrics = {**drivable_iou, **drivable_dice}
+        loss.backward()
+        return loss, outputs
 
-            # Create drivable metrics table
-            drivable_table_data = [["Metric", "Value"]]
-            drivable_table_data.append(["mIoU", f"{drivable_iou['mIoU']:.4f}"])
-            drivable_table_data.append(["mDice", f"{drivable_dice['mDice']:.4f}"])
-            for cls in range(num_drivable_classes):
-                drivable_table_data.append([f"IoU Class {cls}", f"{drivable_iou.get(f'IoU_class_{cls}', 0.0):.4f}"])
+    # ---- train hooks (default = generic loss + timing) ---------------------
+    def _init_train_window(self):
+        self._window_loss = 0.0
+        self._window_step_time = 0.0
+        self._window_batches = 0
 
-            drivable_table_string = AsciiTable(drivable_table_data).table
+    def _accumulate_train_iter(self, loss, model_outputs, step_time):
+        self._window_loss += loss.item()
+        self._window_step_time += step_time
+        self._window_batches += 1
 
-            self.logger.log_message(f"\n[{metric_prefix}] Drivable Segmentation Metrics:")
-            self.logger.log_message(drivable_table_string)
+    def _log_train_iter(self, batch_idx, loss, model_outputs, current_lr):
+        pass
 
-            # Log to WandB
-            wandb_drivable_data = [
-                ["mIoU", drivable_iou['mIoU']],
-                ["mDice", drivable_dice['mDice']]
-            ]
-            for cls in range(num_drivable_classes):
-                wandb_drivable_data.append([f"IoU_class_{cls}", drivable_iou.get(f'IoU_class_{cls}', 0.0)])
-
-            self.wandb_logger.log_table(
-                f"{metric_prefix}/drivable_metrics",
-                columns=["Metric", "Value"],
-                data=wandb_drivable_data,
-                step=self.cur_epoch
-            )
-
-        # Lane segmentation metrics (computed from confusion matrix)
-        lane_metrics = {}
-        if lane_confusion_matrix is not None:
-            lane_iou, lane_dice = SegmentationUtils._compute_metrics_from_confusion_matrix(
-                lane_confusion_matrix, num_lane_classes
-            )
-            lane_metrics = {**lane_iou, **lane_dice}
-
-            self.logger.log_message(f"\nLane Segmentation mIoU: {lane_iou['mIoU']:.4f}, mDice: {lane_dice['mDice']:.4f}")
-
-        # Log all metrics to WandB
-        wandb_metrics = {
-            f"{metric_prefix}/total_loss": avg_total_loss,
-            f"{metric_prefix}/detection_loss": avg_det_loss,
-            f"{metric_prefix}/drivable_loss": avg_drivable_loss,
-            f"{metric_prefix}/lane_loss": avg_lane_loss,
-            f"{metric_prefix}/epoch": self.cur_epoch
-        }
-
-        # Add detection metrics
-        if detection_metrics:
-            wandb_metrics[f"{metric_prefix}/mAP"] = detection_metrics["mAP"]
-            wandb_metrics[f"{metric_prefix}/{ap_label}"] = detection_metrics["mAP"]
-            for cls in range(num_classes):
-                wandb_metrics[f"{metric_prefix}/AP_class_{cls}"] = detection_metrics.get(f'AP_class_{cls}', 0.0)
-
-        # Add drivable metrics
-        if drivable_metrics:
-            wandb_metrics[f"{metric_prefix}/drivable_mIoU"] = drivable_metrics["mIoU"]
-            wandb_metrics[f"{metric_prefix}/drivable_mDice"] = drivable_metrics["mDice"]
-
-        # Add lane metrics
-        if lane_metrics:
-            wandb_metrics[f"{metric_prefix}/lane_mIoU"] = lane_metrics["mIoU"]
-            wandb_metrics[f"{metric_prefix}/lane_mDice"] = lane_metrics["mDice"]
-
-        self.wandb_logger.log_metrics(wandb_metrics, step=self.cur_epoch)
-
-        # Log summary
-        self.logger.log_line()
+    def _log_train_window(self, current_lr, batch_idx):
+        n = self._window_batches or 1
+        avg_loss = self._window_loss / n
+        avg_time = self._window_step_time / n
         self.logger.log_message(
-            f'[{metric_prefix}] Epoch {self.cur_epoch} - Avg Loss: {avg_total_loss:.4f} | '
-            f'Det Loss: {avg_det_loss:.4f} | Drivable Loss: {avg_drivable_loss:.4f}'
+            f"Epoch {self.cur_epoch} - iter {batch_idx}/{self.total_train_batch} "
+            f"- total {avg_loss:.4f} -- lr: {current_lr}"
         )
-        if detection_metrics:
-            self.logger.log_message(f'  [{metric_prefix}] {ap_label}: {detection_metrics["mAP"]:.4f}')
-        if drivable_metrics:
-            self.logger.log_message(f'  [{metric_prefix}] Drivable mIoU: {drivable_metrics["mIoU"]:.4f}')
+        self.wandb_logger.log_metrics({
+            "train/loss_10pct": avg_loss,
+            "train/lr": current_lr,
+            "train/avg_step_time": avg_time,
+        }, step=self.cur_epoch * self.total_train_batch + batch_idx)
 
-        # Save best model checkpoint (only clean val drives checkpointing)
-        if metric_prefix == "val":
-            current_map = detection_metrics.get("mAP", 0.0) if detection_metrics else 0.0
-            if current_map > self.best_map:
-                self.best_map = current_map
-                self.best_epoch = self.cur_epoch
-                self._save_best_checkpoint(current_map, detection_metrics, drivable_metrics)
+    def _log_train_epoch(self, avg_epoch_loss, current_lr, epoch_time):
+        self.logger.log_message(
+            f'Epoch {self.cur_epoch} - Average Loss {avg_epoch_loss:.4f} -- current_lr: {current_lr}'
+        )
+        self.wandb_logger.log_metrics({
+            "train/epoch_loss": avg_epoch_loss,
+            "train/epoch_time": epoch_time,
+            "train/epoch": self.cur_epoch,
+        }, step=self.cur_epoch)
 
-            self.logger.log_message(f'  Best mAP: {self.best_map:.4f} (epoch {self.best_epoch})')
-        self.logger.log_line()
+    # ---- eval hooks (Override) --------------------------------------
+    def _init_eval_state(self, prefix):
+        pass
 
-        # Final cleanup
-        gc.collect()
-        torch.cuda.empty_cache()
+    def _accumulate_eval_iter(self, outputs, data_items):
+        pass
 
-        self.model.train()
+    def _log_eval_epoch(self, prefix):
+        pass
 
-    def _save_best_checkpoint(self, current_map: float, detection_metrics: dict,
-                               drivable_metrics: dict = None):
-        """Save the best model checkpoint."""
-        best_ckpt_path = f'{self.output_dir}/best_model.pt'
+    def _populate_eval_batch_ctx(self, data_items, outputs):
+        # Base populates only the image-shape fields common to any task.
+        images = data_items.get("images")
+        if images is not None and images.dim() == 4:
+            _, _, image_h, image_w = images.shape
+            self.eval_batch_ctx.cur_eval_image_h = image_h
+            self.eval_batch_ctx.cur_eval_image_w = image_w
+        self.eval_batch_ctx.cur_eval_images = images
+        self.eval_batch_ctx.cur_eval_image_paths = data_items.get("image_paths", [])
 
-        checkpoint = {
-            "epoch": self.cur_epoch,
-            "model_state": self.model.state_dict(),
-            "optimizer_state": self.optimizer.state_dict(),
-            "scheduler_state": self.lr_scheduler.state_dict() if hasattr(self, "lr_scheduler") else None,
-            "best_map": current_map,
-            "best_epoch": self.cur_epoch,
-            "detection_metrics": detection_metrics,
-            "drivable_metrics": drivable_metrics,
+    def _log_eval_skip(self, batch_idx, metric_prefix, data_items):
+        paths = data_items.get("image_paths", [])
+        self.logger.log_message(
+            f"[skip-batch] eval iter {batch_idx} ({metric_prefix}): "
+            f"empty loss_items — skipping. paths={paths}"
+        )
+
+
+class PanopticTrainer(Trainer):
+
+    def _build_targets(self, data_items: dict) -> dict:
+        return {
+            "drivable_area_seg": data_items.get("drivable_area_seg"),
+            "lane_seg": data_items.get("segmentation_masks"),
+            "detections": data_items["detections"],
+            "lanes_detections": data_items.get("lanes_detections"),
+            "lane_seg_masks": data_items.get("lane_seg_masks"),
+            "clean_images": data_items.get("clean_images"),
         }
 
-        # Save EMA state if using EMA
-        if self.use_ema and self.ema is not None:
-            checkpoint["ema_state"] = self.ema.state_dict()
-            # Also save EMA weights as separate key (for easy inference loading)
-            checkpoint["ema_model_state"] = {k: v.clone() for k, v in self.ema.shadow.items()}
+    def _forward_model(self, data_items: dict) -> PanopticModelOutputs:
+        return self.model(
+            data_items["images"],
+            targets=self._build_targets(data_items),
+        )
 
-        torch.save(checkpoint, best_ckpt_path)
+    def _train_one_step(self, data_items: dict):
+        for k, v in data_items.items():
+            if torch.is_tensor(v):
+                data_items[k] = v.to(self.device)
 
-        self.logger.log_message(f'New best model saved! mAP: {current_map:.4f} -> {best_ckpt_path}')
+        try:
+            outputs = self._forward_model(data_items)
+        except ValueError as e:
+            if "model produced no outputs" not in str(e):
+                raise
+            paths = data_items.get("image_paths", [])
+            present = {
+                k: (None if data_items.get(k) is None
+                    else (tuple(data_items[k].shape) if torch.is_tensor(data_items[k])
+                          else "non-tensor"))
+                for k in ("detections", "drivable_area_seg", "segmentation_masks",
+                          "lanes_detections", "lane_seg_masks")
+            }
+            self.logger.log_message(
+                f"[skip-batch] iter {getattr(self, 'train_batch_idx', '?')}: "
+                f"empty loss_items — skipping. paths={paths} targets={present}"
+            )
+            return torch.zeros(1, device=self.device), None
 
-        # Log to WandB
-        self.wandb_logger.log_metrics({
-            "val/best_map": current_map,
-            "val/best_epoch": self.cur_epoch
-        }, step=self.cur_epoch)
+        loss = torch.zeros(1, device=self.device)
+        if outputs.detection_loss is not None:
+            loss += outputs.detection_loss
+        if outputs.drivable_segmentation_loss is not None:
+            loss += outputs.drivable_segmentation_loss
+        if outputs.lane_segmentation_loss is not None:
+            loss += outputs.lane_segmentation_loss
+        if outputs.lane_detection_loss is not None:
+            loss += outputs.lane_detection_loss
+        if self.has_enhancement:
+            if hasattr(outputs, "defogging_loss") and outputs.defogging_loss is not None:
+                loss += self.training_args.lambda_defog * outputs.defogging_loss
+
+        loss.backward()
+        return loss, outputs
+
+    def _init_train_window(self):
+        super()._init_train_window()
+        self._window_det = 0.0
+        self._window_drv = 0.0
+        self._window_lane_seg = 0.0
+        self._window_lane_det = 0.0
+        self._window_lane_items = {}
+
+    def _accumulate_train_iter(self, loss, model_outputs, step_time):
+        super()._accumulate_train_iter(loss, model_outputs, step_time)
+        if model_outputs is None:
+            return
+        if model_outputs.detection_loss is not None:
+            self._window_det += model_outputs.detection_loss.item()
+        if model_outputs.drivable_segmentation_loss is not None:
+            self._window_drv += model_outputs.drivable_segmentation_loss.item()
+        if model_outputs.lane_segmentation_loss is not None:
+            self._window_lane_seg += model_outputs.lane_segmentation_loss.item()
+        if model_outputs.lane_detection_loss is not None:
+            self._window_lane_det += model_outputs.lane_detection_loss.item()
+        if model_outputs.lane_detection_loss_items is not None:
+            for k, v in model_outputs.lane_detection_loss_items.items():
+                self._window_lane_items[k] = self._window_lane_items.get(k, 0.0) + v
+
+    def _log_train_window(self, current_lr, batch_idx):
+        n = self._window_batches or 1
+        average_loss = self._window_loss / n
+        average_time = self._window_step_time / n
+        avg_det = self._window_det / n
+        avg_drv = self._window_drv / n
+        avg_lane_seg = self._window_lane_seg / n
+        avg_lane_det = self._window_lane_det / n
+
+        parts = [f'total {average_loss:.4f}']
+        if avg_det > 0:
+            parts.append(f'det {avg_det:.4f}')
+        if avg_drv > 0:
+            parts.append(f'drv {avg_drv:.4f}')
+        if avg_lane_seg > 0:
+            parts.append(f'lane_seg {avg_lane_seg:.4f}')
+        if avg_lane_det > 0:
+            parts.append(f'lane_det {avg_lane_det:.4f}')
+
+        loss_str = ' | '.join(parts)
+        self.logger.log_message(
+            f'Epoch {self.cur_epoch} - iter {batch_idx}/{self.total_train_batch} - {loss_str} -- lr: {current_lr}'
+        )
+
+        wandb_metrics = {
+            "train/loss_10pct": average_loss,
+            "train/lr": current_lr,
+            "train/avg_step_time": average_time,
+        }
+        if avg_det > 0:
+            wandb_metrics["train/det_loss"] = avg_det
+        if avg_drv > 0:
+            wandb_metrics["train/drivable_loss"] = avg_drv
+        if avg_lane_seg > 0:
+            wandb_metrics["train/lane_seg_loss"] = avg_lane_seg
+        if avg_lane_det > 0:
+            wandb_metrics["train/lane_det_loss"] = avg_lane_det
+        for k, v in self._window_lane_items.items():
+            wandb_metrics[f"train/{k}"] = v / n
+
+        self.wandb_logger.log_metrics(
+            wandb_metrics,
+            step=self.cur_epoch * self.total_train_batch + batch_idx,
+        )
+
+    def _populate_eval_batch_ctx(self, data_items, outputs):
+        super()._populate_eval_batch_ctx(data_items, outputs)
+        self.eval_batch_ctx.cur_eval_gt_detections = data_items["detections"]
+        self.eval_batch_ctx.cur_eval_gt_drivable_area_seg = data_items.get("drivable_area_seg")
+        self.eval_batch_ctx.cur_eval_gt_lane_seg = data_items.get("segmentation_masks")
+        self.eval_batch_ctx.cur_eval_gt_lane_detections = data_items.get("lanes_detections")
+
+    def _log_eval_skip(self, batch_idx, metric_prefix, data_items):
+        paths = data_items.get("image_paths", [])
+        present = {
+            k: (None if data_items.get(k) is None
+                else (tuple(data_items[k].shape) if torch.is_tensor(data_items[k])
+                      else "non-tensor"))
+            for k in ("detections", "drivable_area_seg", "segmentation_masks",
+                      "lanes_detections", "lane_seg_masks")
+        }
+        self.logger.log_message(
+            f"[skip-batch] eval iter {batch_idx} ({metric_prefix}): "
+            f"empty loss_items — skipping. paths={paths} targets={present}"
+        )

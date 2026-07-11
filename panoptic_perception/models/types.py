@@ -110,3 +110,10 @@ class ModelArchitectureInfo:
     def is_anchor_free(self) -> bool:
         # "anchor_free model" = has v8 detect and NOT classic detect
         return self.has_anchor_free_detection and not self.has_anchor_based_detection
+    
+
+@dataclass
+class ImageClassifierOutputs:
+    logits: torch.Tensor = None
+    loss: torch.Tensor = None
+    targets: torch.Tensor = None

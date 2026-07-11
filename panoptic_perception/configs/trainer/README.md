@@ -5,17 +5,15 @@ This directory holds the JSON config files that drive training. Treat `train_kwa
 ## Launching a training run
 
 ```bash
-python3 -m panoptic_perception.scripts.train.train_v2 \
+python3 -m panoptic_perception.scripts.train.train \
     --config panoptic_perception/configs/trainer/train_kwargs_optimized_drivable.json
 ```
 
-> `panoptic_perception/scripts/train/train.py` and `panoptic_perception/trainer/trainer.py` are **deprecated**. Use `train_v2.py` + `trainer_refactor.Trainer`. The legacy files emit a `DeprecationWarning` on import and will be removed.
-
-The new entrypoint uses:
+The entrypoint uses:
 - `ModelFactory` for model construction (`model_type` is a registry key)
 - `LossFactory` + `MultiTaskLoss` for composable loss configuration (`_type` is a registry key per task)
 - `TrainingArgument` for config parsing and validation
-- `Trainer` from `trainer_refactor.py` for the training loop
+- `PanopticTrainer` from `trainer.py` for the training loop
 
 ## Config structure
 

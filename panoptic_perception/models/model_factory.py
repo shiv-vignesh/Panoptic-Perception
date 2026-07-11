@@ -27,10 +27,14 @@ class ModelFactory:
 
         assert os.path.exists(cfg_path), f'{cfg_path} does not exists'
         if model_type not in cls._task_models:
-            raise KeyError(f'Unknown Model Class: {model_type}')
+            raise KeyError(f'Unknown Model Class: {model_type} - available models: {cls._task_models.keys()}')
 
         task_model_cls = cls._task_models[model_type]
-        task_model = task_model_cls(cfg_path)
+        
+        if hasattr(task_model_cls, "from_config"):
+            task_model = task_model_cls.from_config(cfg_path)
+        else:
+            task_model = task_model_cls(cfg_path)
 
         enhancement = model_kwargs.get("enhancement")
         if enhancement is None:

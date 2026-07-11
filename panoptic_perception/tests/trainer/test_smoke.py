@@ -19,7 +19,7 @@ import torch.nn as nn
 from torch.utils.data import DataLoader, Dataset
 
 from panoptic_perception.trainer.trainer_args import TrainingArgument
-from panoptic_perception.trainer.trainer_refactor import Trainer
+from panoptic_perception.trainer.trainer import PanopticTrainer
 from panoptic_perception.trainer.callbacks import (
     Callbacks, CheckpointCallback, EvalMetricsCallback,
 )
@@ -250,7 +250,7 @@ class TestSmokeTrainOnly:
     def test_train_only_no_crash(self, model, training_args, logger, wandb_logger):
         training_args.monitor_val = False
 
-        trainer = Trainer(
+        trainer = PanopticTrainer(
             model=model,
             train_dataloader=make_train_dataloader(size=6),
             training_args=training_args,
@@ -270,7 +270,7 @@ class TestSmokeTrainAndEval:
     def test_train_and_eval_no_crash(self, model, training_args, logger, wandb_logger, output_dir):
         val_dls = make_val_dataloaders(size=4)
 
-        trainer = Trainer(
+        trainer = PanopticTrainer(
             model=model,
             train_dataloader=make_train_dataloader(size=6),
             val_dataloaders=val_dls,
@@ -301,7 +301,7 @@ class TestSmokeEvalOnly:
         training_args.monitor_train = False
         val_dls = make_val_dataloaders(size=4)
 
-        trainer = Trainer(
+        trainer = PanopticTrainer(
             model=model,
             val_dataloaders=val_dls,
             training_args=training_args,
@@ -327,7 +327,7 @@ class TestSmokeWarmup:
         training_args.warmup_epochs = 2
         training_args.monitor_val = False
 
-        trainer = Trainer(
+        trainer = PanopticTrainer(
             model=model,
             train_dataloader=make_train_dataloader(size=6),
             training_args=training_args,
@@ -346,7 +346,7 @@ class TestSmokeGradientAccumulation:
         training_args.gradient_accumulation_steps = 4
         training_args.monitor_val = False
 
-        trainer = Trainer(
+        trainer = PanopticTrainer(
             model=model,
             train_dataloader=make_train_dataloader(size=8),
             training_args=training_args,

@@ -1,7 +1,7 @@
 """
 Unit tests for callback classes.
 Tests the Callbacks composite, CheckpointCallback, EvalMetricsCallback,
-and the create_callbacks factory from train_v2.
+and the create_callbacks factory from train.
 """
 
 import pytest
@@ -14,7 +14,7 @@ from panoptic_perception.trainer.callbacks import (
     EnhancedImageLogger, EvalMetricsCallback,
 )
 from panoptic_perception.trainer.utils import EvalMetrics, EvalBatchContext
-from panoptic_perception.scripts.train.train_v2 import (
+from panoptic_perception.scripts.train.train import (
     create_callbacks, CALLBACK_REGISTRY, DEFAULT_CALLBACKS,
 )
 
@@ -173,7 +173,7 @@ class TestEnhancedImageLogger:
 
 
 # ─────────────────────────────────────────────
-# create_callbacks (train_v2 factory)
+# create_callbacks (train factory)
 # ─────────────────────────────────────────────
 
 class TestCreateCallbacks:

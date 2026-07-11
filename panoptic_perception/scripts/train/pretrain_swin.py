@@ -1,106 +1,68 @@
-import json
 import os
-import argparse
-from typing import Union, Optional
-
 import torch
+import argparse
 
-import warnings
-warnings.simplefilter("once", UserWarning)
+from panoptic_perception.dataset.imagenet_dataset import DataLoaderBuilder
 
-from panoptic_perception.models import ModelFactory, BaseTaskModel, BaseEnhancementModel
+from panoptic_perception.models import ModelFactory
 
 from panoptic_perception.utils.logger import Logger
 from panoptic_perception.utils.wandb_logger import WandBLogger
 from panoptic_perception.utils.config_parser import load_json, parse_config
-
-from panoptic_perception.dataset import DataLoaderBuilder
-from panoptic_perception.losses.multi_task_loss import MultiTaskLoss
+from panoptic_perception.losses.loss_factory import LossFactory
 
 from panoptic_perception.trainer.trainer_args import TrainingArgument
 from panoptic_perception.trainer.trainer_optimizer import OptimizerContext, build_optmizer
 from panoptic_perception.trainer.trainer_schedulers import SchedulerContext, build_scheduler
-from panoptic_perception.trainer.trainer_refactor import Trainer
+from panoptic_perception.trainer.trainer_swin import SwinTrainerClassifier
+
 from panoptic_perception.trainer.callbacks import (
-    CheckpointCallback, EnhancedImageLogger, EvalMetricsCallback
+    CheckpointCallback, ImageClsMetricsCallback
 )
 
 CALLBACK_REGISTRY = {
     "checkpoint": CheckpointCallback,
-    "enhanced_image_logger": EnhancedImageLogger,
-    "eval_metrics": EvalMetricsCallback,
+    "image_cls_metrics": ImageClsMetricsCallback,
 }
 
-DEFAULT_CALLBACKS = ["checkpoint", "eval_metrics"]
-
-def create_training_arguments(config:dict) -> TrainingArgument:
-    return TrainingArgument.from_config(parse_config(config))
+DEFAULT_CALLBACKS = ["checkpoint", "image_cls_metrics"]
 
 def create_loss_function(loss_kwargs:dict):
+    loss_func = LossFactory.build(loss_kwargs)
+    return loss_func
 
-    if not loss_kwargs:    
-        raise ValueError(
-            f"Expected Loss Kwargs dict to configure loss function, got {loss_kwargs}"
-        )
-
-    return MultiTaskLoss(
-        loss_kwargs
-    )
-
-def create_model(model_kwargs:dict, loss_kwargs:dict) -> Union[BaseTaskModel, BaseEnhancementModel]:
+def create_model(model_kwargs:dict, loss_kwargs:dict):
 
     device = model_kwargs.get("device", "cuda")
-
-    use_gdip = model_kwargs.get("use_gdip", False)
-    use_denet = model_kwargs.get("use_denet", False)
-
-    assert not (use_gdip and use_denet), "use_gdip and use_denet cannot both be True"
-    if use_gdip:
-        assert "gdip_kwargs" in model_kwargs and model_kwargs["gdip_kwargs"], \
-            f'Key Error: gdip_kwargs missing'    
-
-        model_kwargs["enhancement"] = "gdip-yolo"
-
-    if use_denet:
-        assert "denet_kwargs" in model_kwargs and model_kwargs["denet_kwargs"], \
-            f'Key Error: denet_kwargs missing'
-
-        model_kwargs["enhancement"] = "denet-yolo"
-
+    #TODO, register SWINClassifier with ModelFactory: pretrain_swin.py should be used for 
+    # Classifier and SWIN+FPN pretraining (ImageNet-1k + COCO)
     model = ModelFactory.from_config(model_kwargs)
     device = torch.device(device) if torch.cuda.is_available() and "cuda" in device else torch.device("cpu")
     model.to(device)
 
-    multi_task_loss_function = create_loss_function(loss_kwargs)
-    model.loss_function = multi_task_loss_function
+    loss_func = create_loss_function(loss_kwargs)
+    model.loss_function = loss_func
 
     return model, device
 
-def create_optimizer(model:Union[BaseTaskModel, BaseEnhancementModel], 
-                    optimizer_kwargs:dict, 
-                    training_args:TrainingArgument, 
-                    logger:Logger) -> torch.optim:
-
+def create_optimizer(model:torch.nn.Module, 
+                    optimizer_kwargs:dict,
+                    training_args:TrainingArgument,
+                    logger:Logger):
+    
     groups = optimizer_kwargs.get("groups", {})
-    has_enhancement = isinstance(model, BaseEnhancementModel)
+    if groups and hasattr(model, "get_param_groups"):
+        param_groups = model.get_param_groups(optimizer_kwargs)
 
-    if not groups:
-        if has_enhancement:
-            logger.log_message(f'{model.task_network.__class__.__name__} Full model training (all layers trainable)')
-        else:
-            logger.log_message(f'{model.__class__.__name__} Full model training (all layers trainable)')
-
-    param_groups = model.get_param_groups(optimizer_kwargs)
-
-    # Apply lr_scale to each param group's lr before optimizer creation
-    # This ensures differential LR is active from the start, not just during warmup
-    for pg in param_groups:
-        scale = pg.get("lr_scale", 1.0)
-        pg["lr"] = training_args.initial_lr * scale
-        logger.log_message(f"  Param group '{pg.get('name', '?')}': lr_scale={scale}, lr={pg['lr']:.6f}, params={len(pg['params'])}, trainable={pg.get('trainable', True)}")
+    else:
+        param_groups = [{
+                "params": list(model.parameters()),
+                "name": model.__class__.__name__,
+                "lr_scale":1.0,
+                "trainable": True            
+        }]
 
     ctx = OptimizerContext(param_groups, training_args)
-
     return build_optmizer(ctx)
 
 def create_scheduler(optimizer:torch.optim,
@@ -109,21 +71,30 @@ def create_scheduler(optimizer:torch.optim,
     ctx = SchedulerContext(optimizer, training_args, training_args.epochs)
     return build_scheduler(ctx)
 
-def create_logger(training_args:TrainingArgument) -> Logger:
+def create_training_arguments(config:dict) -> TrainingArgument:
+    return TrainingArgument.from_config(parse_config(config))
 
-    log_dir = training_args.output_dir
-    os.makedirs(log_dir, exist_ok=True)
+def create_wandb_logger(config:dict, training_args:TrainingArgument) -> WandBLogger:
 
-    log_file_path = os.path.join(log_dir, "training.log")
-    return Logger(log_file_path=log_file_path, logger_name="panoptic_trainer")
+    project_name = config.get("trainer_kwargs", {}).get("wandb_project", "panoptic-perception")
+    run_name = os.path.basename(training_args.output_dir)
+    enabled = training_args.wandb_enabled
+
+    return WandBLogger(
+        project_name=project_name,
+        run_name=run_name,
+        config=config,
+        enabled=enabled
+    )
 
 def create_dataloader(dataset_kwargs, logger=None):
-    
+
     builder = DataLoaderBuilder(dataset_kwargs, logger=logger)
-    train_dataloader = builder.build_train()                                                                                          
-    val_dataloaders = builder.build_val()
-    
-    return train_dataloader, val_dataloaders
+
+    train_dataloader = builder._build_train()
+    val_dataloader = builder._build_val()
+
+    return train_dataloader, val_dataloader
 
 def create_callbacks(config: dict) -> list:
     callbacks_config = config.get("callbacks", None)
@@ -139,18 +110,13 @@ def create_callbacks(config: dict) -> list:
 
     return callbacks
 
-def create_wandb_logger(config:dict, training_args:TrainingArgument) -> WandBLogger:
+def create_logger(training_args:TrainingArgument) -> Logger:
 
-    project_name = config.get("trainer_kwargs", {}).get("wandb_project", "panoptic-perception")
-    run_name = os.path.basename(training_args.output_dir)
-    enabled = training_args.wandb_enabled
+    log_dir = training_args.output_dir
+    os.makedirs(log_dir, exist_ok=True)
 
-    return WandBLogger(
-        project_name=project_name,
-        run_name=run_name,
-        config=config,
-        enabled=enabled
-    )
+    log_file_path = os.path.join(log_dir, "training.log")
+    return Logger(log_file_path=log_file_path, logger_name="panoptic_trainer")
 
 def main(args:argparse.Namespace):
 
@@ -173,19 +139,20 @@ def main(args:argparse.Namespace):
     logger.log_message("=== WandB Logger ===")
     logger.log_message(f"Enabled          : {training_args.wandb_enabled}")
     logger.log_message(f"Project          : {config.get('trainer_kwargs', {}).get('wandb_project', 'N/A')}")
-    logger.log_new_line()
+    logger.log_new_line()    
 
     logger.log_message("=== Building Datasets & DataLoaders ===")
     train_dataloader, val_dataloaders = create_dataloader(
         config["dataset_kwargs"], logger=logger
     )
+
     logger.log_message(f'Train Dataset    : {train_dataloader.dataset.__class__.__name__}')
     logger.log_message(f"Train batches    : {len(train_dataloader)}")
     logger.log_message(f"Train batch size : {config['dataset_kwargs'].get('train_batch_size', 'N/A')}")
     logger.log_message(f"Train workers    : {config['dataset_kwargs'].get('train_num_workers', 'N/A')}")
-    for prefix, dl in (val_dataloaders or {}).items():
-        logger.log_message(f'Val Dataset    : {dl.dataset.__class__.__name__}')
-        logger.log_message(f"Val batches    : {len(dl)}")
+
+    logger.log_message(f'Val Dataset    : {val_dataloaders.dataset.__class__.__name__}')
+    logger.log_message(f"Val batches    : {len(val_dataloaders)}")
     logger.log_message(f"Val batch size   : {config['dataset_kwargs'].get('val_batch_size', 'N/A')}")
     logger.log_message(f"Val workers      : {config['dataset_kwargs'].get('val_num_workers', 'N/A')}")
     logger.log_new_line()
@@ -199,23 +166,16 @@ def main(args:argparse.Namespace):
     logger.log_message(f"Device           : {device}")
     logger.log_message(f"Parameters       : {sum(p.numel() for p in model.parameters()):,}")
     logger.log_message(f"Trainable params : {sum(p.numel() for p in model.parameters() if p.requires_grad):,}")
-    logger.log_message(f"Active tasks     : {model.get_active_tasks()}")
+
     loss_kwargs = config.get("loss_kwargs", {})
 
     logger.log_message("=== Loss Configuration ===")
-    for task_name, task_cfg in loss_kwargs.items():
-        if task_name == "loss_weights":
-            continue   # printed separately below  
-        loss_type = task_cfg.get("_type", "?")
-        extra = task_cfg.get("kwargs", {})
-        extra_str = f" ({extra})" if extra else "" 
-        logger.log_message(f"  {task_name:25} : {loss_type}{extra_str}")
-
-    weights = loss_kwargs.get("loss_weights", {})
-    if weights:
-        logger.log_message("Loss weights:")
-        for task_name, weight in weights.items():
-            logger.log_message(f"  {task_name:25} : {weight}")
+    _loss_type = loss_kwargs.get("_type", "?")
+    _inner = loss_kwargs.get("kwargs", {})
+    _criterion = _inner.get("criterion", "?")
+    _criterion_kwargs = _inner.get("criterion_kwargs", {})
+    logger.log_message(f"Loss Type: {_loss_type}")
+    logger.log_message(f"Criterion: {_criterion} - Criterion Kwargs: {_criterion_kwargs}")
 
     logger.log_new_line()
 
@@ -253,12 +213,12 @@ def main(args:argparse.Namespace):
 
     logger.log_message("=== Creating Trainer ===")
     checkpoint_path = config.get("trainer_kwargs", {}).get("checkpoint_path")
-    logger.log_message(f"Checkpoint       : {checkpoint_path or 'None'}")
+    logger.log_message(f"Checkpoint       : {checkpoint_path or 'None'}")    
 
-    trainer = Trainer(
+    trainer = SwinTrainerClassifier(
         model=model,
         train_dataloader=train_dataloader,
-        val_dataloaders=val_dataloaders,
+        val_dataloaders={"val": val_dataloaders}, # wrapping it to prevent keyError __init__
         optimizer=optimizer,
         lr_scheduler=lr_scheduler,
         training_args=training_args,
@@ -270,9 +230,9 @@ def main(args:argparse.Namespace):
     for cb in callbacks:
         trainer.callbacks.add_callback(cb)
 
-    # Log runtime details to wandb for reproducibility
     total_params = sum(p.numel() for p in model.parameters())
     trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
+
     wandb_logger.update_config({
         "runtime/torch_version": torch.__version__,
         "runtime/cuda_available": torch.cuda.is_available(),
@@ -282,7 +242,6 @@ def main(args:argparse.Namespace):
         "model/class": model.__class__.__name__,
         "model/total_params": total_params,
         "model/trainable_params": trainable_params,
-        "model/active_tasks": model.get_active_tasks(),
         "model/cfg_path": config["model_kwargs"].get("cfg_path"),
         "optimizer/type": optimizer.__class__.__name__ if optimizer else None,
         "optimizer/initial_lr": config.get("optimizer_kwargs", {}).get("initial_lr"),
@@ -303,18 +262,17 @@ def main(args:argparse.Namespace):
     logger.log_message("=== Starting Training ===")
     logger.log_new_line()
     trainer.train()
-    
+
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Train YOLOP Panoptic Perception Model")
+    parser = argparse.ArgumentParser(description="Train Swin Model")
     
     parser.add_argument(
         "--config",
         type=str,
-        default="panoptic_perception/configs/trainer/train_kwargs.json",
-        help="Path to training config JSON file"        
+        default="panoptic_perception/configs/trainer/train_kwargs_swin_pretrain.json",
+        help="Path to training config JSON file"
     )
     
     args = parser.parse_args()
 
-    main(args)
-    
+    main(args)    

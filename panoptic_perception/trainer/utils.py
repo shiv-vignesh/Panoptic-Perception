@@ -1,12 +1,14 @@
 from dataclasses import dataclass
-from typing import Any, Iterable, Dict, List
+from typing import Any, Iterable, Dict, List, TypeVar, Optional
 
 from collections import defaultdict
 
 import torch
 import numpy as np
 
-from panoptic_perception.models.types import PanopticModelOutputs
+from panoptic_perception.models.types import PanopticModelOutputs, ImageClassifierOutputs
+
+OutputType = TypeVar('OutputType', PanopticModelOutputs, ImageClassifierOutputs)
 
 def listify(p: Any):
 
@@ -71,7 +73,7 @@ class EvalMetrics:
 @dataclass
 class EvalBatchContext:
     
-    cur_eval_model_outputs : PanopticModelOutputs = None
+    cur_eval_model_outputs : Optional[OutputType] = None
 
     cur_eval_image_h : int = None
     cur_eval_image_w : int = None        
@@ -91,3 +93,6 @@ class EvalBatchContext:
 
     drivable_table_data : dict = None
     wandb_drivable_data : list = None    
+
+    # ---- Swin Classifier ----
+    cur_eval_gt_cls_labels : torch.Tensor = None
