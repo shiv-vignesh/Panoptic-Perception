@@ -9,8 +9,8 @@ Usage:
     python -m panoptic_perception.scripts.data.hf_to_imagefolder /workspace/data/imagenet
 
 Requires HF login first:
-    huggingface-cli login       # accept ILSVRC/imagenet-1k terms on the website beforehand
-    export HF_HUB_ENABLE_HF_TRANSFER=1
+    hf auth login               # accept ILSVRC/imagenet-1k terms on the website beforehand
+    export HF_XET_HIGH_PERFORMANCE=1
 
 Storage: ~300 GB peak (HF parquet cache + extracted JPEGs), ~150 GB after cleanup.
 """
@@ -68,10 +68,14 @@ def main():
     out_root.mkdir(parents=True, exist_ok=True)
 
     cache_dir = args.cache_dir or str(out_root / "hf_cache")
-    os.environ.setdefault("HF_HUB_ENABLE_HF_TRANSFER", "1")
+    os.environ.setdefault("HF_XET_HIGH_PERFORMANCE", "1")
 
-    if not os.environ.get("HF_TOKEN") and not (Path.home() / ".cache/huggingface/token").exists():
-        print("[hf-to-imagefolder] no HF token found. Run `huggingface-cli login` first "
+    # Delegate token resolution to huggingface_hub — it handles HF_TOKEN env var,
+    # custom HF_HOME (Vast puts the token at /workspace/.hf_home/token), and the
+    # default ~/.cache/huggingface/token location.
+    from huggingface_hub import get_token
+    if get_token() is None:
+        print("[hf-to-imagefolder] no HF token found. Run `hf auth login` first "
               "(and accept ILSVRC/imagenet-1k terms on the dataset page).", file=sys.stderr)
         sys.exit(1)
 
