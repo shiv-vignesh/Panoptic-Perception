@@ -6,8 +6,10 @@ that panoptic_perception.dataset.imagenet_dataset.ImageNetDataset expects:
     <root>/val/<wnid>/*.JPEG
 
 Downloads only train + validation parquets (skips the ~14 GB test split we don't
-need), then extracts image bytes with pyarrow. Reuses any parquets already in the
-HF hub cache from a prior interrupted run.
+need), then extracts image bytes with pyarrow. Idempotent — skips a split whose
+extracted image count already matches the expected total. If a prior buggy run
+extracted train into human-readable class dirs (e.g. "tench, Tinca tinca"),
+those get renamed to wnids on the fly.
 
 Usage:
     python -m panoptic_perception.scripts.data.hf_to_imagefolder /workspace/data/imagenet
@@ -17,15 +19,17 @@ Requires HF login first:
     export HF_XET_HIGH_PERFORMANCE=1
 
 Storage: ~150 GB permanent (extracted JPEGs), ~140 GB transient (parquet cache),
-so peak is ~290 GB. HF cache is auto-deleted after extraction unless --keep-cache
-is passed.
+so peak is ~290 GB. HF snapshot dir is auto-deleted after extraction unless
+--keep-cache is passed.
 """
 
 import argparse
 import io
+import json
 import os
 import shutil
 import sys
+import urllib.request
 from pathlib import Path
 
 import pyarrow.parquet as pq
@@ -37,34 +41,75 @@ from tqdm import tqdm
 REPO_ID = "ILSVRC/imagenet-1k"
 REPO_TYPE = "dataset"
 
-# HF stores this dataset's parquets under data/train-*.parquet and data/val-*.parquet.
-# Explicit patterns skip the test split (~14 GB) we don't need.
 ALLOW_PATTERNS = [
     "data/train-*.parquet",
-    "data/val-*.parquet",
+    "data/validation-*.parquet",
     "*.md",
     "*.json",
 ]
 
+TRAIN_TOTAL = 1281167
+VAL_TOTAL = 50000
 
-def get_wnid_mapping(snapshot_dir: Path) -> list:
-    """Read the label index → wnid mapping baked into the dataset's info files."""
+# Canonical ILSVRC label_idx -> [wnid, short_name] mapping (Keras / TF convention).
+# Matches HF's imagenet-1k label ordering exactly.
+IMAGENET_CLASS_INDEX_URL = (
+    "https://storage.googleapis.com/download.tensorflow.org/data/imagenet_class_index.json"
+)
+
+
+def load_id2wnid() -> list:
+    """Return list of 1000 wnids in HF's label_idx order."""
+    with urllib.request.urlopen(IMAGENET_CLASS_INDEX_URL, timeout=30) as f:
+        idx_map = json.load(f)
+    return [idx_map[str(i)][0] for i in range(1000)]
+
+
+def load_id2hf_name() -> list:
+    """Return list of 1000 HF display names (streaming schema fetch, no data)."""
     from datasets import load_dataset
-    ds = load_dataset(REPO_ID, split="validation", streaming=True)
+    ds = load_dataset(REPO_ID, split="train", streaming=True)
     return ds.features["label"].names
+
+
+def rename_display_dirs_to_wnid(split_target: Path, id2wnid: list, id2hf_name: list):
+    """One-shot migration: if a prior buggy run wrote display-name dirs, rename them."""
+    name_to_wnid = {name: id2wnid[i] for i, name in enumerate(id2hf_name)}
+    renamed = 0
+    for d in split_target.iterdir():
+        if not d.is_dir():
+            continue
+        if d.name in name_to_wnid:
+            wnid = name_to_wnid[d.name]
+            if wnid != d.name:
+                target = split_target / wnid
+                if target.exists():
+                    # merge: move files from d into wnid dir, then remove d
+                    for f in d.iterdir():
+                        f.rename(target / f.name)
+                    d.rmdir()
+                else:
+                    d.rename(target)
+                renamed += 1
+    if renamed:
+        print(f"[migrate] renamed {renamed} display-name dirs to wnids under {split_target}")
+
+
+def already_extracted(target: Path, expected: int) -> bool:
+    if not target.is_dir():
+        return False
+    n = sum(1 for _ in target.rglob("*.JPEG"))
+    return n >= expected
 
 
 def convert_parquets(snapshot_dir: Path, out_root: Path, split_glob: str, split_dir: str,
                     id2wnid: list):
-    """Iterate every parquet file matching split_glob and write PIL-decoded JPEGs
-    into out_root/split_dir/<wnid>/. Uses pyarrow row-by-row to keep RAM bounded."""
     parquet_files = sorted((snapshot_dir / "data").glob(split_glob))
     if not parquet_files:
         raise RuntimeError(f"no parquets matched {split_glob} under {snapshot_dir}/data")
 
     target = out_root / split_dir
     target.mkdir(parents=True, exist_ok=True)
-    # Pre-create wnid dirs so mkdir isn't called ~1.28M times.
     for wnid in id2wnid:
         (target / wnid).mkdir(exist_ok=True)
 
@@ -75,7 +120,6 @@ def convert_parquets(snapshot_dir: Path, out_root: Path, split_glob: str, split_
         labels = table.column("label").to_pylist()
         for img_obj, label in tqdm(zip(images, labels), total=len(labels),
                                     desc=pq_path.name, leave=False):
-            # HF encodes images as {"bytes": b"...", "path": "..."} dicts.
             raw = img_obj["bytes"] if isinstance(img_obj, dict) else img_obj
             wnid = id2wnid[label]
             out_path = target / wnid / f"{split_dir}_{running_idx}.JPEG"
@@ -101,7 +145,7 @@ def main():
     ap.add_argument("--cache-dir", default=None,
                     help="HF hub cache dir. Default: $HF_HOME/hub if set, else HF's default.")
     ap.add_argument("--keep-cache", action="store_true",
-                    help="do NOT delete the HF hub cache after conversion")
+                    help="do NOT delete the HF hub snapshot after conversion")
     args = ap.parse_args()
 
     out_root = Path(args.out_root)
@@ -114,7 +158,10 @@ def main():
               "(and accept ILSVRC/imagenet-1k terms on the dataset page).", file=sys.stderr)
         sys.exit(1)
 
-    print(f"[hf-to-imagefolder] snapshot_download only train + val parquets ...", flush=True)
+    print("[hf-to-imagefolder] resolving wnid ordering (imagenet_class_index.json)")
+    id2wnid = load_id2wnid()
+
+    print("[hf-to-imagefolder] snapshot_download (train + validation parquets)")
     snapshot_dir = Path(snapshot_download(
         repo_id=REPO_ID,
         repo_type=REPO_TYPE,
@@ -124,22 +171,35 @@ def main():
     ))
     print(f"[hf-to-imagefolder] snapshot at {snapshot_dir}")
 
-    print(f"[hf-to-imagefolder] loading wnid mapping ...")
-    id2wnid = get_wnid_mapping(snapshot_dir)
-    assert len(id2wnid) == 1000, f"expected 1000 wnids, got {len(id2wnid)}"
+    # Fix any display-name dirs left over from a prior buggy extraction.
+    train_target = out_root / "train"
+    val_target = out_root / "val"
+    if train_target.is_dir() or val_target.is_dir():
+        print("[hf-to-imagefolder] checking for display-name dirs to migrate")
+        id2hf_name = load_id2hf_name()
+        if train_target.is_dir():
+            rename_display_dirs_to_wnid(train_target, id2wnid, id2hf_name)
+        if val_target.is_dir():
+            rename_display_dirs_to_wnid(val_target, id2wnid, id2hf_name)
 
-    convert_parquets(snapshot_dir, out_root, "train-*.parquet", "train", id2wnid)
-    convert_parquets(snapshot_dir, out_root, "val-*.parquet", "val", id2wnid)
+    if already_extracted(train_target, TRAIN_TOTAL):
+        print(f"[hf-to-imagefolder] train already extracted ({TRAIN_TOTAL} imgs); skipping")
+    else:
+        convert_parquets(snapshot_dir, out_root, "train-*.parquet", "train", id2wnid)
+
+    if already_extracted(val_target, VAL_TOTAL):
+        print(f"[hf-to-imagefolder] val already extracted ({VAL_TOTAL} imgs); skipping")
+    else:
+        convert_parquets(snapshot_dir, out_root, "validation-*.parquet", "val", id2wnid)
 
     verify(out_root)
 
     if not args.keep_cache:
-        # Delete the on-disk snapshot dir. HF cache is at
-        # $HF_HOME/hub/datasets--ILSVRC--imagenet-1k, cache_dir if overridden.
-        # We only unlink the snapshot pointing at these parquets; blobs may remain
-        # in the shared blob store (small).
-        print(f"[hf-to-imagefolder] cleaning snapshot at {snapshot_dir.parent} ...")
-        shutil.rmtree(snapshot_dir.parent.parent, ignore_errors=True)
+        # snapshot_dir points to .../snapshots/<hash>/; the datasets--<repo> root is
+        # two levels up. Remove the whole cache to reclaim disk.
+        cache_root = snapshot_dir.parent.parent
+        print(f"[hf-to-imagefolder] cleaning HF cache at {cache_root}")
+        shutil.rmtree(cache_root, ignore_errors=True)
 
 
 if __name__ == "__main__":
