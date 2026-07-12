@@ -140,12 +140,13 @@ class Trainer:
 
         train_iter = tqdm(self.train_dataloader, desc=f'Training Epoch: {self.cur_epoch}')
         for batch_idx, data_items in enumerate(train_iter):
+            self.train_batch_idx = batch_idx
+            self._apply_warmup()
 
             step_begin = time.time()
             loss, model_outputs = self._train_one_step(data_items)
             step_time = time.time() - step_begin
 
-            self.train_batch_idx = batch_idx
             self.batch_images = data_items.get("images")
 
             if ((batch_idx + 1) % self.training_args.gradient_accumulation_steps == 0) or (batch_idx == self.total_train_batch - 1):
@@ -166,7 +167,7 @@ class Trainer:
             self._accumulate_train_iter(loss, model_outputs, step_time)
 
             if (batch_idx + 1) % self.ten_percent_train_batch == 0:
-                self._apply_warmup()
+                current_lr = self.optimizer.param_groups[0]['lr']
                 self._log_train_window(current_lr, batch_idx)
                 self._init_train_window()
 

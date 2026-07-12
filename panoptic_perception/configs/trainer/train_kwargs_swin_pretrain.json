@@ -6,28 +6,28 @@
     },
 
     "dataset_kwargs":{
-        "root":"imagenet-tiny/tiny-imagenet-200",
-        "train_batch_size": 6,
+        "root":"/workspace/data/imagenet",
+        "train_batch_size": 128,
         "train_shuffle": true,
-        "train_num_workers": 4,
+        "train_num_workers": 8,
         "train_preprocessor_kwargs":{
             "image_resize": [224, 224],
             "perform_augmentation": true,
             "augment_params": {
-                "degrees": 5,
-                "translate": 0.05,
-                "scale": 0.15,
-                "shear": 2,
+                "degrees": 0,
+                "translate": 0.0,
+                "scale": 0.0,
+                "shear": 0,
                 "hsv_h": 0.015,
-                "hsv_s": 0.7,
+                "hsv_s": 0.4,
                 "hsv_v": 0.4,
-                "salt_prob": 0.005,
-                "pepper_prob": 0.005,
+                "salt_prob": 0.0,
+                "pepper_prob": 0.0,
                 "flip_prob": 0.5,
                 "img_size": [224, 224]
             }
         },
-        "val_batch_size": 16,
+        "val_batch_size": 128,
         "val_shuffle": false,
         "val_num_workers": 4,
         "val_preprocessor_kwargs":{
@@ -36,36 +36,31 @@
     },
 
     "optimizer_kwargs": {
-        "_description": "AdamW optimizer - all layers trainable for joint training",
         "_type": "AdamW",
         "initial_lr": 1e-3,
-        "weight_decay": 0.01,
-        "momentum": 0.937,
-        "warmup_bias_lr": 0.1,
-        "warmup_momentum": 0.8,
-        "warmup_epochs": 3,
-        "groups":{
-
-        }
+        "weight_decay": 0.05,
+        "betas": [0.9, 0.999],
+        "warmup_epochs": 5,
+        "groups": {}
     },
 
     "trainer_kwargs":{
-        "output_dir": "swin-classifier-dev",
+        "output_dir": "swin-T-classifier-imageNet-pretrain",
         "is_training": true,
         "first_val_epoch": 0,
         "metric_eval_mode": "strict",
         "metric_average_mode": "macro",
         "epochs": 100,
-        "monitor_train": false,
+        "monitor_train": true,
         "monitor_val": true,
-        "gradient_clipping": 1.0,
+        "gradient_clipping": 5.0,
         "checkpoint_idx": 2,
-        "gradient_accumulation_steps": 2,
-        "lr_scheduler_start_epoch": 1,
+        "gradient_accumulation_steps": 8,
+        "lr_scheduler_start_epoch": 4,
         "reload_optimizer": false,
         "reload_optimizer_with_initial_lr": false,
-        "checkpoint_path":null,
-        "wandb_project": "",
+        "checkpoint_path": null,
+        "wandb_project": "swin-classifier-imageNet-pretrain",
         "wandb_enabled": true,
         "use_ema": false,
         "ema_decay": 0.9999,
@@ -82,6 +77,4 @@
             }
         }
     }
-
-
 }

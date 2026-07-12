@@ -13,9 +13,9 @@ class OptimizerContext:
 def _get_adamw_handler(ctx: OptimizerContext):
     args = ctx.training_args
     return torch.optim.AdamW, {
-        "lr":args.initial_lr,
-        "weight_decay":args.lr_decay if hasattr(args, "weight_decay") else 0.0,
-        "betas": args.betas if hasattr(args, "betas") else (0.937, 0.999)
+        "lr": args.initial_lr,
+        "weight_decay": getattr(args, "weight_decay", 0.0),
+        "betas": tuple(getattr(args, "betas", (0.9, 0.999))),
     }
     
 def _get_sgd_handler(ctx:OptimizerContext):

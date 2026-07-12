@@ -50,16 +50,14 @@ def create_optimizer(model:torch.nn.Module,
                     training_args:TrainingArgument,
                     logger:Logger):
     
-    groups = optimizer_kwargs.get("groups", {})
-    if groups and hasattr(model, "get_param_groups"):
+    if hasattr(model, "get_param_groups"):
         param_groups = model.get_param_groups(optimizer_kwargs)
-
     else:
         param_groups = [{
-                "params": list(model.parameters()),
-                "name": model.__class__.__name__,
-                "lr_scale":1.0,
-                "trainable": True            
+            "params": list(model.parameters()),
+            "name": model.__class__.__name__,
+            "lr_scale": 1.0,
+            "trainable": True,
         }]
 
     ctx = OptimizerContext(param_groups, training_args)

@@ -97,6 +97,24 @@ class SwinClassifier(nn.Module):
 
         self._loss_function = loss_function
 
+        nn.init.trunc_normal_(self.head.weight, std=0.02)
+        nn.init.zeros_(self.head.bias)
+
+    def get_param_groups(self, optimizer_kwargs: dict) -> list:
+        decay, no_decay = [], []
+        for name, p in self.named_parameters():
+            if not p.requires_grad:
+                continue
+            if p.ndim <= 1 or name.endswith(".bias") or "norm" in name.lower():
+                no_decay.append(p)
+            else:
+                decay.append(p)
+        return [
+            {"params": decay, "name": "decay", "lr_scale": 1.0, "trainable": True},
+            {"params": no_decay, "name": "no_decay", "lr_scale": 1.0, "trainable": True,
+             "weight_decay": 0.0},
+        ]
+
     def forward(self, x: torch.Tensor, targets:torch.Tensor=None) -> ImageClassifierOutputs:
         x, _ = self.backbone(x)
         x = self.norm(x)
