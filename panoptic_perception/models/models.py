@@ -12,7 +12,8 @@ import torch.nn as nn
 from torchmetrics.image import StructuralSimilarityIndexMeasure
 
 from panoptic_perception.models.common import (
-    ConvBlock, Focus, BottleneckCSP, SPP, Upsample, Detect, C2F, SPPF, DetectV8, LaneDetect
+    ConvBlock, Focus, BottleneckCSP, SPP, Upsample, Detect, C2F, SPPF, DetectV8, LaneDetect,
+    SwinFeatureReshape
 )
 from panoptic_perception.models.utils import (
         parse_model_config, initialize_weights
@@ -143,6 +144,10 @@ def create_modules(module_defs: list,
         elif mtype == "ResidualAdd":
             module = nn.Identity()
             output_channels.append(output_channels[-1])
+
+        elif mtype == "SwinFeatureReshape":
+            module = SwinFeatureReshape()
+            output_channels.append(int(module_def["out_channels"]))
 
         # -- HEADS (skip building) ---------------------------------------------
         elif mtype == "Detect":
@@ -563,7 +568,7 @@ class YOLOP(BaseTaskModel):
                 if route[0] == -1:
                     x = module(x)
                 else:
-                    x = module(cache[route[0]]) 
+                    x = module(cache[route[0]])
 
             elif len(route) > 1:
                 # multiple previous layer routes

@@ -1425,4 +1425,23 @@ class SwinLayer(nn.Module):
         if self.downsample is not None:
             x = self.downsample(x)
 
-        return x    
+        return x
+
+class SwinFeatureReshape(nn.Module):
+
+    def forward(self, x:torch.Tensor, h:int=None, w:int=None, tap_i:int=None):
+
+        assert (h or w), f"Expected non-empty/non-None height and width. Got {h}x{w}"
+        assert len(x.shape) == 3, f"Expected swin tokens tensor, got shape {x.shape}"
+
+        stride = 8 * (2 ** tap_i)
+        hf, wf = h // stride, w // stride
+        B, N, C = x.shape
+
+        if N != hf * wf:
+            raise RuntimeError(
+                f"backbone tap {tap_i}: token count {N} != expected {hf}*{wf}={hf * wf}."
+                f"Input {h}x{w} may not be aligned to window_size at every stage."
+            )
+
+        return x.transpose(1, 2).reshape(B, C, hf, wf)

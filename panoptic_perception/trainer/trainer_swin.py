@@ -71,3 +71,4 @@ class SwinTrainerClassifier(Trainer):
         self.eval_batch_ctx.cur_eval_gt_cls_labels = data_items["labels"]
 
     
+    

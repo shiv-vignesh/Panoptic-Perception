@@ -19,13 +19,14 @@ def batch_size():
 @pytest.fixture
 def dataset_kwargs():
     return {
-        "images_dir": "data/100k/100k",
-        "detection_annotations_dir": "data/bdd100k_labels/100k",
-        "segmentation_annotations_dir": "data/bdd100k_seg_maps/labels",
-        "drivable_annotations_dir": "data/drivable_maps/labels",
+        "images_dir": "../data/100k/100k",
+        "detection_annotations_dir": "../data/bdd100k_labels/100k",
+        "segmentation_annotations_dir": "../data/bdd100k_seg_maps/labels",
+        "drivable_annotations_dir": "../data/drivable_maps/labels",
         "preprocessor_kwargs": {
-            "image_resize": (640, 640),
-            "original_image_size": (720, 1280)
+            # "image_resize": (640, 640),
+            "image_resize": (672, 1120), #SWIN Model
+            "original_image_size": (720, 1280),
         }
     }
 
@@ -94,11 +95,19 @@ def yolov8_detect_drivable():
     }
 
 @pytest.fixture
+def swin_yolov5_kwargs():
+    return {
+        "model_type":"swin-yolov5-fpn",
+        "cfg_path":"panoptic_perception/configs/models/swin_model/swin_model_yolov5.cfg",
+        "device":"cuda:0"        
+    }
+
+@pytest.fixture
 def multi_task_loss_kwargs():
     return {
         "detection":{
             "_type":"detection-loss-ATSS",
-            # "_type":"detection-loss-anchor-free",
+            # "_type":"detection-loss-anchor",
             "kwargs":{}
         },
         "drivable_segmentation":{
@@ -173,3 +182,83 @@ def test_yolop_drivable(yolo_detect_drivable_model_kwargs, multi_task_loss_funct
         print(f'Total Loss: {loss.item()} - Loss Items: {loss_items}')
 
         break
+
+def test_swin_yolov5(swin_yolov5_kwargs, multi_task_loss_function, dataloader):
+    device = swin_yolov5_kwargs.get("device", "cuda")
+    model = ModelFactory.from_config(swin_yolov5_kwargs)
+
+    device = torch.device(device) if torch.cuda.is_available() and "cuda" in device else torch.device("cpu")
+    model.to(device)    
+
+    model.loss_function = multi_task_loss_function
+
+    assert model.loss_function is multi_task_loss_function, \
+        f"Setter didn't persist. Got: {model.loss_function}"
+
+    for _, data_items in enumerate(dataloader):
+        for k, v in data_items.items():
+            if torch.is_tensor(v):
+                data_items[k] = v.to(device)
+
+        outputs = model(
+            data_items["images"],
+            targets={
+                "drivable_area_seg": data_items.get("drivable_area_seg"),
+                "lane_seg": data_items.get("segmentation_masks"),
+                "detections": data_items["detections"],
+                "lanes_detections": data_items.get("lanes_detections"),
+                "lane_seg_masks": data_items.get("lane_seg_masks"),
+                "clean_images": data_items.get("clean_images")
+            }
+        )
+
+        print(f"\nModel outputs: {outputs.keys()}\n")
+        for key, value in outputs.items():
+            if isinstance(value, torch.Tensor):
+                if value.numel() == 1:
+                    print(f"  {key}: {value.shape}")
+                else:
+                    print(f"  {key}: shape {value.shape}")
+            else:
+                print(f"  {key}: {type(value)}")
+
+        loss = torch.zeros(1, device=device)
+
+        loss_items = defaultdict()
+
+        if outputs.detection_loss is not None:
+            loss += outputs.detection_loss
+            loss_items["detection_loss"] = outputs.detection_loss
+        if outputs.drivable_segmentation_loss is not None:
+            loss += outputs.drivable_segmentation_loss
+            loss_items["drivable_segmentation_loss"] = outputs.drivable_segmentation_loss
+        if outputs.lane_segmentation_loss is not None:
+            loss += outputs.lane_segmentation_loss
+            loss_items["lane_segmentation_loss"] = outputs.lane_segmentation_loss
+        if outputs.lane_detection_loss is not None:
+            loss += outputs.lane_detection_loss
+            loss_items["lane_detection_loss"] = outputs.lane_detection_loss            
+
+        print(f'Total Loss: {loss.item()} - Loss Items: {loss_items}')
+
+        break
+
+def test_swin_yolov5_eval(swin_yolov5_kwargs, multi_task_loss_function, dataloader):
+    device = swin_yolov5_kwargs.get("device", "cuda")
+    model = ModelFactory.from_config(swin_yolov5_kwargs)
+
+    device = torch.device(device) if torch.cuda.is_available() and "cuda" in device else torch.device("cpu")
+    model.to(device)    
+
+    for _, data_items in enumerate(dataloader):
+        for k, v in data_items.items():
+            if torch.is_tensor(v):
+                data_items[k] = v.to(device)
+
+        break
+
+    model.eval()
+    with torch.no_grad():
+        outputs = model(data_items["images"])   # no targets
+    assert outputs is not None
+    assert outputs.detection_predictions is not None  # activation ran

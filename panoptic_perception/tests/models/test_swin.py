@@ -6,7 +6,7 @@ from panoptic_perception.models.common import (
     PatchEmbed, ShiftedWindowMSA, SwinBlock, PatchMerge, SwinLayer
 )
 
-from panoptic_perception.models.swin_model import SwinBackbone, SwinClassifier
+from panoptic_perception.models.swin_model import SwinBackbone, SwinClassifier, SwinObjectDetection
 
 @pytest.fixture
 def image_size():
@@ -23,7 +23,11 @@ def dummy_image(batch_size, image_size):
 
 @pytest.fixture
 def swin_cfg():
-    return "/Users/shiv/Developer/ai-ml/Panoptic-Perception/teacher-fusion/panoptic_perception/configs/models/swin_model.cfg"
+    return "panoptic_perception/configs/models/swin_model/swin_model_cls.cfg"
+
+@pytest.fixture
+def swin_yolov5_cfg():
+    return "panoptic_perception/configs/models/swin_model/swin_model_yolov5.cfg"
 
 def test_patch_embed(dummy_image, image_size):
 
@@ -265,9 +269,19 @@ def test_swin_stack_nn(swin_cfg):
     assert final.shape == (2, 49, backbone.final_channels)
     assert set(taps.keys()) == {0, 1, 2, 3}
 
+    for idx, tap in taps.items():
+        print(idx, tap.shape)
+
 def test_swin_classifier(swin_cfg):
 
     model = SwinClassifier.from_config(swin_cfg)
     x = torch.rand(2, 3, 224, 224)
     model_outputs = model(x)
     assert model_outputs.logits.shape == (2, model.head.out_features)
+
+def test_swin_yolov5(swin_yolov5_cfg):
+
+    model = SwinObjectDetection.from_config(swin_yolov5_cfg)
+    x = torch.rand(2, 3, 672, 1120)
+
+    model(x)

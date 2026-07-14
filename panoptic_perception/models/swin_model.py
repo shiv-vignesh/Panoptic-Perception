@@ -1,4 +1,4 @@
-from typing import Optional
+from typing import Optional, Dict
 
 import ast
 
@@ -6,12 +6,15 @@ import torch
 import torch.nn as nn
 
 from panoptic_perception.models.model_factory import ModelFactory
-from panoptic_perception.models.utils import parse_model_config
-from panoptic_perception.models.types import ImageClassifierOutputs
+from panoptic_perception.models.utils import parse_model_config, initialize_weights
+from panoptic_perception.models.types import ImageClassifierOutputs, PanopticModelOutputs
 from panoptic_perception.models.common import (
     PatchEmbed, SwinLayer, PatchMerge
 )
 
+from panoptic_perception.models.models import create_modules, BaseTaskModel
+
+from panoptic_perception.losses.multi_task_loss import MultiTaskLoss
 from panoptic_perception.losses.classifier import ImageClassifierLoss
 
 
@@ -155,3 +158,137 @@ class SwinClassifier(nn.Module):
         if num_classes is None:
             raise ValueError("SwinClassifier.from_cfg requires a [cls_head] block with num_classes")
         return cls(backbone, num_classes)
+
+@ModelFactory.register_task_model("swin-yolov5-fpn")
+class SwinObjectDetection(BaseTaskModel):
+
+    _BACKBONE_BLOCK_TYPES = ("PatchEmbed", "SwinStack")
+
+    def __init__(self, backbone:SwinBackbone, cfg:str,
+                loss_function:Optional[MultiTaskLoss]=None):
+        
+        super().__init__(loss_function=loss_function)
+        self.backbone = backbone
+        self._build(cfg)
+
+    def _build(self, cfg:str):
+
+        module_defs = parse_model_config(cfg)
+
+        if module_defs[0]["type"] == "heads":
+            self.detection_head_idx = int(module_defs[0].get("detection_head_idx", -1))
+            self.segmentation_head_idx = int(module_defs[0].get("segmentation_head_idx", -1))
+            self.lane_segmentation_head_idx = int(module_defs[0].get("lane_segmentation_head_idx", -1))
+            module_defs = module_defs[1:]
+
+        neck_defs = [m for m in module_defs if m["type"] not in self._BACKBONE_BLOCK_TYPES]
+
+        self.module_list, self.routes, self.module_names, self._cache_layer_idx = create_modules(
+            module_defs=neck_defs,
+            segmentation_head_idx=self.segmentation_head_idx,
+            lane_segmentation_head_idx=self.lane_segmentation_head_idx
+        )
+
+        self._tap_indices: Dict[int, int] = {
+            i: int(m["tap_idx"])
+            for i, m in enumerate(neck_defs)
+            if m["type"] == "SwinFeatureReshape"
+        }
+        self._num_taps = len(self._tap_indices)
+
+        initialize_weights(self.module_list)
+
+    @classmethod
+    def from_config(cls, cfg: str):
+        backbone = SwinBackbone(cfg)
+
+        return cls(
+            backbone, cfg
+        )
+
+    def forward(self, x: torch.Tensor, targets:torch.Tensor=None) -> ImageClassifierOutputs:
+
+        batch_size, _, height, width = x.shape
+        device = x.device
+        cache = {} # Cache for layer outputs
+        model_outputs = PanopticModelOutputs()
+
+        x, _intercepts = self.backbone(x, intercept_layers=sorted(set(self._tap_indices.values())))
+
+        for i, (module, route) in enumerate(zip(self.module_list, self.routes)):
+            if self.module_names[i] == "SwinFeatureReshape":
+                tap_idx = self._tap_indices[i]
+                swin_tokens = _intercepts[tap_idx]
+                cache[i] = module(swin_tokens, height, width, tap_idx)
+                x = cache[i]
+
+            elif len(route) == 1:
+                if route[0] == -1:
+                    x = module(x)
+                else:
+                    assert route[0] in cache, f"Output for layer {route[0]} not found in cache."
+                    x = module(cache[route[0]])
+
+            elif len(route) > 1:
+                if self.module_names[i] == "Concat":
+                    for r in route:
+                        if r == -1:
+                            continue
+                        assert r in cache, f"Output for layer {r} not found in cache."
+                        x = torch.cat([x, cache[r]], dim=1)
+
+                elif self.module_names[i] == "ResidualAdd":
+                    for r in route:
+                        if r == -1:
+                            continue
+                        assert r in cache, f"Output for layer {r} not found in cache."
+                        assert x.shape == cache[r].shape, f"Residual Add Expects Tensors of Same Size, Found: {x.shape} and {cache[r].shape}"
+
+                        x = x + cache[r]
+
+                elif self.module_names[i] == "Detect":
+                    inputs = []
+                    for r in route:
+                        if r == -1:
+                            continue
+                        assert r in cache, f"Output for layer {r} not found in cache."
+                        inputs.append(cache[r])
+
+                    detection_outputs  = module(inputs, image_size=(height, width))
+
+                    model_outputs.detection_logits = detection_outputs
+                    model_outputs.anchor_proposals = module._anchor_proposals
+                    model_outputs.proposal_shape = module._proposal_shape
+                    model_outputs.anchor_cxcy = module._anchor_cxcy
+                    model_outputs.anchor_wh = module._anchor_wh
+                    model_outputs.anchor_strides = module._anchor_strides
+
+                    if not self.training:
+                        model_outputs.detection_predictions = module.activation(detection_outputs)
+
+            # Capture segmentation outputs 
+            if self.module_names[i] == "DrivableAreaSegmentation":
+                model_outputs.drivable_segmentation_logits = x
+                if not self.training:
+                    model_outputs.drivable_segmentation_predictions = torch.softmax(x, dim=1)
+
+            elif self.module_names[i] == "LaneSegmentation":
+                model_outputs.lane_segmentation_logits = x
+                if not self.training:
+                    model_outputs.lane_segmentation_predictions = torch.softmax(x, dim=1)
+
+            if i in self._cache_layer_idx:
+                cache[i] = x                        
+
+            # print(f'Layer_idx: {i} - {self.module_names[i]} Route - {route} Tensor - {x.shape}')
+
+        if targets is not None:
+            self._compute_loss(
+                model_outputs, 
+                targets, 
+                height, width,
+                batch_size,
+                device                
+            )
+
+        return model_outputs

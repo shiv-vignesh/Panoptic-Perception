@@ -74,6 +74,7 @@ def parse_model_config(model_config:str):
         
         return module_defs
 
+    #depricated, rather unused flow
     elif (type(model_config) == list):
         
         module_defs = []
