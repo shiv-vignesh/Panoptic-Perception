@@ -2,18 +2,18 @@
 
     "model_kwargs":{
         "model_type":"swin-yolov5-fpn",
-        "cfg_path":"panoptic_perception/configs/models/swin_model/swin_model_yolov5_detection.cfg",
+        "cfg_path":"panoptic_perception/configs/models/swin_model/swin-yolov5-672-1120-detection.cfg",
         "device":"cuda:0"
     },
 
     "dataset_kwargs": {
         "use_super_categories":true,
         "train_dataset_kwargs":{
-            "images_dir": "COCO/val2017",
-            "annotations_json_path":"COCO/annotations/instances_val2017.json",
-            "train_batch_size": 6,
+            "images_dir": "/workspace/data/coco/train2017",
+            "annotations_json_path":"/workspace/data/coco/annotations/instances_train2017.json",
+            "train_batch_size": 8,
             "train_shuffle": true,
-            "train_num_workers": 4,
+            "train_num_workers": 8,
             "preprocessor_kwargs":{
                 "image_resize": [672, 1120],
                 "perform_augmentation": true,
@@ -23,7 +23,7 @@
                     "scale": 0.15,
                     "shear": 2,
                     "hsv_h": 0.015,
-                    "hsv_s": 0.7,
+                    "hsv_s": 0.4,
                     "hsv_v": 0.4,
                     "salt_prob": 0.005,
                     "pepper_prob": 0.005,
@@ -31,17 +31,17 @@
                     "img_size": [672, 1120]
                 },
                 "advanced_aug": {
-                    "mosaic_prob": 0.0,
+                    "mosaic_prob": 0.5,
                     "mixup_prob": 0.0,
                     "copy_paste_prob": 0.0
                 }
             }                 
         },
         "val_dataset_kwargs":{
-            "images_dir": "COCO/val2017",
-            "annotations_json_path":"COCO/annotations/instances_val2017.json",
-            "val_batch_size": 6,
-            "val_shuffle": true,
+            "images_dir": "/workspace/data/coco/val2017",
+            "annotations_json_path":"/workspace/data/coco/annotations/instances_val2017.json",
+            "val_batch_size": 12,
+            "val_shuffle": false,
             "val_num_workers": 4,
             "preprocessor_kwargs":{
                 "image_resize": [672, 1120],
@@ -52,10 +52,11 @@
 
     "optimizer_kwargs": {
         "_type": "AdamW",
-        "initial_lr": 1e-5,
+        "initial_lr": 1e-4,
         "weight_decay": 0.05,
         "betas": [0.9, 0.999],
         "warmup_epochs": 5,
+        "backbone_lr_scale": 0.1,
         "groups": {}
     },
 
@@ -75,39 +76,28 @@
             "_type":"detection-loss-ATSS",
             "kwargs":{}
         },
-        "drivable_segmentation":{
-            "_type":"segmentation-loss",
-            "kwargs":{}
-        },
-        "lane_detection":{
-            "_type":"lane-detection-loss",
-            "kwargs":{}
-        },
         "loss_weights": {
             "_description": "Multi-task loss weights",
-            "detection": 1.0,
-            "drivable_segmentation": 1.0,
-            "lane_detection": 1.0,
-            "lane_segmentation": 0.0
+            "detection": 1.0
         }        
     },
 
     "trainer_kwargs":{
-        "output_dir": "swin-T-yolov5-coco-pretrain-evalOnly",
+        "output_dir": "swin-T-yolov5-coco-pretrain",
         "is_training": true,
         "first_val_epoch": 0,
         "metric_eval_mode": "strict",
         "metric_average_mode": "macro",
         "epochs": 100,
-        "monitor_train": false,
+        "monitor_train": true,
         "monitor_val": true,
         "gradient_clipping": 5.0,
         "checkpoint_idx": 2,
-        "gradient_accumulation_steps": 8,
-        "lr_scheduler_start_epoch": 4,
+        "gradient_accumulation_steps": 4,
+        "lr_scheduler_start_epoch": 5,
         "reload_optimizer": false,
         "reload_optimizer_with_initial_lr": false,
-        "checkpoint_path": "swin-pretraining-outdir/imagenet-pretrain-snapshot-ep38/best_model.pt",
+        "checkpoint_path": "/workspace/Panoptic-Perception/swin-T-classifier-imageNet-pretrain/best_models/val/best_model.pt",
         "wandb_project": "swin-yolov5-coco-pretrain",
         "wandb_enabled": true,
         "use_ema": false,

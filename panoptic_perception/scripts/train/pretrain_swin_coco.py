@@ -128,7 +128,7 @@ def main(args:argparse.Namespace):
 
     logger.log_new_line()
 
-    callbacks = create_callbacks(config)
+    callbacks = create_callbacks(config, class_names_enum=val_dataloaders.dataset.class_names_enum)
     logger.log_message("=== Callbacks ===")
     for cb in callbacks:
         logger.log_message(f"  - {cb.__class__.__name__}")

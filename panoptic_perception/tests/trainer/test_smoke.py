@@ -24,6 +24,7 @@ from panoptic_perception.trainer.callbacks import (
     Callbacks, CheckpointCallback, EvalMetricsCallback,
 )
 from panoptic_perception.trainer.utils import EvalMetrics
+from panoptic_perception.dataset.enums import BDD100KClassesReduced
 from panoptic_perception.models.models import BaseTaskModel
 from panoptic_perception.models.types import PanopticModelOutputs
 from panoptic_perception.utils.logger import Logger
@@ -281,6 +282,7 @@ class TestSmokeTrainAndEval:
 
         trainer.callbacks.add_callback(CheckpointCallback())
         trainer.callbacks.add_callback(EvalMetricsCallback(
+            class_names_enum=BDD100KClassesReduced,
             num_drivable_classes=NUM_DRIVABLE_CLASSES,
             visualize_idx=999,  # skip visualization I/O
         ))
@@ -311,6 +313,7 @@ class TestSmokeEvalOnly:
 
         trainer.callbacks.add_callback(CheckpointCallback())
         trainer.callbacks.add_callback(EvalMetricsCallback(
+            class_names_enum=BDD100KClassesReduced,
             num_drivable_classes=NUM_DRIVABLE_CLASSES,
             visualize_idx=999,
         ))

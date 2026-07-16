@@ -4,14 +4,14 @@ import os
 import torch
 import numpy as np
 
-from typing import Any, Iterable, Dict, TYPE_CHECKING
+from enum import Enum
+from typing import Any, Iterable, Dict, Type, TYPE_CHECKING
 from collections import defaultdict
 from terminaltables import AsciiTable
 
 if TYPE_CHECKING:
     from panoptic_perception.trainer.trainer import Trainer
 
-from panoptic_perception.dataset.enums import BDD100KClassesReduced
 from panoptic_perception.models.models import BaseTaskModel, BaseEnhancementModel
 
 from panoptic_perception.models.utils import WeightsManager
@@ -23,8 +23,6 @@ from panoptic_perception.utils.lane_utils import (
 )
 
 from panoptic_perception.trainer.utils import listify
-
-CLASS_NAMES = [cls.name for cls in BDD100KClassesReduced]
 
 class TrainerCallback:
     def on_train_begin(self, trainer:Trainer): pass
@@ -320,8 +318,9 @@ class EnhancedImageLogger(TrainerCallback):
             
             
 class EvalMetricsCallback(TrainerCallback):
-    
-    def __init__(self, conf_threshold = 0.001,
+
+    def __init__(self, class_names_enum: Type[Enum],
+                conf_threshold = 0.001,
                 iou_threshold = 0.45,
                 max_detections = 500,
                 stats_iou_threshold : float = 0.5,
@@ -331,6 +330,9 @@ class EvalMetricsCallback(TrainerCallback):
                 lane_det_nms_threshold = 0.5,
                 lane_det_iou_threshold = 0.5,
                 visualize_idx:int = 100):
+
+        self.class_names_enum = class_names_enum
+        self.class_names = [c.name for c in class_names_enum]
 
         self.conf_threshold = conf_threshold
         self.iou_threshold = iou_threshold
@@ -446,7 +448,7 @@ class EvalMetricsCallback(TrainerCallback):
                             image=trainer.eval_batch_ctx.cur_eval_images[image_idx],
                             predictions=dets,
                             targets=gts,
-                            class_names=CLASS_NAMES,
+                            class_names=self.class_names,
                             save_path=save_path
                         )
 
@@ -639,17 +641,17 @@ class EvalMetricsCallback(TrainerCallback):
             self.dets_by_image,
             self.gt_by_image,
             iou_threshold=self.stats_iou_threshold,
-            num_classes=len(CLASS_NAMES)
+            num_classes=len(self.class_names)
         )
-        
+
         metric_prefix = trainer.eval_metric_prefix
-        num_classes = len(BDD100KClassesReduced)
+        num_classes = len(self.class_names)
         ap_label = f"mAP@{self.stats_iou_threshold:g}"
 
         # Create AP table for logging with class names
         ap_table_data = [["Class", "AP"]]
         for cls in range(num_classes):
-            class_name = BDD100KClassesReduced(cls).name
+            class_name = self.class_names_enum(cls).name
             ap_value = ap_results.get(f'AP_class_{cls}', 0.0)
             ap_table_data.append([f"{cls}: {class_name}", f"{ap_value:.4f}"])
         ap_table_data.append([ap_label, f"{ap_results['mAP']:.4f}"])
@@ -663,8 +665,8 @@ class EvalMetricsCallback(TrainerCallback):
         #Create Stats (TP, FP, FN)
         stats_table_data = [["Class", "total GT", f"TP", f"FP", f"FN"]]
         for cls in range(num_classes):
-            class_name = BDD100KClassesReduced(cls).name            
-            class_stats = stats_per_class[cls]        
+            class_name = self.class_names_enum(cls).name
+            class_stats = stats_per_class[cls]
 
             total_gt = class_stats.get("total_gt", 0.0)
             true_positives = class_stats.get("true_positives", 0.0)
@@ -683,7 +685,7 @@ class EvalMetricsCallback(TrainerCallback):
         trainer.logger.log_line()
 
         # Log AP table to WandB
-        wandb_ap_data = [[f"{cls}: {BDD100KClassesReduced(cls).name}", ap_results.get(f'AP_class_{cls}', 0.0)] for cls in range(num_classes)]
+        wandb_ap_data = [[f"{cls}: {self.class_names_enum(cls).name}", ap_results.get(f'AP_class_{cls}', 0.0)] for cls in range(num_classes)]
         wandb_ap_data.append([ap_label, ap_results['mAP']])
 
         trainer.eval_batch_ctx.wandb_ap_data = wandb_ap_data

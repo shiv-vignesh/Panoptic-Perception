@@ -240,8 +240,12 @@ class COCODataset(Dataset):
         self.img_ids = list(self.imgs.keys())
 
     def __len__(self):
-        return len(self.img_ids)    
-    
+        return len(self.img_ids)
+
+    @property
+    def class_names_enum(self):
+        return COCOSupercategories if self.use_super_categories else COCOCategories
+
     def _load_raw(self, index):
 
         _image_id = self.img_ids[index]

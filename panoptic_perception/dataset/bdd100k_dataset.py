@@ -397,6 +397,10 @@ class BDD100KDataset(Dataset):
     def get_image_ids(self):
         return [f.split('.')[0] for f in os.listdir(os.path.join(self.images_dir, self.dataset_type))]
 
+    @property
+    def class_names_enum(self):
+        return BDD100KClassesReduced
+
     def __len__(self):
         return len(self.image_ids)
 

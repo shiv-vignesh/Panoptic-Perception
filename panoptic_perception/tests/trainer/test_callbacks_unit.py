@@ -14,6 +14,7 @@ from panoptic_perception.trainer.callbacks import (
     EnhancedImageLogger, EvalMetricsCallback,
 )
 from panoptic_perception.trainer.utils import EvalMetrics, EvalBatchContext
+from panoptic_perception.dataset.enums import BDD100KClassesReduced
 from panoptic_perception.scripts.train.train import (
     create_callbacks, CALLBACK_REGISTRY, DEFAULT_CALLBACKS,
 )
@@ -115,7 +116,9 @@ class TestCheckpointCallback:
 class TestEvalMetricsCallback:
 
     def test_init_defaults(self):
-        cb = EvalMetricsCallback()
+        cb = EvalMetricsCallback(class_names_enum=BDD100KClassesReduced)
+        assert cb.class_names_enum is BDD100KClassesReduced
+        assert cb.class_names == [c.name for c in BDD100KClassesReduced]
         assert cb.conf_threshold == 0.001
         assert cb.iou_threshold == 0.45
         assert cb.max_detections == 500
@@ -125,6 +128,7 @@ class TestEvalMetricsCallback:
 
     def test_init_custom_args(self):
         cb = EvalMetricsCallback(
+            class_names_enum=BDD100KClassesReduced,
             conf_threshold=0.5,
             iou_threshold=0.6,
             max_detections=100,
@@ -135,8 +139,12 @@ class TestEvalMetricsCallback:
         assert cb.max_detections == 100
         assert cb.num_drivable_classes == 3
 
+    def test_missing_class_names_enum_raises(self):
+        with pytest.raises(TypeError):
+            EvalMetricsCallback()
+
     def test_reset(self):
-        cb = EvalMetricsCallback()
+        cb = EvalMetricsCallback(class_names_enum=BDD100KClassesReduced)
         cb.total_val_loss = 10.0
         cb.total_det_loss = 5.0
         cb.global_image_idx = 42
@@ -146,12 +154,12 @@ class TestEvalMetricsCallback:
         assert cb.global_image_idx == 0
 
     def test_drivable_confusion_matrix_shape(self):
-        cb = EvalMetricsCallback(num_drivable_classes=3)
+        cb = EvalMetricsCallback(class_names_enum=BDD100KClassesReduced, num_drivable_classes=3)
         assert cb.drivable_confusion_matrix.shape == (3, 3)
         assert cb.drivable_confusion_matrix.sum() == 0
 
     def test_lane_confusion_matrix_starts_none(self):
-        cb = EvalMetricsCallback()
+        cb = EvalMetricsCallback(class_names_enum=BDD100KClassesReduced)
         assert cb.lane_confusion_matrix is None
 
 
@@ -179,11 +187,15 @@ class TestEnhancedImageLogger:
 class TestCreateCallbacks:
 
     def test_defaults_when_no_config(self):
-        callbacks = create_callbacks({})
+        callbacks = create_callbacks({}, class_names_enum=BDD100KClassesReduced)
         assert len(callbacks) == len(DEFAULT_CALLBACKS)
         types = [type(cb).__name__ for cb in callbacks]
         assert "CheckpointCallback" in types
         assert "EvalMetricsCallback" in types
+
+    def test_defaults_missing_enum_raises(self):
+        with pytest.raises(ValueError, match="class_names_enum"):
+            create_callbacks({})
 
     def test_explicit_config(self):
         config = {
@@ -197,6 +209,16 @@ class TestCreateCallbacks:
         types = [type(cb).__name__ for cb in callbacks]
         assert "CheckpointCallback" in types
         assert "EnhancedImageLogger" in types
+
+    def test_explicit_config_with_eval_metrics_requires_enum(self):
+        config = {"callbacks": {"eval_metrics": {}}}
+        with pytest.raises(ValueError, match="class_names_enum"):
+            create_callbacks(config)
+
+    def test_explicit_config_with_eval_metrics_uses_injected_enum(self):
+        config = {"callbacks": {"eval_metrics": {}}}
+        callbacks = create_callbacks(config, class_names_enum=BDD100KClassesReduced)
+        assert callbacks[0].class_names_enum is BDD100KClassesReduced
 
     def test_unknown_callback_raises(self):
         config = {"callbacks": {"nonexistent_callback": {}}}

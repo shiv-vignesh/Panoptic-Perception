@@ -125,19 +125,26 @@ def create_dataloader(dataset_kwargs, logger=None):
     
     return train_dataloader, val_dataloaders
 
-def create_callbacks(config: dict) -> list:
+def create_callbacks(config: dict, class_names_enum=None) -> list:
     callbacks_config = config.get("callbacks", None)
 
-    if callbacks_config is None:
-        return [CALLBACK_REGISTRY[name]() for name in DEFAULT_CALLBACKS]
-
-    callbacks = []
-    for name, kwargs in callbacks_config.items():
+    def _build(name: str, kwargs: dict):
         if name not in CALLBACK_REGISTRY:
             raise KeyError(f"Unknown callback: {name}")
-        callbacks.append(CALLBACK_REGISTRY[name](**kwargs))
+        cls = CALLBACK_REGISTRY[name]
+        if cls is EvalMetricsCallback and "class_names_enum" not in kwargs:
+            if class_names_enum is None:
+                raise ValueError(
+                    "EvalMetricsCallback requires class_names_enum — pass it via "
+                    "create_callbacks(config, class_names_enum=...) or in the callback config"
+                )
+            kwargs = {**kwargs, "class_names_enum": class_names_enum}
+        return cls(**kwargs)
 
-    return callbacks
+    if callbacks_config is None:
+        return [_build(name, {}) for name in DEFAULT_CALLBACKS]
+
+    return [_build(name, kwargs) for name, kwargs in callbacks_config.items()]
 
 def create_wandb_logger(config:dict, training_args:TrainingArgument) -> WandBLogger:
 
@@ -245,7 +252,8 @@ def main(args:argparse.Namespace):
         logger.log_message("No optimizer provided, skipping scheduler")
     logger.log_new_line()
 
-    callbacks = create_callbacks(config)
+    val_dataset = next(iter(val_dataloaders.values())).dataset if val_dataloaders else train_dataloader.dataset
+    callbacks = create_callbacks(config, class_names_enum=val_dataset.class_names_enum)
     logger.log_message("=== Callbacks ===")
     for cb in callbacks:
         logger.log_message(f"  - {cb.__class__.__name__}")
