@@ -1,7 +1,7 @@
 import numpy as np
 
 from enum import Enum
-from typing import List, Optional, Tuple
+from typing import List, Optional, Tuple, Sequence
 from dataclasses import dataclass, field
 
 @dataclass
@@ -26,6 +26,17 @@ class Bbox:
     @property
     def valid_bbox(self) -> bool:
         return self.x2 > self.x1 and self.y2 > self.y1
+    
+    @classmethod
+    def from_xywh(cls, bbox:Sequence[float]):
+        # for COCO style to pascal VOC
+        x, y, w, h = bbox
+        x1 = x
+        y1 = y
+        x2 = x + w
+        y2 = y + h
+
+        return cls(x1, y1, x2, y2)
 
     def xyxy2xywh(self) -> Tuple[float, float, float, float]:
         w = self.x2 - self.x1

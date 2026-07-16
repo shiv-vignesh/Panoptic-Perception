@@ -1,5 +1,6 @@
 import os
 import torch
+import torch.nn.functional as F
 
 class WeightsManager:
     def __init__(self, verbose=True):
@@ -33,6 +34,9 @@ class WeightsManager:
         if key_prefix:
             state_dict = {f"{key_prefix}.{k}": v for k, v in state_dict.items()}
 
+        # Resolution-aware transforms — runs before load_state_dict
+        self._resize_ape_embeds(model, state_dict)
+
         missing, unexpected = model.load_state_dict(
             state_dict, strict=False
         )
@@ -53,6 +57,96 @@ class WeightsManager:
             print(f"Unexpected : {len(unexpected)} keys")
 
         return missing, unexpected, loaded_keys
+
+    def _resize_ape_embeds(self, model: torch.nn.Module, state_dict: dict):
+        """Bicubic-interpolate any *.ape_embed tensor whose shape doesn't match the model."""
+        model_state = model.state_dict()
+
+        for k in list(state_dict.keys()):
+            if not k.endswith(".ape_embed"):
+                continue
+            if k not in model_state:
+                continue
+
+            src = state_dict[k]
+            if src.shape == model_state[k].shape:
+                continue
+
+            parent_path = k[:-len(".ape_embed")]
+            try:
+                parent = model.get_submodule(parent_path)
+                target_h, target_w = parent.patch_resolutions
+            except (AttributeError, RuntimeError):
+                if self.verbose:
+                    print(f"[APE resize] {k}: can't read target grid from model; skipping")
+                continue
+
+            _, n_src, c = src.shape
+            src_h = src_w = int(round(n_src ** 0.5))
+            if src_h * src_w != n_src:
+                if self.verbose:
+                    print(f"[APE resize] {k}: source not square ({n_src} tokens); skipping")
+                continue
+
+            src_2d = src.reshape(1, src_h, src_w, c).permute(0, 3, 1, 2)
+            dst_2d = F.interpolate(src_2d, size=(target_h, target_w),
+                                   mode="bicubic", align_corners=False)
+            state_dict[k] = dst_2d.permute(0, 2, 3, 1).reshape(1, target_h * target_w, c)
+
+            if self.verbose:
+                print(f"[APE resize] {k}: {tuple(src.shape)} -> "
+                      f"{tuple(state_dict[k].shape)}")
+
+
+    # --------------------------------------------------------
+    # Swin Transformer
+    # Copyright (c) 2021 Microsoft
+    # https://github.com/microsoft/Swin-Transformer/blob/main/models/swin_transformer.py
+    # --------------------------------------------------------
+    def _resize_ape_embeds(self, model: torch.nn.Module, state_dict: dict):
+        """Bicubic-interpolate any *.ape_embed tensor whose shape doesn't match the model."""
+        model_state = model.state_dict()
+
+        for k in list(state_dict.keys()):
+            if not k.endswith(".ape_embed"):
+                continue
+            if k not in model_state:
+                # Model doesn't have this param (e.g., apply_ape=False now); leave for
+                # load_state_dict to report as "unexpected". No-op.
+                continue
+
+            src = state_dict[k]
+            dst_shape = model_state[k].shape
+            if src.shape == dst_shape:
+                continue
+
+            # Read target grid from the parent PatchEmbed's patch_resolutions
+            parent_path = k[:-len(".ape_embed")]
+            try:
+                parent = model.get_submodule(parent_path)
+                target_h, target_w = parent.patch_resolutions
+            except (AttributeError, RuntimeError):
+                if self.verbose:
+                    print(f"[APE resize] {k}: can't read target grid from model; skipping")
+                continue
+
+            # Infer source grid (assume square)
+            _, n_src, c = src.shape
+            src_h = src_w = int(round(n_src ** 0.5))
+            if src_h * src_w != n_src:
+                if self.verbose:
+                    print(f"[APE resize] {k}: source not square ({n_src} tokens); skipping")
+                continue
+
+            # Bicubic interpolate [1, N_src, C] -> [1, target_h * target_w, C]
+            src_2d = src.reshape(1, src_h, src_w, c).permute(0, 3, 1, 2)
+            dst_2d = torch.nn.functional.interpolate(src_2d, size=(target_h, target_w),
+                                   mode="bicubic", align_corners=False)
+            state_dict[k] = dst_2d.permute(0, 2, 3, 1).reshape(1, target_h * target_w, c)
+
+            if self.verbose:
+                print(f"[APE resize] {k}: {tuple(src.shape)} -> "
+                      f"{tuple(state_dict[k].shape)}")
 
 def parse_model_config(model_config:str):
 

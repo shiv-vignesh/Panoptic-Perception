@@ -1267,7 +1267,7 @@ class SwinBlock(nn.Module):
         else:
             attn_mask = None
 
-        self.register_buffer("attention_mask", attn_mask)
+        self.register_buffer("attention_mask", attn_mask, persistent=False)
         self.fused_window_process = fused_window_process
 
     def _window_partition(self, x):

@@ -26,6 +26,9 @@ def parse_config(config: dict) -> dict:
             if key in optim:
                 result[key] = optim[key]
 
+        if "_type" in optim:
+            result["optim_type"] = optim["_type"]                
+
     # lr_scheduler_kwargs — needs key remapping
     if "lr_scheduler_kwargs" in config:
         sched = config["lr_scheduler_kwargs"]

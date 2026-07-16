@@ -45,7 +45,7 @@ class SwinBackbone(nn.Module):
                     embed_dim=embed_dim,
                     patch_size=patch_size,
                     stride=int(m.get("stride", 4)),
-                    apply_ape=bool(m.get("apply_ape", False)),
+                    apply_ape=str(m.get("apply_ape", "False")).lower() == "true"
                 )
                 H, W = image_size[0] // patch_size, image_size[1] // patch_size
 
@@ -54,7 +54,7 @@ class SwinBackbone(nn.Module):
                 num_heads = ast.literal_eval(m["num_heads"])
                 window_size = int(m.get("window_size", 7))
                 mlp_ratio = float(m.get("mlp_ratio", 4.))
-                qkv_bias = bool(m.get("qkv_bias", True))
+                qkv_bias=str(m.get("qkv_bias", "True")).lower() == "true"
                 num_layers = len(depths)
 
                 assert H != -1 and W != -1, "PatchEmbed must precede SwinStack in cfg"
@@ -198,13 +198,28 @@ class SwinObjectDetection(BaseTaskModel):
 
         initialize_weights(self.module_list)
 
-    @classmethod
-    def from_config(cls, cfg: str):
-        backbone = SwinBackbone(cfg)
+    def get_param_groups(self, optimizer_kwargs: dict = None) -> list:
+        optimizer_kwargs = optimizer_kwargs or {}
+        initial_lr = float(optimizer_kwargs.get("initial_lr", 1e-4))
+        backbone_lr_scale = float(optimizer_kwargs.get("backbone_lr_scale", 0.1))
+        neck_head_lr_scale = float(optimizer_kwargs.get("neck_head_lr_scale", 1.0))
 
-        return cls(
-            backbone, cfg
-        )
+        return [
+            {
+                "params": list(self.backbone.parameters()),
+                "name": "backbone",
+                "lr": initial_lr * backbone_lr_scale,
+                "lr_scale": backbone_lr_scale,
+                "trainable": True,
+            },
+            {
+                "params": list(self.module_list.parameters()),
+                "name": "neck_head",
+                "lr": initial_lr * neck_head_lr_scale,
+                "lr_scale": neck_head_lr_scale,
+                "trainable": True,
+            },
+        ]
 
     def forward(self, x: torch.Tensor, targets:torch.Tensor=None) -> ImageClassifierOutputs:
 
@@ -292,3 +307,11 @@ class SwinObjectDetection(BaseTaskModel):
             )
 
         return model_outputs
+
+    @classmethod
+    def from_config(cls, cfg: str):
+        backbone = SwinBackbone(cfg)
+
+        return cls(
+            backbone, cfg
+        )

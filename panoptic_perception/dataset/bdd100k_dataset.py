@@ -92,7 +92,7 @@ class BDDPreprocessor:
             bbox_params=A.BboxParams(format="pascal_voc", label_fields=["class_labels"])
             )
 
-        self.image_only_transformation = A.Compose(base_resize_image)        
+        self.image_only_transformation = A.Compose(base_resize_image)
         self.mask_only_transformation = A.Compose(base_resize_mask)
 
     def load_detection(self, json_path, filter_by_area=False) -> FrameObjDetections:
@@ -246,15 +246,17 @@ class BDDPreprocessor:
     def prepare_inference(self, image_path=None):
 
         assert image_path is not None and os.path.exists(image_path), f"Invalid Image path {image_path}"
-        img = cv2.imread(image_path)
+        img = cv2.imread(image_path, cv2.IMREAD_COLOR)
+        img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
 
         orig = img.copy()
         h0, w0 = img.shape[:2]
 
-        transformed = self.image_only_transformation(image=img)
-        img = transformed['image']
+        frame = FrameData(image=img, image_path=image_path, frame_detections=None)
+        frame = letterbox_with_masks(frame, new_shape=self.image_resize)
 
-        img = self.normalize_tensor(torch.from_numpy(img).permute(2, 0, 1))
+        img = torch.from_numpy(frame.image).permute(2, 0, 1)
+        img = self.normalize_tensor(img)
 
         return {
             "image": img.unsqueeze(0),  # add batch dim
@@ -501,9 +503,6 @@ class BDD100KDataset(Dataset):
 
         # ---- 1. Build / augment the FrameData --------------------------------
         if use_mosaic:
-            # Mosaic: combine 4 frames. Output is already at target_size; no
-            # further augmentation on top (the mosaic itself supplies geometric
-            # diversity via per-tile random scale + center placement).
             indices = [index] + [random.randint(0, len(self) - 1) for _ in range(3)]
             items = [self._load_raw(i) for i in indices]
             frame = mosaic_augmentation(items, output_size=target_size)

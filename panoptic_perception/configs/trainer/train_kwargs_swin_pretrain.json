@@ -6,7 +6,7 @@
     },
 
     "dataset_kwargs":{
-        "root":"/workspace/data/imagenet",
+        "root":"imagenet-tiny/tiny-imagenet-200",
         "train_batch_size": 128,
         "train_shuffle": true,
         "train_num_workers": 8,
@@ -45,7 +45,7 @@
     },
 
     "trainer_kwargs":{
-        "output_dir": "swin-T-classifier-imageNet-pretrain",
+        "output_dir": "swin-T-classifier-dev",
         "is_training": true,
         "first_val_epoch": 0,
         "metric_eval_mode": "strict",
@@ -59,8 +59,8 @@
         "lr_scheduler_start_epoch": 4,
         "reload_optimizer": false,
         "reload_optimizer_with_initial_lr": false,
-        "checkpoint_path": null,
-        "wandb_project": "swin-classifier-imageNet-pretrain",
+        "checkpoint_path": "/Users/shiv/Developer/ai-ml/Panoptic-Perception/swin_model/swin-pretraining-outdir/imagenet-pretrain-snapshot-ep38/best_model.pt",
+        "wandb_project": "swin-classifier-dev",
         "wandb_enabled": true,
         "use_ema": false,
         "ema_decay": 0.9999,
