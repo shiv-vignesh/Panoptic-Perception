@@ -427,8 +427,8 @@ class YOLOv8DetectionLoss(DetectionLoss):
 @LossFactory.register_loss_function("detection-loss-ATSS")
 class ATSSDetectionLoss(DetectionLoss):
 
-    def __init__(self, bbox_weight = 0.05, obj_weight = 1, 
-                cls_weight = 0.5, balance = [4, 1, 0.4], 
+    def __init__(self, bbox_weight = 0.5, obj_weight = 1.0, 
+                cls_weight = 0.1, balance = [4, 1, 0.4], 
                 gamma = 2, iou_aware_cls = False, 
                 label_smoothing = 0, autobalance = False, ssi=[1, 1, 1]):
         
@@ -873,34 +873,39 @@ class ATSSDetectionLoss(DetectionLoss):
         if num_pos > 0:
             lbox += (1.0 - iou).mean()
 
-            pos_cls_logits = cls_logits[batch_pos_masks]              # (n_pos, K)
-            pos_labels = batch_labels[batch_pos_masks].long()     # (n_pos,)
+        num_classes = cls_logits.shape[-1]
+        if num_classes > 1:
+            # ATSS/RetinaNet cls: focal over ALL anchors. Negatives get zero-vector
+            # target so the classifier learns to reject background. Positives get
+            # one-hot (with label smoothing). Normalize by num_pos.
+            cp = 1.0 - 0.5 * self.label_smoothing
+            cn = 0.5 * self.label_smoothing
 
-            num_classes = cls_logits.shape[-1]
-            if num_classes > 1:
-                cp = 1.0 - 0.5 * self.label_smoothing
-                cn = 0.5 * self.label_smoothing
+            cls_target = torch.zeros_like(cls_logits)                        # (B, A, K)
+            if num_pos > 0:
+                pos_b, pos_a = batch_pos_masks.nonzero(as_tuple=True)
+                pos_labels = batch_labels[batch_pos_masks].long()
+                cls_target[pos_b, pos_a] = cn
+                cls_target[pos_b, pos_a, pos_labels] = cp
+            cls_target = cls_target.detach()
 
-                cls_target = torch.full_like(pos_cls_logits, fill_value=cn)
-                cls_target[torch.arange(pos_cls_logits.shape[0]), pos_labels] = cp
-                cls_target = cls_target.detach()
+            if cls_loss_type == "focal":
+                per_anchor = self.focal_loss(
+                    cls_logits, cls_target,
+                    alpha=0.25, gamma=self.gamma,
+                    reduction="none",
+                )
+            else:
+                per_anchor = torch.nn.functional.binary_cross_entropy_with_logits(
+                    cls_logits, cls_target, reduction="none",
+                )
 
-                iou_weight = iou.detach().clamp(0.1, 1.0)
-                if cls_loss_type == "focal":
-                    per_sample = self.focal_loss(
-                        pos_cls_logits, cls_target,
-                        alpha=0.25, gamma=self.gamma,
-                        reduction="none",
-                    )
-                else:
-                    per_sample = torch.nn.functional.binary_cross_entropy_with_logits(
-                        pos_cls_logits, cls_target, reduction="none",
-                    )
+            if self.iou_aware_cls and num_pos > 0:
+                row_weights = torch.ones(cls_logits.shape[:2], device=device, dtype=cls_logits.dtype)
+                row_weights[batch_pos_masks] = iou.detach().clamp(0.1, 1.0)
+                per_anchor = per_anchor * row_weights.unsqueeze(-1)
 
-                if self.iou_aware_cls:
-                    lcls += (per_sample.mean(dim=1) * iou_weight).mean()
-                else:
-                    lcls += per_sample.mean()
+            lcls += per_anchor.sum() / max(num_pos, 1)
 
         obj_target = torch.zeros_like(obj_logits, device=device)
         obj_target[batch_pos_masks] = plain_iou.detach().clamp(0.1, 1.0)
